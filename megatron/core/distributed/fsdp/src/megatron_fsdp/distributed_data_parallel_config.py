@@ -156,6 +156,12 @@ class DistributedDataParallelConfig:
       to minimize the registration time.
     """
 
+    megatron_fsdp_fine_grained_param_ag: bool = False
+    """Whether to enable "fine-grained" param all-gather, which can improve performance when
+      using MXFP8 parameters with activation recomputation. Not compatible with TransformerEngine
+      fused Module(s), which do not permit Megatron-FSDP hooks to modify inputs and outputs.
+    """
+
     def __post_init__(self):
         import os
 

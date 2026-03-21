@@ -2980,6 +2980,11 @@ def _add_experimental_args(parser):
                             'precision-aware-optimizer. This dtype is used for storing the '
                             'optimizer state in memory during training but does not affect '
                             'the precision in the kernel computation.')
+    group.add_argument("--megatron-fsdp-fine-grained-param-ag", action='store_true', default=False,
+                        help="Whether to enable 'fine-grained' param all-gather, which can improve performance "
+                             "when using MXFP8 parameters with activation recomputation. Not compatible with "
+                             "TransformerEngine fused Module(s), which do not permit Megatron-FSDP hooks to "
+                             "modify inputs and outputs. Auto-activated with selective recomputation.")
     return parser
 
 
