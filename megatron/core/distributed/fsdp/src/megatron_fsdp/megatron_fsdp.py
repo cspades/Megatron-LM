@@ -185,7 +185,6 @@ class MegatronFSDP(torch.nn.Module):
         fsdp_double_buffer: bool = False,
         fsdp_db_use_persist_buf_on_alloc_fail: bool = False,
         disable_symmetric_registration: bool = False,
-        enable_fine_grained_param_gather_hook: bool = False,
         report_nan_in_param_grad: bool = False,
     ):
         super().__init__()
@@ -237,7 +236,9 @@ class MegatronFSDP(torch.nn.Module):
         self.mp_policy = mixed_precision_policy
         self.calculate_per_token_loss = calculate_per_token_loss
         self.init_model_with_meta_device = init_model_with_meta_device
-        self.enable_fine_grained_param_gather_hook = enable_fine_grained_param_gather_hook
+        self.enable_fine_grained_param_gather_hook = (
+            self.ddp_config.megatron_fsdp_fine_grained_param_ag
+        )
         self.report_nan_in_param_grad = report_nan_in_param_grad
 
         # FSDPDistributedIndex stores the process groups and meshes used by Megatron-FSDP.
@@ -690,18 +691,13 @@ class MegatronFSDP(torch.nn.Module):
                 self._params_require_handle_grad.discard(param)
 
         @torch.compiler.disable
-        def _pre_forward_param_unshard(
-            module: nn.Module,
-            args: Optional[Tuple[Any, ...]] = None,
-            kwargs: Optional[Dict[str, Any]] = None,
-        ):
-            # If args or kwargs are not passed, default to () and {}.
-            # This matches PyTorch Module hook conventions:
-            # torch.nn.Module._call_impl.inner()
-            if args is None:
-                args = ()
-            if kwargs is None:
-                kwargs = {}
+        def _pre_forward_param_unshard(module: nn.Module, *unused):
+            """
+            Installs a hook that un-shards module parameters prior to the forward pass.
+            If the module is an FSDP unit module, parameters are un-sharded recursively,
+            otherwise (or when fine-grained AG is enabled) only shallow children
+            parameters are un-sharded.
+            """
             # Unshard the parameters before the forward pass.
             input_training_state = module._training_state
             fsdp_forward_prefetch = True
@@ -728,7 +724,7 @@ class MegatronFSDP(torch.nn.Module):
                 prefetch=fsdp_forward_prefetch,
                 prefetch_order=PrefetchOrder.FORWARD_PASS_ORDER,
             )
-            return args, kwargs
+            return None
 
         @torch.compiler.disable
         def _register_post_backward_hook(
@@ -744,16 +740,9 @@ class MegatronFSDP(torch.nn.Module):
             since such operations can trigger an autograd error that
             "the output is a view and is being modified in-place".
             """
-            # If args or kwargs are not passed, default to () and {}.
-            # This matches PyTorch Module hook conventions:
-            # torch.nn.Module._call_impl.inner()
-            if args is None:
-                args = ()
-            if kwargs is None:
-                kwargs = {}
             if not torch.is_grad_enabled():
                 # No gradients / backward pass, don't attach the post-backward hook.
-                return args, kwargs
+                return None
 
             # Preprocess the input arguments.
             args_list, args_spec = tree_flatten(args)
@@ -767,7 +756,7 @@ class MegatronFSDP(torch.nn.Module):
                     inp_tensors.append(obj)
 
             if len(inp_tensors) == 0:
-                return args, kwargs
+                return None
 
             """
             Identity autograd Function that attaches a post-backward "hook" to the
@@ -788,7 +777,12 @@ class MegatronFSDP(torch.nn.Module):
             kwargs = tree_unflatten(kwargs_list, kwargs_spec)
 
             # Return original input to the module forward pass.
-            return args, kwargs
+            if args is not None and kwargs is not None:
+                return args, kwargs
+            elif args is not None:
+                return args
+            else:
+                return None
 
         def _root_post_backward(*unused):
             # Make sure all the gradients are handled.
@@ -897,7 +891,10 @@ class MegatronFSDP(torch.nn.Module):
             torch.autograd.Variable._execution_engine.queue_callback(_root_post_backward)
 
         @torch.compiler.disable
-        def _post_forward(module: nn.Module, input: Any, output: Any):
+        def _post_forward(module: nn.Module, *unused):
+            """
+            Register post-forward re-sharding / parameter de-allocation.
+            """
             # When composed with module-hook-based activation recomputation, the
             # post-backward hook is responsible for resharding the module parameters
             # after the forward pass. In this case, the resharding is performed lazily.
@@ -918,7 +915,7 @@ class MegatronFSDP(torch.nn.Module):
             # Release the module parameters after the forward pass to save memory.
             release_module_parameters(module, bwd=False, lazy=lazy_release)
 
-            return output
+            return None
 
         @torch.compiler.disable
         def _release_module_fp8_transpose_cache(module: nn.Module, *unused):
@@ -966,9 +963,7 @@ class MegatronFSDP(torch.nn.Module):
             """
             if self.data_parallel_sharding_strategy != "no_shard":
                 self.forward_pre_hooks[f"{module._get_name()} parameter unshard"] = (
-                    module.register_forward_pre_hook(
-                        _pre_forward_param_unshard, prepend=True, with_kwargs=True
-                    )
+                    module.register_forward_pre_hook(_pre_forward_param_unshard, prepend=True)
                 )
 
         def _register_pre_backward_param_unshard_hook(module):

@@ -1496,6 +1496,9 @@ def get_model(model_provider_func, model_type=ModelType.encoder_or_decoder, wrap
             kwargs['megatron_fsdp_main_params_dtype'] = args.megatron_fsdp_main_params_dtype
             kwargs['megatron_fsdp_main_grads_dtype'] = args.megatron_fsdp_main_grads_dtype
             kwargs['megatron_fsdp_grad_comm_dtype'] = args.megatron_fsdp_grad_comm_dtype
+            kwargs['megatron_fsdp_fine_grained_param_ag'] = (
+                True if args.recompute_granularity == 'selective' else args.megatron_fsdp_fine_grained_param_ag
+            )
 
             # Initialize DDPConfig.
             ddp_config = DistributedDataParallelConfig(**kwargs)
