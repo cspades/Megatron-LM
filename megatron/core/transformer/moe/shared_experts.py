@@ -120,10 +120,11 @@ class SharedExpertMLP(MLP):
         self.use_shared_expert_gate = gate
         if self.use_shared_expert_gate:
             # TODO: Add support for GPU initialization, which requires updating the golden values.
-            self.gate_weight = torch.nn.Parameter(torch.empty((1, self.config.hidden_size)))
+            self.gate_weight = torch.nn.Parameter(
+                torch.empty((1, self.config.hidden_size), dtype=config.params_dtype)
+            )
             if config.perform_initialization:
                 config.init_method(self.gate_weight)
-            self.gate_weight.data = self.gate_weight.data.to(dtype=config.params_dtype)
             setattr(self.gate_weight, 'sequence_parallel', self.config.sequence_parallel)
         else:
             self.gate_weight = None
@@ -180,6 +181,11 @@ class SharedExpertMLP(MLP):
             if self.__class__.stream is None:
                 self.__class__.stream = torch.cuda.Stream()
             self.stream = self.__class__.stream
+
+    def reset_parameters(self):
+        """Re-initialize parameters on the actual device (for meta-device init)."""
+        if self.use_shared_expert_gate:
+            self.config.init_method(self.gate_weight)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Forward function"""
