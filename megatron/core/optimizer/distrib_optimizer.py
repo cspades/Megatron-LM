@@ -20,6 +20,7 @@ from ..dist_checkpointing.optimizer import KEEP_VARS_HINT
 HAVE_APEX_OR_TE = True
 USING_TE_OPTIMIZER = False
 USING_APEX_OPTIMIZER = False
+# pylint: disable=unused-import
 try:
     from transformer_engine.pytorch.optimizers import FusedAdam as Adam
 
@@ -33,6 +34,7 @@ except ImportError:
         from torch.optim import Adam as Adam
 
         HAVE_APEX_OR_TE = False
+# pylint: enable=unused-import
 
 from megatron.core.optimizer.cpu_offloading import HybridDeviceOptimizer
 
