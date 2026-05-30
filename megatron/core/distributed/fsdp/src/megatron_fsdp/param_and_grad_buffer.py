@@ -505,6 +505,7 @@ class TemporaryBucketAllocator:
         dtype: torch.dtype,
         device: torch.device,
         mem_alloc_context: Optional[Callable] = None,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -538,6 +539,7 @@ class StorageResizeBasedBucketAllocator(TemporaryBucketAllocator):
         dtype: torch.dtype,
         device: torch.device,
         mem_alloc_context: Optional[Callable] = None,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -601,6 +603,7 @@ class RotaryBucketAllocator(TemporaryBucketAllocator):
         dtype: torch.dtype,
         device: torch.device,
         mem_alloc_context: Optional[Callable] = None,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -665,11 +668,12 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         self.dtype_attr = dtype_attr
 
         # Build a mapping from FSDP unit id to its associated bucket ids.
-        fsdp_unit_buckets = defaultdict(list)
+        fsdp_unit_buckets = defaultdict(dict)
         for bucket_id, param_group in enumerate(fsdp_param_groups):
             if param_group.fsdp_unit_id == -1 or param_group.fsdp_unit_id is None:
                 continue
-            fsdp_unit_buckets[param_group.fsdp_unit_id].append(bucket_id)
+            bucket_offset = len(fsdp_unit_buckets[param_group.fsdp_unit_id])
+            fsdp_unit_buckets[param_group.fsdp_unit_id][bucket_id] = (-1, bucket_offset)
         self.fsdp_unit_buckets = fsdp_unit_buckets
 
         # Identify the largest group of FSDP units that share the same buffer storage.
@@ -677,7 +681,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         for fsdp_unit_id, bucket_ids in fsdp_unit_buckets.items():
             same_storage_fsdp_units = []
             for i in fsdp_unit_buckets:
-                if self._is_two_bucket_group_equal(fsdp_unit_buckets[i], bucket_ids):
+                if self._is_two_bucket_group_equal(fsdp_unit_buckets[i], bucket_ids.keys()):
                     same_storage_fsdp_units.append(i)
             # Track the largest group of FSDP units sharing the same buffer storage
             if len(same_storage_fsdp_units) > len(fsdp_units_to_double_buffer):
@@ -748,6 +752,7 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         dtype: torch.dtype,
         device: torch.device,
         mem_alloc_context: Optional[Callable] = None,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -755,19 +760,49 @@ class FixedPoolAllocator(TemporaryBucketAllocator):
         fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
         if fsdp_unit_id in self.fsdp_double_buffer_units:
             # Try to allocate from the buffer pool.
-            bucket_offset = self.fsdp_unit_buckets[fsdp_unit_id].index(bucket_id)
+            buffer_offset, bucket_offset = self.fsdp_unit_buckets[fsdp_unit_id][bucket_id]
             buffer_name = None
             if bucket_id in self.using_buffer:
                 # If this bucket is already using a buffer, reuse it.
                 buf_group_id, bucket_offset = self.using_buffer[bucket_id]
                 buffer_name = self._get_gbuf_name(buf_group_id, bucket_offset)
+            elif (
+                strict_assignments
+                and buffer_offset >= 0
+                and (buffer_offset, bucket_offset) in self.idle_buffer
+            ):
+                # Able to allocate the planned buffer for this bucket.
+                self.using_buffer[bucket_id] = (buffer_offset, bucket_offset)
+                buffer_name = self._get_gbuf_name(buffer_offset, bucket_offset)
+                self.idle_buffer.remove((buffer_offset, bucket_offset))
             else:
+                # If we failed to allocate a planned buffer, then warn the user!
+                if strict_assignments and buffer_offset >= 0:
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        f"[FixedPool][{self.name}] Failed to allocate Bucket {bucket_id} to "
+                        f"FixedPool Buffer {buffer_offset}. Looking for new buffer...",
+                    )
                 # Otherwise, find an available buffer group for this bucket offset.
                 for buf_group_id in range(self.size):
                     if (buf_group_id, bucket_offset) in self.idle_buffer:
                         self.using_buffer[bucket_id] = (buf_group_id, bucket_offset)
                         buffer_name = self._get_gbuf_name(buf_group_id, bucket_offset)
                         self.idle_buffer.remove((buf_group_id, bucket_offset))
+                        if strict_assignments and buffer_offset < 0:
+                            # Save the exact buffer that this bucket should reside in!
+                            # Future allocations should try to use this buffer if possible.
+                            self.fsdp_unit_buckets[fsdp_unit_id][bucket_id] = (
+                                buf_group_id,
+                                bucket_offset,
+                            )
+                            log_single_rank(
+                                logger,
+                                logging.INFO,
+                                f"[FixedPool][{self.name}] Assigned Bucket {bucket_id} "
+                                f"to FixedPool Buffer {buf_group_id}.",
+                            )
                         break
 
             assert buffer_name is not None, (
@@ -965,7 +1000,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                         max_bucket_ids[bucket_offset] = (fsdp_unit_id, bucket_id)
                     # Assign bucket ID to this offset for this dtype,
                     # to recycle the appropriate buffer.
-                    self.bucket_alloc_index[bucket_id] = bucket_offset
+                    self.bucket_alloc_index[bucket_id] = (-1, bucket_offset)
 
         # Log the max pool bucket sizes and bucket IDs responsible.
         if torch.distributed.get_rank() == 0:
@@ -987,6 +1022,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         dtype: torch.dtype,
         device: torch.device,
         mem_alloc_context: Optional[Callable] = None,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         allocate a temporary bucket.
@@ -994,7 +1030,7 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
         fsdp_unit_id = self.fsdp_param_groups[bucket_id].fsdp_unit_id
         if fsdp_unit_id != -1 and fsdp_unit_id is not None:
             # Try to allocate from the buffer pool.
-            bucket_offset = self.bucket_alloc_index[bucket_id]
+            buffer_offset, bucket_offset = self.bucket_alloc_index[bucket_id]
             buffer_name = None
             if bucket_id in self.using_buffer:
                 # If this bucket is already using a buffer, reuse it.
@@ -1004,13 +1040,40 @@ class MaxPoolAllocator(TemporaryBucketAllocator):
                     f"match pre-allocated buffer dtype ({buffer_dtype})!"
                 )
                 buffer_name = self._get_gbuf_name(buf_group_id, dtype, bucket_offset)
+            elif (
+                strict_assignments
+                and buffer_offset >= 0
+                and (buffer_offset, dtype, bucket_offset) in self.idle_buffer
+            ):
+                # Able to allocate the planned buffer for this bucket.
+                self.using_buffer[bucket_id] = (buffer_offset, dtype, bucket_offset)
+                buffer_name = self._get_gbuf_name(buffer_offset, dtype, bucket_offset)
+                self.idle_buffer.remove((buffer_offset, dtype, bucket_offset))
             else:
+                # If we failed to allocate a planned buffer, then warn the user!
+                if strict_assignments and buffer_offset >= 0:
+                    log_single_rank(
+                        logger,
+                        logging.INFO,
+                        f"[MaxPool][{self.name}] Failed to allocate Bucket {bucket_id} to "
+                        f"MaxPool Buffer {buffer_offset}. Looking for new buffer...",
+                    )
                 # Otherwise, find an available buffer group for this bucket offset.
                 for buf_group_id in range(self.size):
                     if (buf_group_id, dtype, bucket_offset) in self.idle_buffer:
                         self.using_buffer[bucket_id] = (buf_group_id, dtype, bucket_offset)
                         buffer_name = self._get_gbuf_name(buf_group_id, dtype, bucket_offset)
                         self.idle_buffer.remove((buf_group_id, dtype, bucket_offset))
+                        if strict_assignments and buffer_offset < 0:
+                            # Save the exact buffer that this bucket should reside in!
+                            # Future allocations should try to use this buffer if possible.
+                            self.bucket_alloc_index[bucket_id] = (buf_group_id, bucket_offset)
+                            log_single_rank(
+                                logger,
+                                logging.INFO,
+                                f"[MaxPool][{self.name}] Assigned Bucket {bucket_id} "
+                                f"to MaxPool Buffer {buf_group_id}.",
+                            )
                         break
 
             assert buffer_name is not None, (
@@ -1188,7 +1251,10 @@ class DataParallelBuffer:
         self.data = data
 
     def fetch_bucket(
-        self, dtype: Optional[torch.dtype] = None, set_param_data: bool = False
+        self,
+        dtype: Optional[torch.dtype] = None,
+        set_param_data: bool = False,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         Fetch a communication buffer for data-parallel operations. If the buffer
@@ -1218,7 +1284,9 @@ class DataParallelBuffer:
             )
         else:
             # Sharded or dtype-custom buffers require un-sharded bucket allocation.
-            bucket = self.allocate_bucket_storage(dtype=dtype, device=self.device)
+            bucket = self.allocate_bucket_storage(
+                dtype=dtype, device=self.device, strict_assignments=strict_assignments
+            )
 
         # Need to set parameter data after resize model weight buffer data-storage.
         if set_param_data:
@@ -1238,6 +1306,7 @@ class DataParallelBuffer:
         dtype: Optional[torch.dtype] = None,
         device: Optional[torch.device] = None,
         init_values: Optional[torch.Tensor] = None,
+        strict_assignments: bool = True,
     ) -> Bucket:
         """
         Allocate a temporary flat communication buffer using the cached
@@ -1278,6 +1347,7 @@ class DataParallelBuffer:
             dtype=dtype,
             device=device,
             mem_alloc_context=self.mem_alloc_context,
+            strict_assignments=strict_assignments,
         )
         # Copy Tensor values into Bucket data.
         if init_values is not None:
@@ -2420,13 +2490,17 @@ class ParamAndGradBuffer:
                 dtype_attr="grad_dtype",
                 fallback_to_persistent_buffer=(
                     self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
-                    and bool(int(os.getenv(
-                        "MEGATRON_FSDP_DBLBUF_PERSIST_GRAD_BUF",
-                        # If we are not using the MaxPoolAllocator, the FixedPoolAllocator
-                        # has risks for asymmetry of allocation strategy that can break CG,
-                        # so it is safer to turn this on when using FixedPoolAllocator.
-                        not self.ddp_config.megatron_fsdp_max_pool_double_buffer,
-                    )))
+                    and bool(
+                        int(
+                            os.getenv(
+                                "MEGATRON_FSDP_DBLBUF_PERSIST_GRAD_BUF",
+                                # If we are not using the MaxPoolAllocator, the FixedPoolAllocator
+                                # has risks for asymmetry of allocation strategy that can break CG,
+                                # so it is safer to turn this on when using FixedPoolAllocator.
+                                not self.ddp_config.megatron_fsdp_max_pool_double_buffer,
+                            )
+                        )
+                    )
                 ),
             )
             if self.dist_index.use_hybrid_fsdp:
@@ -2441,13 +2515,17 @@ class ParamAndGradBuffer:
                     dtype_attr="grad_dtype",
                     fallback_to_persistent_buffer=(
                         self.ddp_config.fsdp_db_use_persist_buf_on_alloc_fail
-                        and bool(int(os.getenv(
-                            "MEGATRON_FSDP_DBLBUF_PERSIST_GRAD_BUF",
-                            # If we are not using the MaxPoolAllocator, the FixedPoolAllocator
-                            # has risks for asymmetry of allocation strategy that can break CG,
-                            # so it is safer to turn this on when using FixedPoolAllocator.
-                            not self.ddp_config.megatron_fsdp_max_pool_double_buffer,
-                        )))
+                        and bool(
+                            int(
+                                os.getenv(
+                                    "MEGATRON_FSDP_DBLBUF_PERSIST_GRAD_BUF",
+                                    # If not using the MaxPoolAllocator, the FixedPoolAllocator
+                                    # has asymmetry of allocation strategy that can break CG,
+                                    # so safer to turn this on when using FixedPoolAllocator.
+                                    not self.ddp_config.megatron_fsdp_max_pool_double_buffer,
+                                )
+                            )
+                        )
                     ),
                 )
             self.double_buf_units = self.weight_alloc.fsdp_double_buffer_units
@@ -2733,7 +2811,7 @@ class ParamAndGradBuffer:
                         wbuf.init_data(
                             torch.empty(wbuf.data_size, dtype=wbuf.dtype, device=self.device)
                         )
-                bucket = wbuf.fetch_bucket()
+                bucket = wbuf.fetch_bucket(strict_assignments=False)
 
             tbuf = group.transpose_weight_buffer
             if tbuf:
@@ -2754,7 +2832,7 @@ class ParamAndGradBuffer:
                         tbuf.init_data(
                             torch.empty(tbuf.data_size, dtype=tbuf.dtype, device=self.device)
                         )
-                transpose_bucket = tbuf.fetch_bucket()
+                transpose_bucket = tbuf.fetch_bucket(strict_assignments=False)
 
             mbuf = group.main_weight_buffer
             if mbuf:
@@ -3194,6 +3272,7 @@ class ParamAndGradBuffer:
                             "is_embedding_or_output_parameter",
                             "is_embedding_parameter",
                             "_tensor_parallel_mode",
+                            "_megatron_fsdp_model",
                         ]:
                             if hasattr(orig_param, attr_name):
                                 setattr(param, attr_name, getattr(orig_param, attr_name))
