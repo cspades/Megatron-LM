@@ -3203,6 +3203,10 @@ def _add_experimental_args(parser):
                              "the FixedPoolAllocator to support asymmetrical FSDP unit configurations. Will "
                              "increase memory overhead to recycle buffers that fit all FSDP units. Enables "
                              "NCCL user buffer registration and CUDA graph replay for mixed-layer models.")
+    group.add_argument("--fsdp-db-use-persist-buf-on-alloc-fail", action='store_true',
+                        help="When using Megatron-FSDP FixedPool double buffering, persist non-unit modules "
+                             "that are not included in the symmetric buffer pool. May be necessary for NCCL "
+                             "UBR or CUDA Graphs on hybrid architectures.")
     
     return parser
 

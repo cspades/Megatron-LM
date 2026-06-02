@@ -249,6 +249,7 @@ fsdp_options=" \
     --megatron-fsdp-max-pool-double-buffer"
     #--use-nccl-ub \
     #--use-sharp \
+    #--fsdp-db-use-persist-buf-on-alloc-fail \
 
 profile_options=" \
     --profile \
