@@ -591,6 +591,17 @@ class MegatronFSDP(torch.nn.Module):
             if not group.requires_grad:
                 return
 
+            # Wait on the partial CG wgrad, which is accumulated in the graph!
+            cudagraph_wgrad_event = getattr(param, "_cudagraph_wgrad_event", None)
+            if cudagraph_wgrad_event is not None:
+                # Megatron-FSDP's post-accumulate hook is based on the AccumulateGrad
+                # stream created during partial CG capture. However, when the wgrad
+                # accumulation is captured, the default stream runs the accumulation.
+                # Thus, we need to synchronize our AccumulateGrad stream to the
+                # partial CG BWD replay default stream to prevent wgrad race conditions.
+                torch.cuda.current_stream().wait_event(cudagraph_wgrad_event)
+                param._cudagraph_wgrad_event = None
+
             # Sharded Gradient Buffer
             gbuf = group.hfsdp_helper_gbuf if group.hfsdp_helper_gbuf else group.main_grad_buffer
             if gbuf.is_data_distributed:
