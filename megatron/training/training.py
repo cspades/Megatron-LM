@@ -3458,7 +3458,8 @@ def train(
         update_num_microbatches(args.consumed_train_samples, consistency_check=True, verbose=True)
 
         if (
-            args.cuda_graph_impl == "full_iteration"
+            args.use_megatron_fsdp
+            and args.cuda_graph_impl == "full_iteration"
             and args.optimizer_cuda_graph
         ):
             # When using full-iteration + optimizer CG with Megatron-FSDP, switch to CG-mode.
