@@ -209,7 +209,7 @@ options=" \
         --cuda-graph-scope mamba attn moe_router \
         --no-check-for-nan-in-loss-and-grad \
         --te-rng-tracker \
-        --exit-interval 10"
+        --exit-interval 15"
         # --optimizer-cuda-graph \
         # --recompute-granularity selective \
         # --recompute-modules moe moe_act core_attn shared_experts layernorm \
@@ -227,13 +227,13 @@ options=" \
         #--tensorboard-dir ${TENSORBOARD_DIR}"
         #--moe-shared-expert-overlap \
         #--moe-shared-expert-compute-before-router \
-        #--ddp-reduce-scatter-with-fp32-accumulation \
 
 mxfp8_options=" \
     --moe-router-padding-for-quantization \
     --fp8-format e4m3 \
     --fp8-recipe mxfp8 \
-    --fp8-param-gather"
+    --fp8-param-gather \
+    --reuse-grad-buf-for-mxfp8-param-ag"
 
 nvfp4_options=" \
     --moe-router-padding-for-quantization \
@@ -256,6 +256,7 @@ fsdp_options=" \
     --data-parallel-sharding-strategy optim_grads_params \
     --no-gradient-accumulation-fusion \
     --ckpt-format fsdp_dtensor \
+    --ddp-reduce-scatter-with-fp32-accumulation \
     --megatron-fsdp-max-pool-double-buffer \
     --megatron-fsdp-grad-comm-dtype bf16 \
     --megatron-fsdp-main-params-dtype fp32 \
@@ -275,7 +276,7 @@ profile_options=" \
     --profile-step-end 4 \
     --profile-ranks 0 \
     --record-memory-history \
-    --memory-snapshot-path ${RUN_DIR}/${NAME}_node${SLURM_NODEID}_rank${SLURM_PROCID}.pickle"
+    --memory-snapshot-path ${RUN_DIR}/${NAME}_job${SLURM_JOB_ID}_node${SLURM_NODEID}_rank${SLURM_PROCID}.pickle"
 
 #nsys_cmd="nsys profile -s none -t nvtx,cuda-sw -o ${RUN_DIR}/${NAME}_node${SLURM_NODEID}_rank${SLURM_PROCID} --force-overwrite true --cuda-graph-trace=node --capture-range=cudaProfilerApi --capture-range-end=stop"
 run_cmd="torchrun --nproc_per_node 4 --nnodes 1 --log-dir ${LOGS_DIR}/${NAME}.log ${MEGATRON_LM_DIR}/pretrain_mamba.py ${options} ${mxfp8_options} ${mtp_options} ${fsdp_options} ${profile_options}"
