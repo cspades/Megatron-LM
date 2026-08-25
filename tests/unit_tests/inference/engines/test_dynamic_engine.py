@@ -6,7 +6,7 @@ import math
 import os
 import random
 import types
-from collections import deque
+from collections import OrderedDict, deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from functools import partial
@@ -36,6 +36,7 @@ from megatron.core.inference.contexts.dynamic_context import (
 )
 from megatron.core.inference.engines import DynamicInferenceEngine
 from megatron.core.inference.engines.dynamic_engine import EngineState
+from megatron.core.inference.headers import Headers
 from megatron.core.inference.inference_request import (
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
@@ -101,8 +102,16 @@ def _build_mock_vlm_engine(image_embeddings):
     engine.context = mock.Mock(block_size_tokens=256, enable_prefix_caching=False)
     engine._get_cached_vision_embedding = mock.Mock(return_value=None)
     engine._cache_vision_embedding = mock.Mock()
-    engine._resolve_image_token_id = mock.Mock(return_value=99)
+    wrapper.resolve_media_token_id.return_value = 99
     return engine, wrapper
+
+
+def _build_vision_embedding_cache_engine(max_bytes):
+    engine = object.__new__(DynamicInferenceEngine)
+    engine.vision_embedding_cache_max_bytes = max_bytes
+    engine._vision_embedding_cache = OrderedDict()
+    engine._vision_embedding_cache_bytes = 0
+    return engine
 
 
 def _call_build_vlm_request(engine, tokens, *, media_tokens_preexpanded):
@@ -120,7 +129,7 @@ def _call_build_vlm_request(engine, tokens, *, media_tokens_preexpanded):
         )
 
 
-def test_build_vlm_request_preserves_preexpanded_tokens_and_derives_mask():
+def test_build_vlm_request_normalizes_preexpanded_tokens_and_derives_mask():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
     tokens = torch.tensor([10, 99, 99, 20], dtype=torch.int64)
     wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
@@ -129,11 +138,11 @@ def test_build_vlm_request_preserves_preexpanded_tokens_and_derives_mask():
 
     request = _call_build_vlm_request(engine, tokens, media_tokens_preexpanded=True)
 
-    assert torch.equal(request.prompt_tokens, tokens)
+    assert request.prompt_tokens.tolist() == [10, -1, -1, 20]
     assert request.compact_prompt_tokens is None
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
     wrapper.expand_image_tokens.assert_not_called()
-    wrapper.build_preexpanded_media_token_mask.assert_called_once_with(tokens, "image")
+    wrapper.build_preexpanded_media_token_mask.assert_called_once_with(tokens, 99)
 
 
 def test_build_vlm_request_rejects_preexpanded_embedding_count_mismatch():
@@ -148,15 +157,28 @@ def test_build_vlm_request_rejects_preexpanded_embedding_count_mismatch():
         )
 
 
+def test_build_vlm_request_rejects_inconsistent_cached_embedding_count():
+    engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
+    engine._get_cached_vision_embedding.return_value = torch.ones(1, 4)
+    wrapper.build_preexpanded_media_token_mask.return_value = torch.tensor(
+        [-1, 0, 1, -1], dtype=torch.int64
+    )
+
+    with pytest.raises(RuntimeError, match="media identity is inconsistent"):
+        _call_build_vlm_request(
+            engine, torch.tensor([10, 99, 99, 20], dtype=torch.int64), media_tokens_preexpanded=True
+        )
+
+
 def test_build_vlm_request_keeps_compact_expansion_path():
     engine, wrapper = _build_mock_vlm_engine(torch.ones(2, 4))
-    compact_tokens = torch.tensor([10, 42, 20], dtype=torch.int64)
+    compact_tokens = torch.tensor([10, 99, 20], dtype=torch.int64)
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
 
     request = _call_build_vlm_request(engine, compact_tokens, media_tokens_preexpanded=False)
 
     wrapper.expand_image_tokens.assert_called_once()
-    assert request.prompt_tokens.tolist() == [10, 99, 99, 20]
+    assert request.prompt_tokens.tolist() == [10, -1, -1, 20]
     assert torch.equal(request.compact_prompt_tokens, compact_tokens)
     assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
 
@@ -168,7 +190,7 @@ def test_build_vlm_request_enables_media_salted_prefix_caching():
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
 
     request = _call_build_vlm_request(
-        engine, torch.tensor([10, 42, 20], dtype=torch.int64), media_tokens_preexpanded=False
+        engine, torch.tensor([10, 99, 20], dtype=torch.int64), media_tokens_preexpanded=False
     )
 
     media_cache_key = compute_media_cache_key(
@@ -179,6 +201,130 @@ def test_build_vlm_request_enables_media_salted_prefix_caching():
     assert request.precomputed_block_hashes == compute_block_hashes_batched(
         request.prompt_tokens, block_size=2, cache_salt=media_cache_key
     )
+
+
+def test_vision_embedding_cache_accounts_bytes_and_replacements():
+    engine = _build_vision_embedding_cache_engine(max_bytes=32)
+    first = torch.ones(4, dtype=torch.float32)
+    replacement = torch.ones(3, dtype=torch.float16)
+
+    engine._cache_vision_embedding("image", first)
+    assert engine._vision_embedding_cache_bytes == 16
+    engine._cache_vision_embedding("image", replacement)
+
+    assert engine._vision_embedding_cache["image"] is replacement
+    assert engine._vision_embedding_cache_bytes == 6
+
+
+def test_vision_embedding_cache_uses_lru_eviction():
+    engine = _build_vision_embedding_cache_engine(max_bytes=16)
+    embeddings = {key: torch.ones(2, dtype=torch.float32) for key in ("oldest", "recent", "new")}
+    engine._cache_vision_embedding("oldest", embeddings["oldest"])
+    engine._cache_vision_embedding("recent", embeddings["recent"])
+
+    assert engine._get_cached_vision_embedding("oldest") is embeddings["oldest"]
+    engine._cache_vision_embedding("new", embeddings["new"])
+
+    assert list(engine._vision_embedding_cache) == ["oldest", "new"]
+    assert engine._vision_embedding_cache_bytes == 16
+
+
+def test_vision_embedding_cache_ignores_oversized_and_zero_budget_entries():
+    engine = _build_vision_embedding_cache_engine(max_bytes=8)
+    retained = torch.ones(2, dtype=torch.float32)
+    engine._cache_vision_embedding("retained", retained)
+    engine._cache_vision_embedding("oversized", torch.ones(3, dtype=torch.float32))
+    assert list(engine._vision_embedding_cache) == ["retained"]
+    assert engine._vision_embedding_cache["retained"] is retained
+    assert engine._vision_embedding_cache_bytes == 8
+
+    disabled_engine = _build_vision_embedding_cache_engine(max_bytes=0)
+    disabled_engine._cache_vision_embedding("image", retained)
+    assert disabled_engine._get_cached_vision_embedding("image") is None
+    assert not disabled_engine._vision_embedding_cache
+    assert disabled_engine._vision_embedding_cache_bytes == 0
+
+
+def test_clear_vision_embedding_cache_resets_lifecycle_state():
+    engine = _build_vision_embedding_cache_engine(max_bytes=8)
+    engine._cache_vision_embedding("image", torch.ones(2, dtype=torch.float32))
+
+    engine.clear_vision_embedding_cache()
+
+    assert not engine._vision_embedding_cache
+    assert engine._vision_embedding_cache_bytes == 0
+
+
+def test_suspend_clears_vision_embedding_cache_before_releasing_state():
+    engine = _build_vision_embedding_cache_engine(max_bytes=8)
+    engine.state = EngineState.RUNNING
+    engine._cache_vision_embedding("image", torch.ones(2, dtype=torch.float32))
+
+    with (
+        mock.patch.object(
+            InferenceMode, "unset_active", side_effect=RuntimeError("stop after cache clear")
+        ),
+        pytest.raises(RuntimeError, match="stop after cache clear"),
+    ):
+        engine.suspend()
+
+    assert not engine._vision_embedding_cache
+    assert engine._vision_embedding_cache_bytes == 0
+
+
+def test_generation_epoch_change_clears_vision_embedding_cache():
+    engine = _build_vision_embedding_cache_engine(max_bytes=8)
+    engine.is_mp_coordinator = False
+    engine.model_parallel_subscriber_socket = mock.Mock()
+    engine._poll_pending_kv_imports = mock.Mock()
+    engine._poll_pending_kv_pushes = mock.Mock()
+    engine.requests = {}
+    engine._pending_signals = deque()
+    engine._generation_epoch = 1
+
+    def schedule_epoch(epoch):
+        engine.model_parallel_subscriber_socket.recv_multipart.return_value = [
+            bytes([Headers.TP_BROADCAST.value]),
+            msgpack.packb([Headers.SET_GENERATION_EPOCH.value, epoch], use_bin_type=True),
+        ]
+        assert engine.schedule_requests() == 1
+
+    engine._cache_vision_embedding("old-weights", torch.ones(2, dtype=torch.float32))
+    schedule_epoch(2)
+    assert not engine._vision_embedding_cache
+
+    # Repeating the same epoch does not invalidate embeddings from unchanged weights.
+    retained = torch.ones(2, dtype=torch.float32)
+    engine._cache_vision_embedding("current-weights", retained)
+    schedule_epoch(2)
+    assert engine._get_cached_vision_embedding("current-weights") is retained
+
+
+def test_refresh_vlm_request_embeddings_reencodes_preserved_media():
+    engine = _build_vision_embedding_cache_engine(max_bytes=1024)
+    refreshed = torch.arange(6, dtype=torch.float32).reshape(2, 1, 3)
+    wrapper = mock.Mock()
+    wrapper._forward_vision_encoder.return_value = refreshed
+    engine.controller = types.SimpleNamespace(inference_wrapped_model=wrapper)
+    request = types.SimpleNamespace(
+        imgs=torch.ones(1, 4),
+        num_tiles=None,
+        imgs_sizes=torch.tensor([[2, 2]]),
+        num_frames=torch.tensor([1]),
+        image_token_mask=torch.tensor([-1, 0, 1]),
+        block_hash_salt="media",
+    )
+
+    result = engine._refresh_vlm_request_embeddings(request)
+
+    assert result is refreshed
+    wrapper._forward_vision_encoder.assert_called_once_with(
+        request.imgs,
+        num_image_tiles=None,
+        imgs_sizes=request.imgs_sizes,
+        num_frames=request.num_frames,
+    )
+    assert engine._get_cached_vision_embedding("media") is refreshed
 
 
 def skip_if_mamba_sequence_packing_not_available(model_provider: str, ssm_mixer: str = "mamba"):

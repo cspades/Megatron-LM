@@ -38,17 +38,14 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
 
     def get_multimodal_prompt_config(self) -> MultimodalPromptConfig:
         """Return Nemotron Omni's compact visual-span contract."""
-        model = resolve_wrapped_model(self.model)
         return MultimodalPromptConfig(
             image_spec=MediaPromptSpec(
                 model_token="<image>",
-                model_token_id=int(model.image_token_index),
                 prefix="<img>",
                 suffix="</img>",
             ),
             video_spec=MediaPromptSpec(
                 model_token="<image>",
-                model_token_id=int(model.image_token_index),
                 prefix="<img>",
                 suffix="</img>",
             ),
@@ -64,7 +61,9 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             )
         return super().run_one_forward_step(inference_input, recv_buffer_seq_len)
 
-    def expand_image_tokens(self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None):
+    def expand_image_tokens(
+        self, tokens, image_token_id, num_tiles=None, imgs_sizes=None, num_frames=None
+    ):
         """Expand compact image/video placeholders and build embedding masks."""
         if imgs_sizes is None:
             raise NotImplementedError(
@@ -80,7 +79,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             imgs_sizes, patch_dim=model.patch_dim, pixel_shuffle=True
         )
         placeholder_count = sum(
-            token == model.image_token_index for sample_tokens in tokens for token in sample_tokens
+            token == image_token_id for sample_tokens in tokens for token in sample_tokens
         )
 
         replacement_counts = dynamic_media_replacement_counts(
@@ -98,7 +97,7 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             expanded_sample = []
             mask_sample = []
             for token in sample_tokens:
-                if token != model.image_token_index:
+                if token != image_token_id:
                     expanded_sample.append(token)
                     mask_sample.append(None)
                     continue

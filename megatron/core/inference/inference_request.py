@@ -655,6 +655,8 @@ class DynamicInferenceRequest(InferenceRequest):
     uid: str = field(default_factory=lambda: f"chatcmpl-{uuid.uuid4().hex}")
     prompt: Optional[str] = None
     prompt_tokens: Optional[torch.Tensor] = None
+    # Preserve the user-facing compact prompt for RL bookkeeping when the
+    # engine expands media placeholders into the authoritative prompt tokens.
     compact_prompt_tokens: Optional[torch.Tensor] = None
     # remaining prompt tokens are used for chunked prefill
     remaining_prompt_tokens: Optional[torch.Tensor] = None
@@ -995,6 +997,7 @@ class DynamicInferenceRequestRecord:
         common_kwargs = dict(
             request_id=old_request.request_id,
             prompt_tokens=new_prompt_tokens,
+            compact_prompt_tokens=old_request.compact_prompt_tokens,
             sampling_params=new_sampling_params,
             policy_epoch=policy_epoch,
             kv_cache_epoch=kv_cache_epoch,
@@ -1002,18 +1005,31 @@ class DynamicInferenceRequestRecord:
             enable_prefix_caching=old_request.enable_prefix_caching,
             block_hash_salt=old_request.block_hash_salt,
         )
-        # Preserve the VLM subtype and multimodal fields so a suspend/resume
-        # cycle doesn't downcast the request to text-only and lose its imgs /
-        # embeddings / token mask.
+        # Preserve the VLM subtype and media inputs so a suspend/resume cycle
+        # doesn't downcast the request to text-only.
         if isinstance(old_request, DynamicVLMInferenceRequest):
+            image_token_mask = old_request.image_token_mask
+            if image_token_mask is not None and old_request.generated_tokens:
+                image_token_mask = torch.cat(
+                    (
+                        image_token_mask,
+                        torch.full(
+                            (len(old_request.generated_tokens),),
+                            -1,
+                            dtype=image_token_mask.dtype,
+                            device=image_token_mask.device,
+                        ),
+                    )
+                )
             new_request = DynamicVLMInferenceRequest(
                 **common_kwargs,
                 num_img_embeddings_per_tile=old_request.num_img_embeddings_per_tile,
                 imgs=old_request.imgs,
                 num_tiles=old_request.num_tiles,
                 decoder_seq_length=old_request.decoder_seq_length,
-                image_embeddings=old_request.image_embeddings,
-                image_token_mask=old_request.image_token_mask,
+                imgs_sizes=old_request.imgs_sizes,
+                num_frames=old_request.num_frames,
+                image_token_mask=image_token_mask,
             )
         else:
             new_request = DynamicInferenceRequest(**common_kwargs)
@@ -1116,7 +1132,14 @@ class DynamicInferenceRequestRecord:
             (DynamicInferenceRequestRecord) Deserialized record.
         """
         request = cls(**obj)
-        request.requests = [DynamicInferenceRequest.deserialize(r) for r in obj["requests"]]
+        request.requests = [
+            (
+                DynamicVLMInferenceRequest.deserialize(serialized)
+                if "num_img_embeddings_per_tile" in serialized
+                else DynamicInferenceRequest.deserialize(serialized)
+            )
+            for serialized in obj["requests"]
+        ]
         return request
 
 
@@ -1156,6 +1179,8 @@ class VLMInferenceRequest(InferenceRequest):
     imgs: torch.Tensor
     num_tiles: torch.Tensor
     decoder_seq_length: int
+    imgs_sizes: Optional[torch.Tensor] = None
+    num_frames: Optional[torch.Tensor] = None
 
 
 @dataclass(kw_only=True)
@@ -1163,9 +1188,7 @@ class DynamicVLMInferenceRequest(DynamicInferenceRequest, VLMInferenceRequest):
     """Dynamic inference request for VLM models.
 
     Combines DynamicInferenceRequest (for dynamic batching) with VLMInferenceRequest
-    (for multimodal fields). Also stores pre-computed image embeddings and the image
-    token mask produced by expand_image_tokens.
+    (for multimodal fields).
     """
 
-    image_embeddings: Optional[torch.Tensor] = None  # [seq_img, 1, hidden]
     image_token_mask: Optional[torch.Tensor] = None  # 1D, -1=text, >=0=image index

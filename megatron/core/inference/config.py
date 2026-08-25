@@ -241,10 +241,16 @@ class ImageProcessingConfig:
 
 @dataclass
 class VideoProcessingConfig:
-    """Configuration for decoding raw video bytes into model input tensors."""
+    """Configuration for decoding raw video bytes into model input tensors.
+
+    Frame manifests are a trusted RL/internal transport whose request-provided
+    paths are read directly. Do not enable ``frame_manifest_magic`` on an
+    endpoint that accepts untrusted clients.
+    """
 
     image_config: ImageProcessingConfig
     num_frames: int = 8
+    """Maximum sampled frames per encoded video; ``-1`` keeps every frame."""
     temporal_patch_size: int = 1
     frame_manifest_magic: Optional[bytes] = None
     """Prefix for payloads encoded as ``magic + UTF-8 {"frame_paths": [...]}``."""
@@ -254,10 +260,12 @@ class VideoProcessingConfig:
 class MediaPromptSpec:
     """Map one API media type to the model's prompt-token contract."""
 
-    model_token: str = "<image>"
-    model_token_id: Optional[int] = None
+    model_token: Optional[str] = None
+    """Compact media token resolved through the inference tokenizer; required for media."""
     prefix: str = ""
+    """Text inserted before ``model_token``; e.g., ``"<img>"`` in ``<img><image></img>``."""
     suffix: str = ""
+    """Text inserted after ``model_token``; e.g., ``"</img>"`` in ``<img><image></img>``."""
     input_marker: Optional[str] = None
 
 

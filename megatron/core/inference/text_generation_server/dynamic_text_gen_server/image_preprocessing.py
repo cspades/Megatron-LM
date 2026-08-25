@@ -10,6 +10,7 @@ can import it without circular dependencies.
 import io
 import json
 import math
+import random
 from pathlib import Path
 from typing import Optional
 
@@ -17,28 +18,6 @@ import torch
 
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.models.vision.encoder_registry import REGISTRY as _ENCODER_REGISTRY
-
-
-def _video_target_resolution(image, config: ImageProcessingConfig) -> tuple[int, int]:
-    """Return a video frame target as ``(height, width)``."""
-    target_patches = config.dynamic_resolution_max_patches
-    aspect_ratio = image.width / max(image.height, 1)
-    patch_height = max(1, round(math.sqrt(target_patches / aspect_ratio)))
-    patch_width = max(1, round(math.sqrt(target_patches * aspect_ratio)))
-    required_divisor = 2 if config.pixel_shuffle else 1
-    if required_divisor > 1:
-        height_remainder = patch_height % required_divisor
-        width_remainder = patch_width % required_divisor
-        height_up = patch_height + (required_divisor - height_remainder if height_remainder else 0)
-        width_up = patch_width + (required_divisor - width_remainder if width_remainder else 0)
-        if height_up * width_up <= target_patches:
-            patch_height, patch_width = height_up, width_up
-        else:
-            patch_height = max(required_divisor, patch_height - height_remainder)
-            patch_width = max(required_divisor, patch_width - width_remainder)
-    return patch_height * config.patch_dim, patch_width * config.patch_dim
-
-
 def _resolve_pixel_stats(vision_model_type: str):
     """Return (pixel_mean, pixel_std) for a vision encoder.
 
@@ -59,7 +38,11 @@ def _resolve_pixel_stats(vision_model_type: str):
 
 
 def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional[bytes]):
-    """Load PIL images from a configured frame-sequence manifest."""
+    """Load PIL images from a configured frame-sequence manifest.
+
+    This is a trusted RL/internal transport. Request-provided paths are read
+    directly and must not be accepted from untrusted clients.
+    """
     if not frame_manifest_magic or not payload.startswith(frame_manifest_magic):
         return None
 
@@ -86,6 +69,77 @@ def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional
         with Image.open(resolved) as image:
             frames.append(image.convert("RGB").copy())
     return frames
+
+
+def _sample_count(total_frames: int, config: VideoProcessingConfig) -> int:
+    """Return a bounded sample count compatible with temporal patching."""
+    if config.num_frames == -1:
+        return total_frames
+    sample_count = min(config.num_frames, total_frames)
+    if config.temporal_patch_size > 1 and sample_count % config.temporal_patch_size:
+        rounded_down = (sample_count // config.temporal_patch_size) * config.temporal_patch_size
+        sample_count = (
+            rounded_down if rounded_down > 0 else min(config.temporal_patch_size, total_frames)
+        )
+    return sample_count
+
+
+def _uniform_indices(total_frames: int, sample_count: int) -> list[int]:
+    """Return deterministic, approximately uniform frame indices."""
+    if sample_count <= 0:
+        return []
+    if sample_count == 1:
+        return [0]
+    stride = (total_frames - 1) / (sample_count - 1)
+    return [round(index * stride) for index in range(sample_count)]
+
+
+def _decode_sampled_video_frames(encoded_video: bytes, config: VideoProcessingConfig):
+    """Decode only a bounded set of PyAV frames into PIL images.
+
+    Container frame metadata enables direct index selection while decoding.
+    Streams without a declared frame count use deterministic reservoir
+    sampling, retaining at most ``num_frames`` decoded frame objects.
+    """
+    import av
+
+    with av.open(io.BytesIO(encoded_video)) as container:
+        stream = container.streams.video[0]
+        if config.num_frames == -1:
+            return [frame.to_image().convert("RGB") for frame in container.decode(stream)]
+
+        declared_frames = int(stream.frames or 0)
+        if declared_frames > 0:
+            sample_count = _sample_count(declared_frames, config)
+            sample_indices = _uniform_indices(declared_frames, sample_count)
+            wanted = set(sample_indices)
+            sampled = []
+            final_index = sample_indices[-1]
+            for index, frame in enumerate(container.decode(stream)):
+                if index in wanted:
+                    sampled.append(frame.to_image().convert("RGB"))
+                if index >= final_index:
+                    break
+            return sampled
+
+        rng = random.Random(0)
+        reservoir = []
+        total_frames = 0
+        for index, frame in enumerate(container.decode(stream)):
+            total_frames = index + 1
+            if len(reservoir) < config.num_frames:
+                reservoir.append((index, frame))
+            else:
+                replacement = rng.randrange(total_frames)
+                if replacement < config.num_frames:
+                    reservoir[replacement] = (index, frame)
+
+        reservoir.sort(key=lambda item: item[0])
+        sample_count = _sample_count(total_frames, config)
+        if sample_count < len(reservoir):
+            keep = _uniform_indices(len(reservoir), sample_count)
+            reservoir = [reservoir[index] for index in keep]
+        return [frame.to_image().convert("RGB") for _, frame in reservoir]
 
 
 def dynamic_res_preprocess(
@@ -286,8 +340,8 @@ def preprocess_video_bytes_list(
     """
     if not video_bytes_list:
         return {}
-    if config.num_frames <= 0:
-        raise ValueError("VideoProcessingConfig.num_frames must be positive.")
+    if config.num_frames == 0 or config.num_frames < -1:
+        raise ValueError("VideoProcessingConfig.num_frames must be positive or -1.")
     if config.temporal_patch_size <= 0:
         raise ValueError("VideoProcessingConfig.temporal_patch_size must be positive.")
     if not config.image_config.dynamic_resolution or config.image_config.use_tiling:
@@ -296,59 +350,35 @@ def preprocess_video_bytes_list(
             "non-tiled vision inputs."
         )
 
-    import numpy as np
-
     def decode_frames(encoded_video):
         frames = _load_frame_sequence_manifest(encoded_video, config.frame_manifest_magic)
         if frames is not None:
-            return frames, True
-
-        import av
-
-        with av.open(io.BytesIO(encoded_video)) as container:
-            return ([frame.to_image().convert("RGB") for frame in container.decode(video=0)], False)
+            return frames
+        return _decode_sampled_video_frames(encoded_video, config)
 
     packed_videos = []
     packed_sizes = []
     frame_counts = []
-    reference_hw = None
-
     for encoded_video in video_bytes_list:
         if not isinstance(encoded_video, (bytes, bytearray)):
             raise TypeError("video payloads must contain only bytes.")
-        frames, is_frame_sequence = decode_frames(bytes(encoded_video))
+        frames = decode_frames(bytes(encoded_video))
         if not frames:
             raise ValueError("Decoded video contains no frames.")
-
-        if is_frame_sequence:
-            if len(frames) != config.num_frames:
-                raise ValueError(
-                    "Frame-sequence count must match the configured count: "
-                    f"{len(frames)} != {config.num_frames}."
-                )
-            sampled_frames = frames
-        else:
-            sample_count = min(config.num_frames, len(frames))
-            if config.temporal_patch_size > 1 and sample_count % config.temporal_patch_size:
-                rounded_down = (
-                    sample_count // config.temporal_patch_size
-                ) * config.temporal_patch_size
-                sample_count = (
-                    rounded_down
-                    if rounded_down > 0
-                    else min(config.temporal_patch_size, len(frames))
-                )
-            sample_indices = (
-                np.rint(np.linspace(0, len(frames) - 1, num=sample_count)).astype(np.int64).tolist()
-            )
-            sampled_frames = [frames[index] for index in sample_indices]
-        sample_count = len(sampled_frames)
+        sample_count = len(frames)
 
         frame_tensors = []
         frame_sizes = []
-        if reference_hw is None:
-            reference_hw = _video_target_resolution(sampled_frames[0], config.image_config)
-        for frame in sampled_frames:
+        reference_frame = dynamic_res_preprocess(
+            frames[0],
+            min_patches=config.image_config.dynamic_resolution_min_patches,
+            max_patches=config.image_config.dynamic_resolution_max_patches,
+            res_step=config.image_config.patch_dim,
+            pixel_shuffle=config.image_config.pixel_shuffle,
+            spatial_merge_size=config.image_config.spatial_merge_size,
+        )
+        reference_hw = (reference_frame.height, reference_frame.width)
+        for frame in frames:
             imgs, imgs_sizes = preprocess_image(
                 frame, config.image_config, target_hw=reference_hw, device=device
             )

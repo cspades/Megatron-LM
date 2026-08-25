@@ -36,7 +36,7 @@ class AbstractModelInferenceWrapper(abc.ABC):
             cache and other inference params.
     """
 
-    # Input modalities accepted by this wrapper.
+    # Capability metadata to track what modalities an inference wrapper supports.
     supports_text: ClassVar[bool] = True
     supports_image: ClassVar[bool] = False
     supports_video: ClassVar[bool] = False
@@ -94,19 +94,44 @@ class AbstractModelInferenceWrapper(abc.ABC):
         """Return this model's structured-media prompt contract, if any."""
         return None
 
-    def build_preexpanded_media_token_mask(
-        self, prompt_tokens: torch.Tensor, modality: str
-    ) -> torch.Tensor:
-        """Map pre-expanded media-token positions to sequential embedding indices."""
+    def resolve_media_token_id(self, tokenizer, modality: str) -> int:
+        """Resolve and validate the tokenizer ID for a compact media placeholder."""
         prompt_config = self.get_multimodal_prompt_config()
         if prompt_config is None:
             raise ValueError(f"{type(self).__name__} does not define a multimodal prompt contract.")
-        media_token_id = prompt_config.get_spec(modality).model_token_id
-        if media_token_id is None:
+        spec = prompt_config.get_spec(modality)
+        if spec.model_token is None:
             raise ValueError(
-                f"{type(self).__name__} does not define a model token id for " f"{modality} inputs."
+                f"{type(self).__name__} does not define a model token for {modality} inputs."
             )
 
+        tokenizer_token_id = None
+        candidates = [
+            getattr(getattr(tokenizer, "_tokenizer", None), "tokenizer", None),
+            getattr(tokenizer, "_tokenizer", None),
+            tokenizer,
+        ]
+        for candidate in candidates:
+            if candidate is None or not hasattr(candidate, "convert_tokens_to_ids"):
+                continue
+            try:
+                resolved_id = candidate.convert_tokens_to_ids(spec.model_token)
+            except (TypeError, ValueError):
+                resolved_id = candidate.convert_tokens_to_ids([spec.model_token])
+            if isinstance(resolved_id, (list, tuple)):
+                resolved_id = resolved_id[0] if len(resolved_id) == 1 else None
+            if resolved_id is not None and resolved_id != getattr(candidate, "unk_token_id", None):
+                tokenizer_token_id = int(resolved_id)
+                break
+
+        if tokenizer_token_id is None:
+            raise ValueError(f"Tokenizer does not define the compact {spec.model_token!r} token.")
+        return tokenizer_token_id
+
+    def build_preexpanded_media_token_mask(
+        self, prompt_tokens: torch.Tensor, media_token_id: int
+    ) -> torch.Tensor:
+        """Map pre-expanded media-token positions to sequential embedding indices."""
         media_positions = prompt_tokens == int(media_token_id)
         media_indices = torch.nonzero(media_positions, as_tuple=False).flatten()
         mask = torch.full_like(prompt_tokens, -1, dtype=torch.int64)

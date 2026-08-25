@@ -11,6 +11,7 @@ from megatron.core.inference.inference_request import (
     DynamicInferenceEventType,
     DynamicInferenceRequest,
     DynamicInferenceRequestRecord,
+    DynamicVLMInferenceRequest,
     FinishedRequestRecord,
     InferenceRequest,
     compute_block_hashes_batched,
@@ -60,6 +61,7 @@ def test_serialization_helpers_round_trip():
 
 
 def test_preexpanded_multimodal_request_round_trip():
+    """RL capability metadata survives client-to-engine serialization."""
     media = {
         "image": {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])},
         "media_tokens_preexpanded": True,
@@ -187,6 +189,7 @@ def test_inference_request_serialize_round_trip_through_msgpack():
     dyn = _make_dynamic_request(
         request_id=22,
         prompt_tokens=torch.tensor([1, 2]),
+        compact_prompt_tokens=torch.tensor([1, 99, 2]),
         generated_tokens=[10],
         routing_indices=np.array([[1, 2], [3, 4]], dtype=np.int32),
     )
@@ -194,6 +197,7 @@ def test_inference_request_serialize_round_trip_through_msgpack():
     dyn_out = DynamicInferenceRequest.deserialize(dyn_data)
     assert isinstance(dyn_out.routing_indices, np.ndarray)
     assert dyn_out.routing_indices.tolist() == [[1, 2], [3, 4]]
+    assert dyn_out.compact_prompt_tokens.tolist() == [1, 99, 2]
     # The engine-minted uid (the OpenAI response id / ledger key) survives the wire.
     assert dyn_out.uid == dyn.uid
 
@@ -253,6 +257,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     req = DynamicInferenceRequest(
         request_id=1,
         prompt_tokens=torch.tensor([1, 2, 3, 4, 5, 6]),
+        compact_prompt_tokens=torch.tensor([1, 99, 6]),
         sampling_params=sp,
         generated_tokens=[7, 8],
         block_size_tokens=4,
@@ -268,6 +273,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert new_req.sampling_params.num_tokens_to_generate == 6
     assert new_req.block_size_tokens == 4
     assert new_req.enable_prefix_caching
+    assert torch.equal(new_req.compact_prompt_tokens, req.compact_prompt_tokens)
     assert new_req.precomputed_block_hashes == compute_block_hashes_batched(
         new_req.prompt_tokens, new_req.block_size_tokens
     )
@@ -285,6 +291,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert second_new_req.sampling_params.num_tokens_to_generate == 2
     assert second_new_req.block_size_tokens == 4
     assert second_new_req.enable_prefix_caching
+    assert torch.equal(second_new_req.compact_prompt_tokens, req.compact_prompt_tokens)
     assert second_new_req.precomputed_block_hashes == compute_block_hashes_batched(
         second_new_req.prompt_tokens, second_new_req.block_size_tokens
     )
@@ -307,6 +314,7 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     a = DynamicInferenceRequest(
         request_id=3,
         prompt_tokens=torch.tensor([1, 2, 3]),
+        compact_prompt_tokens=torch.tensor([1, 99, 3]),
         sampling_params=sp,
         generated_tokens=[10, 11],
     )
@@ -329,6 +337,8 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     assert merged.generated_text == "foobar"
     assert merged.generated_length == 3 and merged.latency == 4.2
     assert merged.routing_indices.tolist() == [[1, 2], [3, 4]]
+    # RL consumers need the original compact multimodal prompt after merging.
+    assert torch.equal(merged.compact_prompt_tokens, a.compact_prompt_tokens)
     # Every request mints a distinct chatcmpl- uid; merge() keeps the FIRST
     # segment's — the id the response and the finished-request ledger key on.
     assert a.uid.startswith("chatcmpl-") and a.uid != b.uid
@@ -356,6 +366,38 @@ def test_dynamic_inference_request_record_checkpoint_and_merge():
     # Never-stamped requests record None epochs (non-RL serving).
     finished_cd = FinishedRequestRecord.from_request(merged_cd)
     assert finished_cd.policy_epoch is None and finished_cd.num_evictions == 0
+
+
+def test_dynamic_vlm_record_round_trip_preserves_media_history():
+    request = DynamicVLMInferenceRequest(
+        request_id=7,
+        prompt_tokens=torch.tensor([10, -1, -1, 20]),
+        compact_prompt_tokens=torch.tensor([10, 99, 20]),
+        sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=0),
+        generated_tokens=[30],
+        num_img_embeddings_per_tile=0,
+        imgs=torch.ones(1, 2, 4),
+        num_tiles=None,
+        decoder_seq_length=0,
+        imgs_sizes=torch.tensor([[2, 2]]),
+        num_frames=torch.tensor([1]),
+        image_token_mask=torch.tensor([-1, 0, 1, -1]),
+    )
+    record = DynamicInferenceRequestRecord.from_request(request)
+
+    record.checkpoint()
+    checkpoint = record[-1]
+    assert isinstance(checkpoint, DynamicVLMInferenceRequest)
+    assert request.imgs is checkpoint.imgs
+    assert request.image_token_mask.tolist() == [-1, 0, 1, -1]
+    assert checkpoint.image_token_mask.tolist() == [-1, 0, 1, -1, -1]
+
+    wire = msgpack.unpackb(msgpack.packb(record.serialize(), use_bin_type=True), raw=False)
+    restored = DynamicInferenceRequestRecord.deserialize(wire)
+    assert len(restored.requests) == 2
+    assert all(isinstance(segment, DynamicVLMInferenceRequest) for segment in restored.requests)
+    assert all(segment.imgs_sizes.tolist() == [[2, 2]] for segment in restored.requests)
+    assert all(segment.num_frames.tolist() == [1] for segment in restored.requests)
 
 
 def test_dynamic_inference_request_serialize_strips_event_add_engine():

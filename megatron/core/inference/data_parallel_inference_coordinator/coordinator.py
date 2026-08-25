@@ -26,6 +26,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
 from .handlers import HANDLERS
 from .state import CoordinatorState
 
+DEFAULT_MEDIA_CACHE_AFFINITY_MAX_ENTRIES = 65536
+
 try:
     import zmq
 
@@ -109,6 +111,7 @@ class DataParallelInferenceCoordinator:
         vision_embedding_cache_enabled: bool = False,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        media_cache_affinity_max_entries: int = DEFAULT_MEDIA_CACHE_AFFINITY_MAX_ENTRIES,
     ):
         """
         Initializes the inference coordinator.
@@ -131,6 +134,9 @@ class DataParallelInferenceCoordinator:
                 units of one cached prompt block, used for multimodal routing.
             vision_embedding_cache_enabled (bool): Whether engines retain
                 reusable projected media embeddings.
+            media_cache_affinity_max_entries (int): Maximum number of generated
+                media keys retained by the coordinator's bounded LRU shadow
+                map. Zero disables media-affinity tracking.
             max_requests (int): Max concurrent requests per rank, used to
                 compute normalized_load for prefix-aware scoring.
         """
@@ -219,6 +225,8 @@ class DataParallelInferenceCoordinator:
         self.vision_embedding_cache_enabled = vision_embedding_cache_enabled
         if self.media_cache_routing_weight < 0:
             raise ValueError("media_cache_routing_weight must be non-negative.")
+        if media_cache_affinity_max_entries < 0:
+            raise ValueError("media_cache_affinity_max_entries must be non-negative.")
         self.max_requests = max_requests
         assert self.max_requests is not None and self.max_requests > 0
 
@@ -243,7 +251,7 @@ class DataParallelInferenceCoordinator:
         self._hash_table: dict[int, dict[int, int]] = {}
         self._hash_assignment_counter = 0
         self._media_cache_affinity: OrderedDict[str, bytes] = OrderedDict()
-        self._media_cache_affinity_max_entries = 65536
+        self._media_cache_affinity_max_entries = media_cache_affinity_max_entries
 
         # Clients that have completed the CONNECT handshake.
         self.known_clients = set()
@@ -266,7 +274,7 @@ class DataParallelInferenceCoordinator:
         return self._identities_list[best_idx]
 
     def _update_media_affinity(self, media_cache_key: str, identity: bytes) -> None:
-        """Record the rank most recently assigned a generated media key."""
+        """Record a generated media key in the bounded rank-affinity LRU."""
         self._media_cache_affinity.pop(media_cache_key, None)
         self._media_cache_affinity[media_cache_key] = identity
         if len(self._media_cache_affinity) > self._media_cache_affinity_max_entries:
@@ -301,6 +309,15 @@ class DataParallelInferenceCoordinator:
         """
         self.identities_of_data_parallel_ranks.remove(identity)
         self.removed_engine_identities.add(identity)
+        # Media keys only identify reusable work while their assigned engine is
+        # connected. Purge all references before rank indices are rebuilt.
+        stale_media_keys = [
+            key
+            for key, assigned_identity in self._media_cache_affinity.items()
+            if assigned_identity == identity
+        ]
+        for key in stale_media_keys:
+            del self._media_cache_affinity[key]
         idx = self.identity_to_rank_index.pop(identity, None)
         if idx is None:
             return
@@ -573,6 +590,7 @@ class DataParallelInferenceCoordinator:
         vision_embedding_cache_enabled: bool = False,
         schedule_output_path: str | None = None,
         hostname: str | None = None,
+        media_cache_affinity_max_entries: int = DEFAULT_MEDIA_CACHE_AFFINITY_MAX_ENTRIES,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -598,6 +616,8 @@ class DataParallelInferenceCoordinator:
                 cached prompt blocks.
             vision_embedding_cache_enabled (bool): Whether engines retain
                 reusable projected media embeddings.
+            media_cache_affinity_max_entries (int): Capacity of the bounded
+                coordinator media-affinity LRU. Zero disables tracking.
             max_requests (int): Max concurrent requests per rank.
         """
         coordinator = cls(
@@ -614,6 +634,7 @@ class DataParallelInferenceCoordinator:
             media_cache_coordinator_policy=media_cache_coordinator_policy,
             media_cache_routing_weight=media_cache_routing_weight,
             vision_embedding_cache_enabled=vision_embedding_cache_enabled,
+            media_cache_affinity_max_entries=media_cache_affinity_max_entries,
             schedule_output_path=schedule_output_path,
             hostname=hostname,
         )

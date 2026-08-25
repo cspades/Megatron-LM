@@ -14,6 +14,9 @@ from megatron.core.inference.config import (
 from megatron.core.inference.data_parallel_inference_coordinator import (
     DataParallelInferenceCoordinator,
 )
+from megatron.core.inference.data_parallel_inference_coordinator.coordinator import (
+    DEFAULT_MEDIA_CACHE_AFFINITY_MAX_ENTRIES,
+)
 
 
 def make_coordinator_direct(
@@ -26,6 +29,7 @@ def make_coordinator_direct(
     policy=PrefixCachingCoordinatorPolicy.LONGEST_PREFIX,
     media_policy=MediaCacheCoordinatorPolicy.AFFINITY,
     vision_embedding_cache_enabled=True,
+    media_cache_affinity_max_entries=DEFAULT_MEDIA_CACHE_AFFINITY_MAX_ENTRIES,
     tokenizer=None,
     rank_name_template="rank_{}",
 ):
@@ -43,6 +47,7 @@ def make_coordinator_direct(
         policy: Prefix caching coordinator routing policy.
         media_policy: Media-cache coordinator routing policy.
         vision_embedding_cache_enabled: Whether projected media embeddings are cached.
+        media_cache_affinity_max_entries: Capacity of the bounded media-affinity LRU.
         tokenizer: Optional tokenizer instance (set on the coordinator).
         rank_name_template: Format string for rank names, e.g. ``"rank_{}"``
             or ``"rank-{}"``.  The integer rank index is substituted.
@@ -76,7 +81,7 @@ def make_coordinator_direct(
     coordinator._hash_table = {}
     coordinator._hash_assignment_counter = 0
     coordinator._media_cache_affinity = OrderedDict()
-    coordinator._media_cache_affinity_max_entries = 65536
+    coordinator._media_cache_affinity_max_entries = media_cache_affinity_max_entries
 
     sorted_identities = sorted(coordinator.identities_of_data_parallel_ranks)
     coordinator.identity_to_rank_index = {

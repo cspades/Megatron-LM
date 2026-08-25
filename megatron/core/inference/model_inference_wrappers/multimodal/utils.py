@@ -5,10 +5,30 @@ import torch
 from megatron.core.utils import unwrap_model
 
 
+def validate_video_temporal_patch(num_frames, temporal_patch_size: int) -> list[int]:
+    """Validate video metadata and return normalized host frame counts."""
+    if isinstance(num_frames, int):
+        frame_groups = [num_frames]
+    elif hasattr(num_frames, "tolist"):
+        values = num_frames.tolist()
+        frame_groups = (
+            [int(values)] if not isinstance(values, list) else [int(value) for value in values]
+        )
+    else:
+        frame_groups = [int(value) for value in num_frames]
+    if any(value <= 0 for value in frame_groups):
+        raise ValueError("num_frames entries must be positive.")
+    if temporal_patch_size <= 0:
+        raise ValueError("temporal_patch_size must be positive.")
+    return frame_groups
+
+
 def resolve_wrapped_model(model):
     """Return the innermost model across supported and lightweight wrappers."""
     module = unwrap_model(model)
-    for _ in range(4):
+    visited = set()
+    while id(module) not in visited:
+        visited.add(id(module))
         inner = getattr(module, "module", None)
         if inner is None or inner is module:
             break
@@ -70,26 +90,13 @@ def dynamic_media_replacement_counts(
             )
         return frame_embedding_counts
 
-    if isinstance(num_frames, int):
-        frame_groups = [num_frames]
-    elif hasattr(num_frames, "tolist"):
-        values = num_frames.tolist()
-        frame_groups = (
-            [int(values)] if not isinstance(values, list) else [int(value) for value in values]
-        )
-    else:
-        frame_groups = [int(value) for value in num_frames]
-    if any(value <= 0 for value in frame_groups):
-        raise ValueError("num_frames entries must be positive.")
+    frame_groups = validate_video_temporal_patch(num_frames, temporal_patch_size)
     if sum(frame_groups) != len(frame_embedding_counts):
         raise ValueError(
             "num_frames must partition imgs_sizes exactly: "
             f"sum(num_frames)={sum(frame_groups)}, "
             f"imgs_sizes={len(frame_embedding_counts)}."
         )
-    if temporal_patch_size <= 0:
-        raise ValueError("temporal_patch_size must be positive.")
-
     per_tubelet_counts = []
     per_video_counts = []
     frame_offset = 0

@@ -9,7 +9,7 @@ prefix match, and maintains per-rank shadow state (cached hashes and timestamps)
 
 import asyncio
 import itertools
-from collections import deque
+from collections import Counter, deque
 from typing import Dict, Optional
 from unittest.mock import MagicMock
 
@@ -204,6 +204,7 @@ def make_coordinator_direct(
     prefix_caching_routing_alpha=0.5,
     media_policy=MediaCacheCoordinatorPolicy.AFFINITY,
     vision_embedding_cache_enabled=True,
+    media_cache_affinity_max_entries=65536,
     max_requests=10,
 ):
     """Create a coordinator with mock ZMQ, for unit testing routing logic.
@@ -223,6 +224,7 @@ def make_coordinator_direct(
         prefix_caching_routing_alpha=prefix_caching_routing_alpha,
         media_policy=media_policy,
         vision_embedding_cache_enabled=vision_embedding_cache_enabled,
+        media_cache_affinity_max_entries=media_cache_affinity_max_entries,
         max_requests=max_requests,
         tokenizer=DummyTokenizer(),
     )
@@ -463,6 +465,37 @@ class TestMultimodalAffinityRouting:
         assert (
             coordinator.get_best_data_parallel_rank(hashes, media_cache_key="image-a") == media_rank
         )
+
+    def test_saturated_media_rank_is_not_selected_for_media_hit(self):
+        coordinator = make_coordinator_direct(
+            enable_prefix_caching=False, prefix_caching_routing_alpha=1.0, max_requests=2
+        )
+        free_rank, media_rank = coordinator._identities_list
+        coordinator._pending_counts[coordinator.identity_to_rank_index[media_rank]] = 2
+        coordinator._update_media_affinity("image-a", media_rank)
+
+        assert coordinator.get_best_data_parallel_rank([], media_cache_key="image-a") == free_rank
+
+    def test_media_affinity_lru_capacity_is_configurable(self):
+        coordinator = make_coordinator_direct(media_cache_affinity_max_entries=2)
+        rank = coordinator._identities_list[0]
+        coordinator._update_media_affinity("image-a", rank)
+        coordinator._update_media_affinity("image-b", rank)
+        coordinator._update_media_affinity("image-a", rank)
+        coordinator._update_media_affinity("image-c", rank)
+
+        assert list(coordinator._media_cache_affinity) == ["image-a", "image-c"]
+
+    def test_removing_rank_purges_only_its_media_affinity(self):
+        coordinator = make_coordinator_direct()
+        removed_rank, remaining_rank = coordinator._identities_list
+        coordinator._update_media_affinity("removed-a", removed_rank)
+        coordinator._update_media_affinity("remaining", remaining_rank)
+        coordinator._update_media_affinity("removed-b", removed_rank)
+
+        coordinator._remove_engine(removed_rank)
+
+        assert coordinator._media_cache_affinity == {"remaining": remaining_rank}
 
 
 class TestCoordinatorShadowState:
@@ -758,8 +791,6 @@ class TestLoadAwarePrefixRouting:
             assigned_ranks.append(rank)
 
         # Each rank should get exactly 2 of the 6 requests.
-        from collections import Counter
-
         counts = Counter(assigned_ranks)
         assert counts[rank_0] == 2
         assert counts[rank_1] == 2

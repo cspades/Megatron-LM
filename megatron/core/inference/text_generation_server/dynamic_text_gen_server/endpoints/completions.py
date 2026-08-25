@@ -1,7 +1,6 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 import asyncio
-import base64
 import logging
 import time
 
@@ -10,6 +9,7 @@ from megatron.core.inference.sampling_params import SamplingParams
 
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
 from ..openai_streaming import openai_stream
+from .chat_completions import _decode_base64_media, _extract_media_url_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -126,8 +126,10 @@ try:
                 ):
                     raise ValueError(f"multi_modal_data.{modality} must be a string or list[str].")
                 media_bytes = [
-                    base64.b64decode(
-                        item.split(",", 1)[1] if item.startswith("data:") and "," in item else item
+                    (
+                        _extract_media_url_bytes(item, modality)
+                        if item.startswith("data:")
+                        else _decode_base64_media(item, modality)
                     )
                     for item in encoded_media
                 ]

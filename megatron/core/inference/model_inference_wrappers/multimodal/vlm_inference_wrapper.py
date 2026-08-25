@@ -17,6 +17,7 @@ from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
     dynamic_media_embedding_counts,
     dynamic_media_replacement_counts,
     resolve_wrapped_model,
+    validate_video_temporal_patch,
 )
 
 
@@ -33,11 +34,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
     def get_multimodal_prompt_config(self) -> MultimodalPromptConfig:
         """Use the conventional compact ``<image>`` placeholder."""
-        module = resolve_wrapped_model(self.model)
-        token_id = getattr(module, "image_token_index", None)
-        spec = MediaPromptSpec(
-            model_token="<image>", model_token_id=int(token_id) if token_id is not None else None
-        )
+        spec = MediaPromptSpec(model_token="<image>")
         return MultimodalPromptConfig(image_spec=spec, video_spec=spec)
 
     def prep_model_for_inference(self, prompts_tokens: Optional[torch.Tensor] = None):
@@ -147,7 +144,9 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
     # ---- Dynamic inference methods ----
 
-    def expand_image_tokens(self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None):
+    def expand_image_tokens(
+        self, tokens, image_token_id, num_tiles=None, imgs_sizes=None, num_frames=None
+    ):
         """Expand image tokens to multiple pad tokens.
 
         Supports two modes:
@@ -158,6 +157,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         Args:
             tokens (List[List[int]]): List of token sequences, one per sample.
+            image_token_id (int): Positive tokenizer ID for the compact ``<image>`` token.
             num_tiles (torch.Tensor): Number of tiles per image (static resolution).
             imgs_sizes (torch.Tensor): Per-image sizes [N, 2] with [H, W] (dynamic resolution).
 
@@ -167,7 +167,6 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 position, None for non-image positions.
         """
         module = resolve_wrapped_model(self.model)
-        image_token_index = module.image_token_index
 
         pad_value = -1
         batch_size = len(tokens)
@@ -203,7 +202,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                     count + class_token_len for count in frame_embedding_counts
                 ]
             placeholder_count = sum(
-                token == image_token_index for sample_tokens in tokens for token in sample_tokens
+                token == image_token_id for sample_tokens in tokens for token in sample_tokens
             )
             per_image_embeddings = dynamic_media_replacement_counts(
                 frame_embedding_counts,
@@ -220,7 +219,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         num_images_per_sample = []
         for sample_tokens in tokens:
             num_images_per_sample.append(
-                sum(1 for token in sample_tokens if token == image_token_index)
+                sum(1 for token in sample_tokens if token == image_token_id)
             )
 
         expanded_tokens_list = []
@@ -236,7 +235,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 image_embedding_offset = sum(per_image_embeddings[:image_global_idx])
 
                 for token in sample_tokens:
-                    if token == image_token_index and image_global_idx < len(per_image_embeddings):
+                    if token == image_token_id and image_global_idx < len(per_image_embeddings):
                         tokens_for_image = per_image_embeddings[image_global_idx]
                         expanded_sample.extend([pad_value] * tokens_for_image)
 
@@ -274,7 +273,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
                 )
 
                 for token in sample_tokens:
-                    if token == image_token_index:
+                    if token == image_token_id:
                         if image_idx < len(sample_num_tiles):
                             tiles_for_image = sample_num_tiles[image_idx].item()
                             tokens_for_image = tiles_for_image * img_embeddings_per_tile
@@ -318,6 +317,10 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         from megatron.core.packed_seq_params import PackedSeqParams
 
         module = resolve_wrapped_model(self.model)
+        if num_frames is not None:
+            validate_video_temporal_patch(
+                num_frames, int(getattr(module, "temporal_patch_dim", 1))
+            )
 
         # Reject dynamic-resolution requests when the model does not expose
         # the required attributes (see expand_image_tokens for context).

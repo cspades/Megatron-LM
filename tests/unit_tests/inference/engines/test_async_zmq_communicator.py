@@ -5,7 +5,11 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from megatron.core.inference.engines.async_zmq_communicator import AsyncZMQCommunicator
+from megatron.core.inference.engines import async_zmq_communicator as communicator_module
+from megatron.core.inference.engines.async_zmq_communicator import (
+    AsyncZMQCommunicator,
+    RankedPubSub,
+)
 
 pytestmark = pytest.mark.asyncio
 
@@ -23,6 +27,86 @@ def _make_comm(rank=0, world_size=1):
     comm.gather_sock = MagicMock(name="gather_sock")
     comm.bcast_sock = MagicMock(name="bcast_sock")
     return comm
+
+
+def _make_init_sockets(monkeypatch, rank, world_size, notifications=()):
+    """Mock the constructor's distributed rendezvous and ZMQ sockets."""
+    gather_sock = MagicMock(name="gather_sock")
+    bcast_sock = MagicMock(name="bcast_sock")
+    gather_sock.getsockopt_string.return_value = "tcp://host:1000"
+    bcast_sock.getsockopt_string.return_value = "tcp://host:1001"
+    bcast_sock.recv.side_effect = notifications
+
+    context = MagicMock(name="zmq_context")
+    context.socket.side_effect = [gather_sock, bcast_sock]
+
+    monkeypatch.setattr(communicator_module.dist, "get_rank", lambda group: rank)
+    monkeypatch.setattr(communicator_module.dist, "get_world_size", lambda group: world_size)
+    monkeypatch.setattr(
+        communicator_module.dist, "get_process_group_ranks", lambda group: list(range(world_size))
+    )
+
+    def broadcast_object_list(values, src, group):
+        if rank != 0:
+            values[:] = ["tcp://host:1000", "tcp://host:1001"]
+
+    monkeypatch.setattr(communicator_module.dist, "broadcast_object_list", broadcast_object_list)
+    return context, gather_sock, bcast_sock
+
+
+async def test_startup_readiness_ignores_duplicate_peer_notification(monkeypatch):
+    """Duplicate XPUB notifications cannot satisfy another rank's readiness."""
+    pub_sub = RankedPubSub(b"AsyncZMQCommunicator.broadcast:")
+    topic_1 = pub_sub._readiness_topic(1)
+    topic_2 = pub_sub._readiness_topic(2)
+    context, _, bcast_sock = _make_init_sockets(
+        monkeypatch,
+        rank=0,
+        world_size=3,
+        notifications=[
+            b"\x01" + topic_1,
+            b"\x01" + topic_1,
+            b"\x01",  # The shared broadcast subscription is not an identity.
+            b"\x01" + topic_2,
+        ],
+    )
+
+    AsyncZMQCommunicator(context, process_group=MagicMock())
+
+    assert bcast_sock.recv.call_count == 4
+
+
+async def test_startup_readiness_timeout_counts_unique_peers(monkeypatch):
+    """Timeout diagnostics report unique ranks, not notification frames."""
+    import zmq
+
+    topic_1 = RankedPubSub(b"AsyncZMQCommunicator.broadcast:")._readiness_topic(1)
+    context, _, bcast_sock = _make_init_sockets(
+        monkeypatch,
+        rank=0,
+        world_size=3,
+        notifications=[b"\x01" + topic_1, b"\x01" + topic_1, zmq.Again()],
+    )
+
+    with pytest.raises(RuntimeError, match=r"missing ranks: \[2\]"):
+        AsyncZMQCommunicator(context, process_group=MagicMock())
+
+    assert bcast_sock.setsockopt.call_args_list[-1].args == (zmq.RCVTIMEO, -1)
+
+
+async def test_follower_subscribes_to_broadcast_and_rank_readiness(monkeypatch):
+    """Followers retain broadcasts while exposing an exact readiness identity."""
+    import zmq
+
+    context, _, bcast_sock = _make_init_sockets(monkeypatch, rank=2, world_size=3)
+
+    AsyncZMQCommunicator(context, process_group=MagicMock())
+
+    bcast_sock.setsockopt_string.assert_called_once_with(zmq.SUBSCRIBE, "")
+    bcast_sock.setsockopt.assert_called_once_with(
+        zmq.SUBSCRIBE,
+        RankedPubSub(b"AsyncZMQCommunicator.broadcast:")._readiness_topic(2),
+    )
 
 
 # (rank, world_size, local_vals, peer_payloads, expected_result, expected_broadcast)
