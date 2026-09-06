@@ -22,6 +22,7 @@ except ImportError as e:
 import megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints as endpoints
 from megatron.core.inference.config import MultimodalPromptConfig, PrefixCachingCoordinatorPolicy
 from megatron.core.inference.inference_client import InferenceClient
+from megatron.core.inference.request_trace import trace_request
 from megatron.core.utils import trace_async_exceptions
 
 logger = logging.getLogger(__name__)
@@ -146,6 +147,7 @@ async def _run_text_gen_server(
         # independent listener and an InferenceClient connected to the
         # coordinator.  A single HTTP health check only exercises whichever
         # SO_REUSEPORT replica happened to receive that connection.
+        trace_request("frontend_ready", rank=rank, server_port=server_port)
         if ready_event is not None:
             ready_event.set()
 

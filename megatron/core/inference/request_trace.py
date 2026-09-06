@@ -2,7 +2,6 @@
 
 """Opt-in request-lifecycle logging for dynamic inference debugging."""
 
-import logging
 import os
 from typing import Any
 
@@ -25,9 +24,11 @@ def trace_request(stage: str, **fields: Any) -> None:
     details = " ".join(
         f"{key}={format_value(value)}" for key, value in sorted(fields.items())
     )
-    logging.info(
-        "MCORE_REQUEST_TRACE stage=%s pid=%s%s",
-        stage,
-        os.getpid(),
-        f" {details}" if details else "",
-    )
+    # Frontend replicas are spawned with a fresh interpreter. They do not
+    # necessarily inherit Ray's logging configuration, so logging.info() can be
+    # silently filtered there. stdout is captured by Ray and ``flush=True``
+    # preserves the final events when a worker is wedged or terminated.
+    message = f"MCORE_REQUEST_TRACE stage={stage} pid={os.getpid()}"
+    if details:
+        message += f" {details}"
+    print(message, flush=True)
