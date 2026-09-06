@@ -31,6 +31,7 @@ from megatron.core.inference.config import (
     routes_on_prefix,
 )
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.request_trace import trace_request
 
 from .state import CONTROL_TRANSITIONS, CoordinatorState
 
@@ -142,6 +143,12 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
+    trace_request(
+        "coordinator_admitted",
+        client_identity=sender_identity,
+        client_request_id=client_request_id,
+        request_id=request_id,
+    )
 
     # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
     # media bytes, only the bounded media descriptor.
@@ -208,6 +215,13 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
+    trace_request(
+        "coordinator_dispatched",
+        client_identity=sender_identity,
+        client_request_id=client_request_id,
+        request_id=request_id,
+        rank_identity=next_identity,
+    )
     if (
         isinstance(media_cache_key, str)
         and coordinator.vision_embedding_cache_enabled
@@ -411,6 +425,12 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
             [Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True
         )
         coordinator.router_socket.send_multipart([client_identity, reply_metadata, body])
+        trace_request(
+            "coordinator_reply_routed",
+            client_identity=client_identity,
+            client_request_id=client_request_id,
+            request_id=fid,
+        )
 
 
 @message_handler(Headers.ENGINE_REPLY_PARTIAL)

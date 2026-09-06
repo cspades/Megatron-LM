@@ -107,6 +107,17 @@ async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_conf
 def test_start_server_forwards_multimodal_prompt_config_to_worker(monkeypatch):
     processes = []
 
+    class FakeEvent:
+        def __init__(self):
+            self.is_set = False
+
+        def set(self):
+            self.is_set = True
+
+        def wait(self, timeout):
+            del timeout
+            return self.is_set
+
     class FakeSocket:
         def __init__(self):
             self.closed = False
@@ -123,14 +134,35 @@ def test_start_server_forwards_multimodal_prompt_config_to_worker(monkeypatch):
             self.args = args
             self.daemon = daemon
             self.pid = 123
+            self.alive = True
             processes.append(self)
 
         def start(self):
-            pass
+            self.args[-1].set()
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.alive = False
+
+        def join(self, timeout=None):
+            del timeout
+
+        def kill(self):
+            self.alive = False
+
+    class FakeSpawnContext:
+        Process = FakeProcess
+        Event = FakeEvent
 
     prompt_config = MultimodalPromptConfig(video_spec=MediaPromptSpec(model_token="<video>"))
     monkeypatch.setattr(text_generation_server, "_SERVER_PROCESSES", [])
-    monkeypatch.setattr(text_generation_server.mp, "Process", FakeProcess)
+    monkeypatch.setattr(
+        text_generation_server.mp,
+        "get_context",
+        lambda method: FakeSpawnContext() if method == "spawn" else pytest.fail("expected spawn context"),
+    )
 
     handed_in_socket = FakeSocket()
     text_generation_server.start_text_gen_server(
@@ -152,7 +184,59 @@ def test_start_server_forwards_multimodal_prompt_config_to_worker(monkeypatch):
         *processes[0].args
     )
     assert worker_call.arguments["multimodal_prompt_config"] is prompt_config
+    assert worker_call.arguments["ready_event"].is_set is True
     assert processes[0].daemon is True
+
+
+def test_start_server_fails_when_a_spawned_replica_never_becomes_ready(monkeypatch):
+    processes = []
+
+    class FakeEvent:
+        def wait(self, timeout):
+            del timeout
+            return False
+
+    class FakeProcess:
+        pid = 123
+
+        def __init__(self, **_kwargs):
+            self.terminated = False
+            processes.append(self)
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return True
+
+        def terminate(self):
+            self.terminated = True
+
+        def join(self, timeout=None):
+            del timeout
+
+        def kill(self):
+            pass
+
+    class FakeSpawnContext:
+        Process = FakeProcess
+        Event = FakeEvent
+
+    monkeypatch.setattr(text_generation_server, "_SERVER_PROCESSES", [])
+    monkeypatch.setattr(text_generation_server.mp, "get_context", lambda _method: FakeSpawnContext())
+
+    with pytest.raises(TimeoutError, match="did not become ready"):
+        text_generation_server.start_text_gen_server(
+            "coordinator:1234",
+            tokenizer=object(),
+            rank=0,
+            server_port=8080,
+            num_replicas=1,
+            frontend_startup_timeout_seconds=0,
+        )
+
+    assert processes[0].terminated is True
+    assert text_generation_server._SERVER_PROCESSES == []
 
 
 def test_start_server_rejects_socket_without_real_port(monkeypatch):

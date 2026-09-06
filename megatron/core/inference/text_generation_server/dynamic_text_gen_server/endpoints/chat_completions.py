@@ -22,6 +22,7 @@ _MEDIA_FETCH_USER_AGENT = "megatron-inference"
 
 from megatron.core.inference.config import MultimodalPromptConfig
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
+from megatron.core.inference.request_trace import trace_request
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -813,6 +814,7 @@ try:
         tokenize_chat_tok = tokenize_hf_tok if tokenize_hf_tok is not None else tokenize_tok
 
         try:
+            trace_request("frontend_tokenize_started")
             if hasattr(chat_tok, 'apply_chat_template') and (
                 getattr(chat_tok, "chat_template", None) is not None
                 or chat_template_kwargs.get('chat_template') is not None
@@ -964,6 +966,8 @@ try:
         except Exception as e:
             logger.error(f"{traceback.format_exc()}")
             return Response(f"Error processing 'messages': {e}", status=500)
+
+        trace_request("frontend_tokenize_finished", prompt_tokens=len(prompt_tokens))
 
         # --- 2. Parse Sampling Params ---
         try:
@@ -1132,6 +1136,7 @@ try:
                 )
                 request_ids.append(request_id)
                 tasks.append(future)
+                trace_request("frontend_submitted", client_request_id=request_id)
         except Exception as e:
             abort_requests(client, request_ids, f"submission failed: {e}")
             logger.error(f"Error submitting request: {e}")
@@ -1142,6 +1147,8 @@ try:
 
         try:
             batch_results = await asyncio.gather(*tasks)
+            for request_id in request_ids:
+                trace_request("frontend_gather_finished", client_request_id=request_id)
         except asyncio.CancelledError:
             # Quart cancels this handler when the peer goes away (its ASGI
             # connection races handle_messages against handle_request and

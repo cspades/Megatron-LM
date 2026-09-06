@@ -110,6 +110,18 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
 
     async def fake_run_text_gen_server(*args):
         captured["run_args"] = args
+        args[-1].set()
+
+    class FakeEvent:
+        def __init__(self):
+            self.is_set = False
+
+        def set(self):
+            self.is_set = True
+
+        def wait(self, timeout):
+            del timeout
+            return self.is_set
 
     class FakeProcess:
         pid = 123
@@ -119,10 +131,27 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
             self.args = args
             self.daemon = daemon
             self.started = False
+            self.alive = True
 
         def start(self):
             self.started = True
             self.target(*self.args)
+
+        def is_alive(self):
+            return self.alive
+
+        def terminate(self):
+            self.alive = False
+
+        def join(self, timeout=None):
+            del timeout
+
+        def kill(self):
+            self.alive = False
+
+    class FakeSpawnContext:
+        Process = FakeProcess
+        Event = FakeEvent
 
     class FakeSocket:
         def getsockname(self):
@@ -132,7 +161,7 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
             captured["socket_closed"] = True
 
     monkeypatch.setattr(server, "_SERVER_PROCESSES", [])
-    monkeypatch.setattr(server.mp, "Process", FakeProcess)
+    monkeypatch.setattr(server.mp, "get_context", lambda _method: FakeSpawnContext())
     monkeypatch.setattr(server, "_run_text_gen_server", fake_run_text_gen_server)
     monkeypatch.setattr(server.asyncio, "set_event_loop", lambda loop: None)
 
@@ -158,7 +187,7 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
 
     # The port is taken from the socket; no fd is handed to the replica, which
     # binds its own listener on that port.
-    assert captured["run_args"] == (
+    assert captured["run_args"][:-1] == (
         "tcp://coord:5555",
         tokenizer,
         3,
@@ -177,6 +206,7 @@ def test_sampling_config_reaches_frontend_process(monkeypatch):
         None,
         None,
     )
+    assert captured["run_args"][-1].is_set is True
     assert captured["socket_closed"] is True
     assert server._SERVER_PROCESSES[0].daemon is True
     assert server._SERVER_PROCESSES[0].started is True

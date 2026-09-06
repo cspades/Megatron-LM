@@ -16,6 +16,7 @@ from megatron.core.inference.inference_request import (
     serialize_multimodal_data,
     split_multimodal_data,
 )
+from megatron.core.inference.request_trace import trace_request
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import get_asyncio_loop, trace_async_exceptions
 
@@ -490,6 +491,7 @@ class InferenceClient:
                     request_id = data[1]
                     if request_id in self.aborted_request_ids:
                         self.aborted_request_ids.discard(request_id)
+                        trace_request("client_reply_discarded", client_request_id=request_id)
                         continue
                     reply = msgpack.unpackb(frames[1], raw=False)
                     submitted = self.request_submission_times.pop(request_id, None)
@@ -514,6 +516,7 @@ class InferenceClient:
                         DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
                     )
                     completion_future.set_result(completed_request)
+                    trace_request("client_reply", client_request_id=request_id)
                 elif header == Headers.ENGINE_REPLY_PARTIAL:
                     request_id = data[1]
                     stream = self.streams.get(request_id)

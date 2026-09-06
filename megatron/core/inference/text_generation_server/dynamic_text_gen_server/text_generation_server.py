@@ -5,9 +5,10 @@ import copy
 import logging
 import multiprocessing as mp
 import socket
+import time
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
-from typing import List, Optional
+from typing import Any, List, Optional
 
 try:
     from hypercorn.asyncio import serve
@@ -27,6 +28,12 @@ logger = logging.getLogger(__name__)
 
 # Global reference to manage the background server processes
 _SERVER_PROCESSES: List[mp.Process] = []
+
+# Starting a frontend through ``spawn`` imports a clean interpreter, then loads
+# the tokenizer received from the parent.  Give every replica enough time to
+# complete that work and establish its coordinator client before considering
+# the server available.
+_FRONTEND_STARTUP_TIMEOUT_SECONDS = 30.0
 
 
 @contextmanager
@@ -58,6 +65,7 @@ async def _run_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    ready_event: Optional[Any] = None,
 ):
     """
     Initializes and runs the async web server. Automatically starts and
@@ -134,6 +142,13 @@ async def _run_text_gen_server(
         own_socket = _bind_reuseport_socket(server_port, bind_host)
         config.bind = [f"fd://{own_socket.fileno()}"]
 
+        # The parent must not publish this server until every replica has an
+        # independent listener and an InferenceClient connected to the
+        # coordinator.  A single HTTP health check only exercises whichever
+        # SO_REUSEPORT replica happened to receive that connection.
+        if ready_event is not None:
+            ready_event.set()
+
         with temp_log_level(logging.INFO, logger):
             logger.info(f"Starting text generation server on http://{hostname}:{server_port}")
             logger.info(f"Using tokenizer: {type(tokenizer)}")
@@ -172,6 +187,7 @@ def _server_process_worker(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    ready_event: Optional[Any] = None,
 ):
     """Synchronous worker function that sets up a new event loop for the separate process."""
     loop = asyncio.new_event_loop()
@@ -194,6 +210,7 @@ def _server_process_worker(
                 eval_mode,
                 block_size_tokens,
                 prefix_caching_coordinator_policy,
+                ready_event,
             )
         )
     except KeyboardInterrupt:
@@ -257,6 +274,7 @@ def start_text_gen_server(
     eval_mode: bool = False,
     block_size_tokens: Optional[int] = None,
     prefix_caching_coordinator_policy: Optional[PrefixCachingCoordinatorPolicy] = None,
+    frontend_startup_timeout_seconds: float = _FRONTEND_STARTUP_TIMEOUT_SECONDS,
 ) -> Optional[str]:
     """Start the text generation server.
 
@@ -303,34 +321,69 @@ def start_text_gen_server(
     elif server_port == 0:
         server_port = _reserve_port(hostname)
 
-    for i in range(num_replicas):
-        p = mp.Process(
-            target=_server_process_worker,
-            args=(
-                coordinator_addr,
-                tokenizer,
-                rank,
-                server_port,
-                parsers,
-                verbose,
-                hostname,
-                chat_template,
-                multimodal_prompt_config,
-                default_temperature,
-                default_top_p,
-                default_top_k,
-                eval_mode,
-                block_size_tokens,
-                prefix_caching_coordinator_policy,
-            ),
-            daemon=True,
-        )
-        p.start()
-        _SERVER_PROCESSES.append(p)
-        logger.info(
-            f"Started text gen frontend replica {i+1}/{num_replicas} "
-            f"on port {server_port} (PID: {p.pid})"
-        )
+    # This function is called after Ray, CUDA/NCCL, ZMQ, and the inference
+    # event-loop thread have all been initialized.  The Linux multiprocessing
+    # default is ``fork``, which copies that live multithreaded process and can
+    # leave a child with locks whose owning threads no longer exist.  Use a
+    # private spawn context rather than changing the application's global start
+    # method; the frontend then creates its ZMQ and async state in a clean
+    # interpreter.
+    frontend_context = mp.get_context("spawn")
+    processes: List[mp.Process] = []
+    ready_events = []
+    try:
+        for i in range(num_replicas):
+            ready_event = frontend_context.Event()
+            p = frontend_context.Process(
+                target=_server_process_worker,
+                args=(
+                    coordinator_addr,
+                    tokenizer,
+                    rank,
+                    server_port,
+                    parsers,
+                    verbose,
+                    hostname,
+                    chat_template,
+                    multimodal_prompt_config,
+                    default_temperature,
+                    default_top_p,
+                    default_top_k,
+                    eval_mode,
+                    block_size_tokens,
+                    prefix_caching_coordinator_policy,
+                    ready_event,
+                ),
+                daemon=True,
+            )
+            p.start()
+            processes.append(p)
+            ready_events.append(ready_event)
+            logger.info(
+                f"Started text gen frontend replica {i+1}/{num_replicas} "
+                f"on port {server_port} (PID: {p.pid})"
+            )
+
+        deadline = time.monotonic() + frontend_startup_timeout_seconds
+        for replica_index, (p, ready_event) in enumerate(zip(processes, ready_events), start=1):
+            remaining = deadline - time.monotonic()
+            if remaining > 0 and ready_event.wait(timeout=remaining) and p.is_alive():
+                continue
+            exited = [str(process.pid) for process in processes if not process.is_alive()]
+            if exited:
+                raise RuntimeError(
+                    "Text generation frontend replica(s) exited before signalling readiness: "
+                    + ", ".join(exited)
+                )
+            raise TimeoutError(
+                f"Text generation frontend replica {replica_index}/{num_replicas} did not become "
+                f"ready within {frontend_startup_timeout_seconds} seconds."
+            )
+    except BaseException:
+        _terminate(processes, "partially started Text Gen frontend")
+        raise
+
+    _SERVER_PROCESSES = processes
 
     return f"http://{hostname or socket.gethostname()}:{server_port}"
 
