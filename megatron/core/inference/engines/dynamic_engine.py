@@ -51,6 +51,7 @@ from megatron.core.inference.inference_request import (
     merge_multimodal_data,
     resolve_multimodal_data_for_engine,
 )
+from megatron.core.inference.request_trace import trace_request
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     DecodeOnly,
@@ -1341,6 +1342,8 @@ class DynamicInferenceEngine(AbstractEngine):
         """Send completed or failed request records from the MP coordinator."""
 
         merged_requests = [record.merge() for record in records]
+        for request in merged_requests:
+            trace_request("engine_reply_sending", rank=self.rank, request_id=request.request_id)
         if self.local_metadata_ledger_enabled:
             # Failed requests are sent immediately but remain in the engine until the
             # next bookkeeping pass. Index only completed requests as they are dropped.
@@ -3475,6 +3478,7 @@ class DynamicInferenceEngine(AbstractEngine):
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
                 request_id, sampling_params, media_meta = data[1:]
+                trace_request("engine_received", rank=self.rank, request_id=request_id)
                 # The prompt and the media each ride in their own frame; the
                 # engine is their first consumer, so this is where they finally
                 # get decoded. The coordinator forwarded both untouched, and
@@ -3513,6 +3517,7 @@ class DynamicInferenceEngine(AbstractEngine):
                         self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
                     else:
                         self.add_request(request_id, prompt, sampling_params)
+                    trace_request("engine_admitted", rank=self.rank, request_id=request_id)
                 except Exception as error:  # pylint: disable=broad-except
                     self._fail_submission(request_id, sampling_params, error)
                 nvtx_range_pop("add_request")
