@@ -6,6 +6,7 @@ import os
 from typing import Any
 
 _TRACE_ENV_VAR = "MCORE_INFERENCE_REQUEST_TRACE"
+_TRACE_FILE_ENV_VAR = "MCORE_INFERENCE_REQUEST_TRACE_FILE"
 
 
 def trace_request(stage: str, **fields: Any) -> None:
@@ -26,9 +27,28 @@ def trace_request(stage: str, **fields: Any) -> None:
     )
     # Frontend replicas are spawned with a fresh interpreter. They do not
     # necessarily inherit Ray's logging configuration, so logging.info() can be
-    # silently filtered there. stdout is captured by Ray and ``flush=True``
-    # preserves the final events when a worker is wedged or terminated.
+    # silently filtered there. stdout is the useful default, but Ray can merge
+    # or coalesce output from an actor's background engine thread. A per-PID
+    # append-only file is therefore available for a lossless hang trace.
     message = f"MCORE_REQUEST_TRACE stage={stage} pid={os.getpid()}"
     if details:
         message += f" {details}"
+
+    trace_file = os.environ.get(_TRACE_FILE_ENV_VAR)
+    if trace_file:
+        try:
+            fd = os.open(
+                f"{trace_file}.{os.getpid()}",
+                os.O_APPEND | os.O_CREAT | os.O_WRONLY,
+                0o600,
+            )
+            try:
+                os.write(fd, f"{message}\n".encode())
+            finally:
+                os.close(fd)
+            return
+        except OSError:
+            # Fall through to stdout: diagnostics must not affect serving.
+            pass
+
     print(message, flush=True)
