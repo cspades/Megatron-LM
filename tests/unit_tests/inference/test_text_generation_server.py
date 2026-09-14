@@ -54,9 +54,14 @@ async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_conf
         served.append((app, config))
 
     closed_sockets = []
+    detached_sockets = []
 
     class FakeListener:
         def fileno(self):
+            return 19
+
+        def detach(self):
+            detached_sockets.append(self)
             return 19
 
         def close(self):
@@ -97,6 +102,7 @@ async def test_server_exposes_multimodal_prompt_config(monkeypatch, provide_conf
     assert app.blueprints == ["completion-blueprint", "chat-blueprint"]
     assert served[0][0] is app
     assert served[0][1].bind == ["fd://19"]
+    assert len(detached_sockets) == 1, "Hypercorn must take ownership of the listener fd"
     assert len(closed_sockets) == 1, "the listener must be released once serve() returns"
     assert clients[0].address == "coordinator:1234"
     assert clients[0].deserialize is False

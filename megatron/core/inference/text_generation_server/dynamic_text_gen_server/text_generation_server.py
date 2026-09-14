@@ -146,6 +146,10 @@ async def _run_text_gen_server(
 
         try:
             # Quart is natively ASGI, so we can serve the app directly
+            # Hypercorn constructs and owns a socket from config.bind's raw fd.
+            # Detach it from this Python socket object to avoid closing the same
+            # descriptor twice when serve() shuts down.
+            own_socket.detach()
             await serve(app, config)
         finally:
             own_socket.close()
