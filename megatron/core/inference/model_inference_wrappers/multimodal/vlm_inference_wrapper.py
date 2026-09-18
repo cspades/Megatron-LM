@@ -327,6 +327,46 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         from megatron.core.packed_seq_params import PackedSeqParams
 
         module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        if (
+            imgs_sizes is not None
+            and getattr(module, 'dynamic_resolution', False)
+            and getattr(module.vision_model.config, 'vision_model_type', None) == 'radio'
+            and images.ndim == 4
+        ):
+            # Dynamic-resolution RADIO consumes packed patch vectors rather
+            # than padded pixels. Processors emit [N, C, H, W], so crop each
+            # image to its true size and pack its non-overlapping patches.
+            patch_dim = int(module.patch_dim)
+            if images.shape[0] != imgs_sizes.shape[0]:
+                raise ValueError(
+                    f"Received {images.shape[0]} images but "
+                    f"{imgs_sizes.shape[0]} image sizes."
+                )
+            patches = []
+            for image, size in zip(images, imgs_sizes):
+                height, width = (int(value) for value in size.tolist())
+                if height % patch_dim or width % patch_dim:
+                    raise ValueError(
+                        f"Image size {(height, width)} is not divisible by "
+                        f"patch_dim={patch_dim}."
+                    )
+                image = image[:, :height, :width]
+                channels = image.shape[0]
+                rows = height // patch_dim
+                columns = width // patch_dim
+                patches.append(
+                    image.reshape(
+                        channels,
+                        rows,
+                        patch_dim,
+                        columns,
+                        patch_dim,
+                    )
+                    .permute(1, 3, 0, 2, 4)
+                    .reshape(rows * columns, channels * patch_dim * patch_dim)
+                )
+            images = torch.cat(patches, dim=0).unsqueeze(0).contiguous()
+
         target_dtype = module.vision_model.config.params_dtype
         if images.dtype != target_dtype:
             images = images.to(dtype=target_dtype)

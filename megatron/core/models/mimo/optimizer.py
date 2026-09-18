@@ -50,6 +50,9 @@ class MimoOptimizer(MegatronOptimizer):
         ]
         self.is_stub_optimizer = len(self._active_optimizers) == 0
         self.optimizer = None  # Base class compat
+        # Stock training loops inspect this after every step for optional
+        # separately clipped groups such as MTP and draft-model parameters.
+        self.grad_norms_by_group: Dict[str, float] = {}
 
     @torch.no_grad()
     def prepare_grads(self) -> bool:
@@ -80,6 +83,7 @@ class MimoOptimizer(MegatronOptimizer):
     @torch.no_grad()
     def step(self) -> Tuple[bool, Optional[float], Optional[int]]:
         """Run one optimizer step across all active module optimizers."""
+        self.grad_norms_by_group = {}
         found_inf = self.prepare_grads()
         # Synchronize found_inf across all ranks to prevent deadlock:
         # if encoder ranks detect inf but LLM ranks don't, the early return
@@ -381,13 +385,21 @@ def _optimizer_config_for_module(
     if ddp_config is None:
         raise ValueError("Active MIMO modules must be DDP-wrapped before optimizer construction.")
     overlap_param_gather = ddp_config.overlap_param_gather
-    return replace(
+    module_config = replace(
         config,
         overlap_param_gather=overlap_param_gather,
         overlap_param_gather_with_optimizer_step=(
             config.overlap_param_gather_with_optimizer_step and overlap_param_gather
         ),
     )
+    # Megatron-Bridge's OptimizerConfig subclass intentionally defers the
+    # MCore __post_init__ work to finalize(). dataclasses.replace() reconstructs
+    # that subclass and therefore drops non-field derived attributes such as
+    # use_precision_aware_optimizer_no_fp8_or_ds_fp8.
+    finalize = getattr(module_config, 'finalize', None)
+    if callable(finalize):
+        finalize()
+    return module_config
 
 
 def get_mimo_optimizer(mimo_model: "MimoModel", config: OptimizerConfig) -> MimoOptimizer:

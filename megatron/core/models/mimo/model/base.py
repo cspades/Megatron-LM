@@ -16,6 +16,7 @@ from megatron.core.models.mimo.partition.utils import PartitionAdapter, Partitio
 from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.quantization.utils import get_quant_config_or_none
 from megatron.core.transformer import MegatronModule
+from megatron.core.transformer.enums import ModelType
 from megatron.core.transformer.module import Float16Module
 from megatron.core.transformer.spec_utils import build_module
 from megatron.core.transformer.utils import sharded_state_dict_default
@@ -59,6 +60,9 @@ class MimoModel(MegatronModule):
         """
         # Initialize with language model's transformer config for MegatronModule compatibility
         super().__init__(mimo_config.language_model_spec.params['config'])
+        # Standard Megatron pipeline schedules query this on the top-level
+        # model before dispatching the forward step.
+        self.model_type = ModelType.encoder_or_decoder
 
         warn_single_rank(
             "MimoModel is experimental and still under active development. "
@@ -127,7 +131,13 @@ class MimoModel(MegatronModule):
             ):
                 raise ValueError("Refit requires one image encoder and at most one input projector")
             vision = unwrap_model(next(iter(tower.encoders.values())))
-            components.append(("vision_model", vision, getattr(vision, "pg_collection", None)))
+            components.append(
+                (
+                    "vision_model",
+                    vision,
+                    getattr(vision, "pg_collection", None),
+                )
+            )
             for wrapped_projector in tower.input_projections:
                 projector = unwrap_model(wrapped_projector)
                 components.append(
@@ -528,6 +538,16 @@ class MimoModel(MegatronModule):
         for module in self._active_ddp_modules():
             if module.ddp_config.overlap_grad_reduce:
                 module.start_grad_sync()
+
+    def finish_grad_sync(self, *unused, force_all_reduce: bool = False):
+        """Finish gradient synchronization on all active inner DDP modules."""
+        for module in self._active_ddp_modules():
+            module.finish_grad_sync(force_all_reduce=force_all_reduce)
+
+    def scale_gradients(self, scaling_factor):
+        """Scale gradient buffers owned by all active inner DDP modules."""
+        for module in self._active_ddp_modules():
+            module.scale_gradients(scaling_factor)
 
     def free_overlap_buffers(self):
         """Release parameter-gather buffers owned by overlapped inner DDP modules."""
