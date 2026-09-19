@@ -507,7 +507,19 @@ class InferenceClient:
                         stream.put({"final": completed_request})
                         stream.finish()
                         continue
-                    completion_future = self.completion_futures.pop(request_id)
+                    completion_future = self.completion_futures.pop(request_id, None)
+                    if completion_future is None:
+                        # A reply nobody is waiting for: a duplicate, or one that
+                        # raced abort_request's already-completed early return. This
+                        # popped without a default before, and the only handler below
+                        # was for zmq.Again, so one stray reply killed this listener
+                        # and left every pending future in the process unresolved --
+                        # the HTTP frontend then held those connections open forever
+                        # and answered nothing.
+                        logging.warning(
+                            f"Client: no pending future for request {request_id}; dropping reply."
+                        )
+                        continue
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
@@ -525,6 +537,16 @@ class InferenceClient:
                 continue
             except KeyboardInterrupt:
                 break
+            except Exception:
+                # This task owns every pending future in the process, so letting it
+                # exit converts one bad frame into a permanently mute frontend: no
+                # future ever resolves again and callers block until their own
+                # timeout, with the engine reporting the work as finished. Survive
+                # the frame instead. CancelledError derives from BaseException and
+                # still stops the loop, so stop() continues to work.
+                logging.exception("Client: error handling coordinator frame; continuing.")
+                await asyncio.sleep(0.005)
+                continue
 
     def _connect_with_inference_coordinator(self, timeout_seconds: Optional[float] = None):
         """
