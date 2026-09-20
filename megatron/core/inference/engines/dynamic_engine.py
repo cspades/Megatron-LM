@@ -230,6 +230,45 @@ def _engine_reply_frames(finished_requests: List[dict]) -> List[bytes]:
     ]
 
 
+def _request_tag(request_id: int) -> str:
+    """Letters-only request identifier that remains distinct under Ray log dedup."""
+    value = int(request_id)
+    chars = []
+    while True:
+        value, remainder = divmod(value, 26)
+        chars.append(chr(ord("a") + remainder))
+        if value == 0:
+            return "".join(reversed(chars))
+        value -= 1
+
+
+def _serialize_finished_request(request: DynamicInferenceRequest) -> dict:
+    """Serialize a reply without echoing input-only multimodal tensors.
+
+    A dynamic VLM request retains its raw media and projected media state for
+    prefix-cache bookkeeping and possible refreshes while it is active. None of
+    those tensors are response data. Echoing them to the HTTP frontend makes every
+    replica deserialize and convert the full video payload to Python lists before it
+    can return a completion, blocking the replica's asyncio loop for minutes.
+
+    Keep the keys with ``None`` values so clients using ``deserialize=True`` can
+    still construct the VLM request dataclass, whose inherited media fields are
+    required constructor arguments.
+    """
+    serialized = request.serialize()
+    if isinstance(request, DynamicVLMInferenceRequest):
+        for key in (
+            "imgs",
+            "num_tiles",
+            "imgs_sizes",
+            "num_frames",
+            "image_embeddings",
+            "image_token_mask",
+        ):
+            serialized[key] = None
+    return serialized
+
+
 def _get_decode_only_log_state(
     mode: AsyncScheduleMode, decode_only: DecodeOnly
 ) -> Tuple[str, Optional[bool]]:
@@ -563,6 +602,10 @@ class DynamicInferenceEngine(AbstractEngine):
 
         self.requests: Dict[int, RequestEntry] = {}
         self.waiting_request_ids = deque()
+        self._request_engine_received_at: dict[int, float] = {}
+        self._request_waiting_since: dict[int, float] = {}
+        self._last_admission_trace_at: dict[int, float] = {}
+        self._last_slow_request_trace_at = 0.0
         if hasattr(self, "_pinned_handoff_blocks"):
             self._pinned_handoff_blocks.clear()
             self._pinned_handoff_ssm_slots.clear()
@@ -1516,8 +1559,24 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.local_metadata_ledger[request.uid] = FinishedRequestRecord.from_request(
                     request
                 )
-        self.socket_for_receiving_requests.send_multipart(
-            _engine_reply_frames([request.serialize() for request in requests])
+        serialize_started_at = time.perf_counter()
+        frames = _engine_reply_frames(
+            [_serialize_finished_request(request) for request in requests]
+        )
+        serialized_at = time.perf_counter()
+        self.socket_for_receiving_requests.send_multipart(frames)
+        sent_at = time.perf_counter()
+        logger.warning(
+            "Engine replies sent: rank=%d tags=%s request_ids=%s count=%d "
+            "serialize_ms=%.1f send_ms=%.1f frame_bytes=%s total_bytes=%d",
+            self.rank,
+            [_request_tag(request.request_id) for request in requests],
+            [request.request_id for request in requests],
+            len(requests),
+            (serialized_at - serialize_started_at) * 1000,
+            (sent_at - serialized_at) * 1000,
+            [len(frame) for frame in frames],
+            sum(len(frame) for frame in frames),
         )
 
     def _handle_failed_request(self, request_id: int):
@@ -1541,6 +1600,20 @@ class DynamicInferenceEngine(AbstractEngine):
             errors_str = (
                 "; ".join(f"{type(e).__name__}: {e}" for e in errors) if errors else "unknown error"
             )
+            logger.error(
+                "ENGINE REQUEST FAILED: tag=%s rank=%d request_id=%d status=%s "
+                "errors=%s prompt_tokens=%d max_new_tokens=%d active=%d/%d waiting=%d",
+                _request_tag(request_id),
+                self.rank,
+                request_id,
+                request.status,
+                errors_str,
+                len(request.prompt_tokens),
+                request.sampling_params.num_tokens_to_generate,
+                self.context.total_request_count,
+                self.context.max_requests,
+                len(self.waiting_request_ids),
+            )
             warnings.warn(
                 f"Request {request_id} failed to be added to the engine ({errors_str}). "
                 f"Prompt Tokens: {len(request.prompt_tokens)} "
@@ -1553,6 +1626,9 @@ class DynamicInferenceEngine(AbstractEngine):
         request.add_event_fail()
         self.failed_request_ids.append(request_id)
         finished_request = self._complete_request(request_entry)
+        self._request_engine_received_at.pop(request_id, None)
+        self._request_waiting_since.pop(request_id, None)
+        self._last_admission_trace_at.pop(request_id, None)
 
         # Send the reply immediately, because it may never get a chance to be sent again.
         if self.use_coordinator and self.is_mp_coordinator:
@@ -1671,6 +1747,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 future=self._loop.create_future(),
             )
             request.add_event_add_engine()  # Record when request enters engine
+            self._request_waiting_since[request_id] = time.perf_counter()
 
             # Stamp new request with the current generation epoch.
             if self._generation_epoch is not None:
@@ -1765,6 +1842,27 @@ class DynamicInferenceEngine(AbstractEngine):
 
         if request.status != Status.FAILED:
             self.waiting_request_ids.append(request_id)
+            if self.is_mp_coordinator:
+                logger.warning(
+                    "Engine request queued: tag=%s rank=%d request_id=%d "
+                    "receive_to_queue_ms=%.1f waiting=%d active=%d/%d "
+                    "prompt_tokens=%d max_new_tokens=%d",
+                    _request_tag(request_id),
+                    self.rank,
+                    request_id,
+                    (
+                        time.perf_counter()
+                        - self._request_engine_received_at.get(
+                            request_id, self._request_waiting_since[request_id]
+                        )
+                    )
+                    * 1000,
+                    len(self.waiting_request_ids),
+                    self.context.total_request_count,
+                    self.context.max_requests,
+                    len(request.prompt_tokens),
+                    request.sampling_params.num_tokens_to_generate,
+                )
         else:
             self._handle_failed_request(request_id)
 
@@ -2072,6 +2170,10 @@ class DynamicInferenceEngine(AbstractEngine):
             # Retrieve or compute the vision embedding.
             image_embeddings = self._get_cached_vision_embedding(media_cache_key)
             if image_embeddings is None and imgs is not None:
+                vision_cpu_started_at = time.perf_counter()
+                vision_start_event = torch.cuda.Event(enable_timing=True)
+                vision_end_event = torch.cuda.Event(enable_timing=True)
+                vision_start_event.record()
                 imgs = imgs.to(device=device)
                 # PP>1 is rejected above, so this is the only stage that owns
                 # the vision encoder.
@@ -2083,6 +2185,26 @@ class DynamicInferenceEngine(AbstractEngine):
                         self.controller.inference_wrapped_model._forward_vision_encoder(
                             imgs, **encoder_kwargs
                         )
+                    )
+                vision_end_event.record()
+                # Cache misses are rare relative to sibling requests, and the
+                # embedding is consumed by the next model step. Synchronize here
+                # to report real GPU time instead of only asynchronous launch time.
+                vision_end_event.synchronize()
+                if self.is_mp_coordinator:
+                    logger.warning(
+                        "Vision encoder completed: tag=%s rank=%d request_id=%d "
+                        "modality=%s cuda_ms=%.1f wall_ms=%.1f input_shape=%s "
+                        "embedding_shape=%s media_cache_key=%s",
+                        _request_tag(request_id),
+                        self.rank,
+                        request_id,
+                        modality,
+                        vision_start_event.elapsed_time(vision_end_event),
+                        (time.perf_counter() - vision_cpu_started_at) * 1000,
+                        tuple(imgs.shape),
+                        tuple(image_embeddings.shape),
+                        media_cache_key[:12] if media_cache_key else "none",
                     )
 
             # Cache the image embedding.
@@ -2327,6 +2449,36 @@ class DynamicInferenceEngine(AbstractEngine):
                         request.ttft = (
                             first_token_event.timestamp - request.event_add_engine.timestamp
                         )
+                        if self.is_mp_coordinator:
+                            logger.warning(
+                                "Engine request first token: tag=%s rank=%d request_id=%d "
+                                "ttft_ms=%.1f prefill_to_first_token_ms=%.1f prompt_tokens=%d "
+                                "cached_tokens=%d waiting=%d active=%d/%d",
+                                _request_tag(request_id),
+                                self.rank,
+                                request_id,
+                                request.ttft * 1000,
+                                (
+                                    first_token_event.timestamp
+                                    - (
+                                        next(
+                                            (
+                                                event.timestamp
+                                                for event in request.events
+                                                if event.type
+                                                == DynamicInferenceEventType.ADD_CONTEXT
+                                            ),
+                                            request.event_add_engine.timestamp,
+                                        )
+                                    )
+                                )
+                                * 1000,
+                                len(request.prompt_tokens),
+                                request.num_cached_tokens,
+                                len(self.waiting_request_ids),
+                                self.context.total_request_count,
+                                self.context.max_requests,
+                            )
                     # TPOT is observability-only. step_time is 0.0 on
                     # non-logging steps (async_forward skips the event sync),
                     # so gate the update to keep the metric a truthful sparse
@@ -2409,7 +2561,50 @@ class DynamicInferenceEngine(AbstractEngine):
                     # Request finished by normal means (termination_id, max_length, or stop word from previous step)
                     request.generated_length = len(request.generated_tokens)
                     request.status = Status.COMPLETED
-                    request.add_event_finish()
+                    finish_event = request.add_event_finish()
+                    if self.is_mp_coordinator:
+                        add_context_event = next(
+                            (
+                                event
+                                for event in request.events
+                                if event.type == DynamicInferenceEventType.ADD_CONTEXT
+                            ),
+                            None,
+                        )
+                        queue_seconds = (
+                            add_context_event.timestamp - request.event_add_engine.timestamp
+                            if add_context_event is not None
+                            else None
+                        )
+                        total_seconds = (
+                            finish_event.timestamp - request.event_add_engine.timestamp
+                        )
+                        logger.warning(
+                            "Engine request finished: tag=%s rank=%d request_id=%d "
+                            "queue_ms=%s ttft_ms=%s decode_ms=%s total_ms=%.1f "
+                            "prompt_tokens=%d output_tokens=%d cached_tokens=%d "
+                            "waiting=%d active=%d/%d",
+                            _request_tag(request_id),
+                            self.rank,
+                            request_id,
+                            f"{queue_seconds * 1000:.1f}" if queue_seconds is not None else "none",
+                            f"{request.ttft * 1000:.1f}" if request.ttft is not None else "none",
+                            (
+                                f"{max(0.0, total_seconds - request.ttft) * 1000:.1f}"
+                                if request.ttft is not None
+                                else "none"
+                            ),
+                            total_seconds * 1000,
+                            len(request.prompt_tokens),
+                            len(request.generated_tokens),
+                            request.num_cached_tokens,
+                            len(self.waiting_request_ids),
+                            self.context.total_request_count,
+                            self.context.max_requests,
+                        )
+                    self._request_engine_received_at.pop(request_id, None)
+                    self._request_waiting_since.pop(request_id, None)
+                    self._last_admission_trace_at.pop(request_id, None)
                     # Keep handoff blocks only when the request needs them.
                     handoff_blocks = handoff_blocks_by_request.get(request_id, [])
                     if request.sampling_params.do_kv_handoff:
@@ -2861,6 +3056,44 @@ class DynamicInferenceEngine(AbstractEngine):
             and token_capacity_available
         )
 
+    def _log_admission_blocked(self, req: DynamicInferenceRequest, mode: str) -> None:
+        """Rate-limit a complete snapshot of why the queue head cannot admit."""
+        if not self.is_mp_coordinator:
+            return
+        now = time.perf_counter()
+        last = self._last_admission_trace_at.get(req.request_id, 0.0)
+        if now - last < 5.0:
+            return
+        self._last_admission_trace_at[req.request_id] = now
+        request_available, token_available, kv_available = self.context.check_availability(req)
+        waiting_since = self._request_waiting_since.get(req.request_id, now)
+        logger.warning(
+            "Engine admission blocked: tag=%s rank=%d request_id=%d mode=%s "
+            "queue_age=%.1fs waiting=%d active=%d/%d active_tokens=%d/%d "
+            "paused=%d request_available=%s token_available=%s kv_available=%s "
+            "remaining_prompt=%d chunk_owner=%d can_prepare=%s cg_gating=%s "
+            "allocatable_blocks=%d",
+            _request_tag(req.request_id),
+            self.rank,
+            req.request_id,
+            mode,
+            now - waiting_since,
+            len(self.waiting_request_ids),
+            self.context.total_request_count,
+            self.context.max_requests,
+            self.context.active_token_count,
+            self.context.max_tokens,
+            self.context.paused_request_count,
+            request_available,
+            token_available,
+            kv_available,
+            len(req.remaining_prompt_tokens),
+            self.context.chunked_prefill_request_id,
+            self.context.can_prepare_requests(),
+            self._cg_admission_gating_active(),
+            self.context.kv_block_allocator.get_allocatable_count(),
+        )
+
     def _should_run_async_sched_overlap(self) -> bool:
         """Return whether this step should use overlap ordering.
 
@@ -2917,7 +3150,26 @@ class DynamicInferenceEngine(AbstractEngine):
                 req.remaining_prompt_tokens = req.remaining_prompt_tokens.new_empty(0)
                 req.add_event_add_context()
                 self.waiting_request_ids.popleft()
+                if self.is_mp_coordinator:
+                    logger.warning(
+                        "Engine request admitted: tag=%s rank=%d request_id=%d "
+                        "mode=non_chunked queue_ms=%.1f active=%d/%d waiting=%d",
+                        _request_tag(req.request_id),
+                        self.rank,
+                        req.request_id,
+                        (
+                            time.perf_counter()
+                            - self._request_waiting_since.get(
+                                req.request_id, time.perf_counter()
+                            )
+                        )
+                        * 1000,
+                        self.context.total_request_count,
+                        self.context.max_requests,
+                        len(self.waiting_request_ids),
+                    )
             else:
+                self._log_admission_blocked(req, "non_chunked")
                 break
 
         # Prepend pending request ids to waiting queue.
@@ -3192,6 +3444,27 @@ class DynamicInferenceEngine(AbstractEngine):
                     req.add_event_add_context()
                     self.waiting_request_ids.popleft()
                     can_schedule = True
+                    if self.is_mp_coordinator:
+                        logger.warning(
+                            "Engine request admitted: tag=%s rank=%d request_id=%d "
+                            "mode=chunked_final queue_ms=%.1f prompt_chunk=%d "
+                            "cached_tokens=%d active=%d/%d waiting=%d",
+                            _request_tag(req.request_id),
+                            self.rank,
+                            req.request_id,
+                            (
+                                time.perf_counter()
+                                - self._request_waiting_since.get(
+                                    req.request_id, time.perf_counter()
+                                )
+                            )
+                            * 1000,
+                            prefill_chunk_length,
+                            req.num_cached_tokens,
+                            self.context.total_request_count,
+                            self.context.max_requests,
+                            len(self.waiting_request_ids),
+                        )
                 else:
                     # Partial admit: schedule this chunk and keep the request at the queue head.
                     self.context.add_request(req, prefill_chunk_length=prefill_chunk_length)
@@ -3201,6 +3474,31 @@ class DynamicInferenceEngine(AbstractEngine):
                     self.context.chunked_prefill_request_id = req.request_id
                     req.remaining_prompt_tokens = req.remaining_prompt_tokens[prefill_chunk_length:]
                     req.finished_chunk_token_count += prefill_chunk_length
+                    if self.is_mp_coordinator and req.finished_chunk_token_count == prefill_chunk_length:
+                        logger.warning(
+                            "Engine request prefill started: tag=%s rank=%d request_id=%d "
+                            "queue_ms=%.1f first_chunk=%d remaining_prompt=%d "
+                            "active=%d/%d",
+                            _request_tag(req.request_id),
+                            self.rank,
+                            req.request_id,
+                            (
+                                time.perf_counter()
+                                - self._request_waiting_since.get(
+                                    req.request_id, time.perf_counter()
+                                )
+                            )
+                            * 1000,
+                            prefill_chunk_length,
+                            len(req.remaining_prompt_tokens),
+                            self.context.total_request_count,
+                            self.context.max_requests,
+                        )
+
+        if self.waiting_request_ids and not can_schedule:
+            self._log_admission_blocked(
+                self.get_request(self.waiting_request_ids[0]), "chunked"
+            )
 
         # Prepend pending request ids to waiting queue.
         if prefix_caching_enabled and pending_request_ids:
@@ -3651,6 +3949,42 @@ class DynamicInferenceEngine(AbstractEngine):
                 output_str = f"\033[94m{output_str}\033[0m"
             logger.info(output_str)
 
+            now = time.perf_counter()
+            if (
+                self.is_mp_coordinator
+                and now - self._last_slow_request_trace_at >= 30.0
+            ):
+                old_requests = []
+                for request_id, entry in sorted(
+                    self.requests.items(),
+                    key=lambda item: self._request_engine_received_at.get(item[0], now),
+                ):
+                    received_at = self._request_engine_received_at.get(request_id)
+                    if received_at is None or now - received_at < 60.0:
+                        continue
+                    request = entry.record[-1]
+                    old_requests.append(
+                        {
+                            "id": request_id,
+                            "tag": _request_tag(request_id),
+                            "status": str(request.status),
+                            "age_s": round(now - received_at, 1),
+                            "prompt_tokens": len(request.prompt_tokens),
+                            "generated_tokens": len(request.generated_tokens),
+                            "max_new_tokens": request.sampling_params.num_tokens_to_generate,
+                            "waiting": request_id in self.waiting_request_ids,
+                        }
+                    )
+                    if len(old_requests) == 16:
+                        break
+                if old_requests:
+                    logger.warning(
+                        "ENGINE LONG-RUNNING REQUESTS: rank=%d requests=%s",
+                        self.rank,
+                        old_requests,
+                    )
+                    self._last_slow_request_trace_at = now
+
         nvtx_range_pop("console_logging")
 
         return {
@@ -3816,6 +4150,7 @@ class DynamicInferenceEngine(AbstractEngine):
             int: The number of messages that were received and processed in this batch.
         """
 
+        drain_started_at = time.perf_counter()
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
         if self.is_mp_coordinator:
@@ -3838,9 +4173,29 @@ class DynamicInferenceEngine(AbstractEngine):
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
-            self.model_parallel_publisher_socket.send_multipart(
-                self._pack_tp_broadcast(all_messages)
-            )
+            receive_finished_at = time.perf_counter()
+            broadcast_frames = self._pack_tp_broadcast(all_messages)
+            broadcast_started_at = time.perf_counter()
+            self.model_parallel_publisher_socket.send_multipart(broadcast_frames)
+            broadcast_finished_at = time.perf_counter()
+            if all_messages:
+                inbound_bytes = sum(
+                    len(frame)
+                    for message in all_messages
+                    for frame in (
+                        message if isinstance(message, (list, tuple)) else [message]
+                    )
+                )
+                logger.warning(
+                    "Engine socket drain: rank=%d messages=%d inbound_bytes=%d "
+                    "receive_ms=%.1f tp_pack_ms=%.1f tp_broadcast_ms=%.1f",
+                    self.rank,
+                    len(all_messages),
+                    inbound_bytes,
+                    (receive_finished_at - drain_started_at) * 1000,
+                    (broadcast_started_at - receive_finished_at) * 1000,
+                    (broadcast_finished_at - broadcast_started_at) * 1000,
+                )
         else:
             all_messages = self._unpack_tp_broadcast(
                 self.model_parallel_subscriber_socket.recv_multipart()
@@ -3855,7 +4210,21 @@ class DynamicInferenceEngine(AbstractEngine):
             data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
-                request_id, sampling_params, media_meta = data[1:]
+                request_id, sampling_params, media_meta, *trace_fields = data[1:]
+                wire_trace = (
+                    trace_fields[0]
+                    if trace_fields and isinstance(trace_fields[0], dict)
+                    else {}
+                )
+                request_started_at = time.perf_counter()
+                self._request_engine_received_at[request_id] = request_started_at
+                frame_bytes = [len(frame) for frame in message]
+                coordinator_send_wall_ns = wire_trace.get("coordinator_send_wall_ns")
+                coordinator_to_engine_ms = (
+                    (time.time_ns() - coordinator_send_wall_ns) / 1e6
+                    if isinstance(coordinator_send_wall_ns, int)
+                    else None
+                )
                 # The prompt and the media each ride in their own frame. The
                 # coordinator forwarded both untouched, while the bounded media
                 # descriptor lets a cache hit avoid decoding the payload frame.
@@ -3880,6 +4249,7 @@ class DynamicInferenceEngine(AbstractEngine):
                     sampling_params = SamplingParams.deserialize(sampling_params)
                 finally:
                     nvtx_range_pop(nvtx_range)
+                unpack_finished_at = time.perf_counter()
                 nvtx_range_push("add_request")
                 # TODO(perf): uncached media preprocessing (decode / resize /
                 # normalize / patchify) runs synchronously on the engine step
@@ -3890,6 +4260,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 # receives ready tensors.
                 try:
                     if cached_vision_entry is not None:
+                        logger.info(
+                            "multimodal preprocessing cache hit: rank=%d request_id=%d "
+                            "modality=%s media_cache_key=%s",
+                            self.rank,
+                            request_id,
+                            media_modality,
+                            media_cache_key[:12] if media_cache_key else "none",
+                        )
                         vlm_kwargs = {
                             "media_cache_key": media_cache_key,
                             "media_tokens_preexpanded": bool(
@@ -3907,6 +4285,7 @@ class DynamicInferenceEngine(AbstractEngine):
                             "megatron.inference.multimodal.resolve_multimodal_data_for_engine"
                         )
                         nvtx_range_push(nvtx_range)
+                        media_preprocess_started_at = time.perf_counter()
                         try:
                             vlm_kwargs = resolve_multimodal_data_for_engine(
                                 multi_modal_data,
@@ -3919,12 +4298,66 @@ class DynamicInferenceEngine(AbstractEngine):
                             )
                         finally:
                             nvtx_range_pop(nvtx_range)
+                        media_preprocess_seconds = (
+                            time.perf_counter() - media_preprocess_started_at
+                        )
+                        log = (
+                            logger.warning
+                            if media_preprocess_seconds >= 0.1
+                            else logger.info
+                        )
+                        log(
+                            "uncached multimodal preprocessing: rank=%d request_id=%d "
+                            "modality=%s elapsed_ms=%.1f media_cache_key=%s",
+                            self.rank,
+                            request_id,
+                            media_modality,
+                            media_preprocess_seconds * 1000,
+                            media_cache_key[:12] if media_cache_key else "none",
+                        )
                     if vlm_kwargs:
                         self.add_request(request_id, prompt, sampling_params, **vlm_kwargs)
                     else:
                         self.add_request(request_id, prompt, sampling_params)
                 except Exception as error:  # pylint: disable=broad-except
+                    if self.is_mp_coordinator:
+                        logger.exception(
+                            "ENGINE REQUEST SUBMISSION ERROR: tag=%s rank=%d request_id=%d "
+                            "error_type=%s error=%r frame_bytes=%s cache_hit=%s",
+                            _request_tag(request_id),
+                            self.rank,
+                            request_id,
+                            type(error).__name__,
+                            error,
+                            frame_bytes,
+                            cached_vision_entry is not None,
+                        )
                     self._fail_submission(request_id, sampling_params, error)
+                finally:
+                    if self.is_mp_coordinator:
+                        logger.warning(
+                            "Engine request received: tag=%s rank=%d request_id=%d "
+                            "frame_bytes=%s total_bytes=%d unpack_ms=%.1f "
+                            "prepare_and_queue_ms=%.1f total_ms=%.1f cache_hit=%s "
+                            "wall_coordinator_to_engine_ms=%s waiting=%d active=%d/%d",
+                            _request_tag(request_id),
+                            self.rank,
+                            request_id,
+                            frame_bytes,
+                            sum(frame_bytes),
+                            (unpack_finished_at - request_started_at) * 1000,
+                            (time.perf_counter() - unpack_finished_at) * 1000,
+                            (time.perf_counter() - request_started_at) * 1000,
+                            cached_vision_entry is not None,
+                            (
+                                f"{coordinator_to_engine_ms:.1f}"
+                                if coordinator_to_engine_ms is not None
+                                else "unknown"
+                            ),
+                            len(self.waiting_request_ids),
+                            self.context.total_request_count,
+                            self.context.max_requests,
+                        )
                 nvtx_range_pop("add_request")
             elif header == Headers.SUBMIT_REQUEST_WITH_KV:
                 # Decode-side KV import. As on the plain path, the prompt rides
@@ -3950,6 +4383,24 @@ class DynamicInferenceEngine(AbstractEngine):
             elif header == Headers.ABORT_REQUEST:
                 request_id = int(data[1])
                 entry = self.requests.get(request_id)
+                if self.is_mp_coordinator:
+                    logger.warning(
+                        "Engine abort received: tag=%s rank=%d request_id=%d known=%s "
+                        "waiting=%s queue_age=%s active=%d/%d waiting_depth=%d",
+                        _request_tag(request_id),
+                        self.rank,
+                        request_id,
+                        entry is not None,
+                        request_id in self.waiting_request_ids,
+                        (
+                            f"{time.perf_counter() - self._request_waiting_since[request_id]:.1f}s"
+                            if request_id in self._request_waiting_since
+                            else "unknown"
+                        ),
+                        self.context.total_request_count,
+                        self.context.max_requests,
+                        len(self.waiting_request_ids),
+                    )
                 if entry is not None:
                     request = entry.record[-1]
                     # Force active requests to finish on the next step.
@@ -4118,6 +4569,20 @@ class DynamicInferenceEngine(AbstractEngine):
                     await asyncio.sleep(0.001)
         except asyncio.CancelledError:
             pass
+        except Exception as error:
+            logger.exception(
+                "FATAL INFERENCE ENGINE ERROR: rank=%d mode=standalone state=%s "
+                "error_type=%s error=%r active=%d/%d waiting=%d request_ids=%s",
+                self.rank,
+                self.state,
+                type(error).__name__,
+                error,
+                self.context.total_request_count,
+                self.context.max_requests,
+                len(self.waiting_request_ids),
+                sorted(self.requests)[:64],
+            )
+            raise
 
     async def _ep_establish_consensus(
         self, local_work: int, signal_consensus: bool
@@ -4315,5 +4780,44 @@ class DynamicInferenceEngine(AbstractEngine):
                         logger.info("Stopping engine.")
                     break
 
+        except Exception as error:
+            now = time.perf_counter()
+            oldest_requests = []
+            for request_id, entry in sorted(
+                self.requests.items(),
+                key=lambda item: self._request_engine_received_at.get(item[0], now),
+            )[:32]:
+                request = entry.record[-1]
+                received_at = self._request_engine_received_at.get(request_id)
+                oldest_requests.append(
+                    {
+                        "id": request_id,
+                        "tag": _request_tag(request_id),
+                        "status": str(request.status),
+                        "age_s": (
+                            round(now - received_at, 1) if received_at is not None else None
+                        ),
+                        "prompt_tokens": len(request.prompt_tokens),
+                        "generated_tokens": len(request.generated_tokens),
+                        "max_new_tokens": request.sampling_params.num_tokens_to_generate,
+                        "waiting": request_id in self.waiting_request_ids,
+                    }
+                )
+            logger.exception(
+                "FATAL INFERENCE ENGINE ERROR: rank=%d mode=coordinator state=%s "
+                "error_type=%s error=%r active=%d/%d waiting=%d "
+                "pending_imports=%d pending_pushes=%d oldest_requests=%s",
+                self.rank,
+                self.state,
+                type(error).__name__,
+                error,
+                self.context.total_request_count,
+                self.context.max_requests,
+                len(self.waiting_request_ids),
+                self.pending_kv_import_count,
+                self.pending_kv_push_count,
+                oldest_requests,
+            )
+            raise
         finally:
             await self.shutdown()

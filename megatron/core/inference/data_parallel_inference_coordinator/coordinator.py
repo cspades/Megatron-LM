@@ -27,6 +27,7 @@ from .state import CoordinatorState
 
 try:
     import zmq
+    from zmq.utils.monitor import recv_monitor_message
 
     HAVE_ZMQ = True
 except:
@@ -167,6 +168,18 @@ class DataParallelInferenceCoordinator:
         self.router_socket = self.context.socket(zmq.ROUTER)
         # Raise error if the other side of the connection has dropped.
         self.router_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
+        monitor_endpoint = f"inproc://inference-coordinator-monitor-{id(self)}"
+        monitor_events = (
+            zmq.EVENT_ACCEPTED
+            | zmq.EVENT_ACCEPT_FAILED
+            | zmq.EVENT_DISCONNECTED
+            | zmq.EVENT_CLOSED
+        )
+        self.router_socket.monitor(monitor_endpoint, monitor_events)
+        self._monitor_socket = self.context.socket(zmq.PAIR)
+        self._monitor_socket.connect(monitor_endpoint)
+        self._monitor_event_counts: dict[str, int] = {}
+        self._last_monitor_event = None
         is_bound = False
         if inference_coordinator_port is not None:
             try:
@@ -210,6 +223,18 @@ class DataParallelInferenceCoordinator:
         self.request_id_to_client_id = {}
         self.request_id_to_client_request_id = {}
         self.request_id_to_rank = {}  # Maps request_id → rank identity for pending count tracking
+        # Coordinator residency spans client receipt through final engine reply.
+        # Used only for lifecycle diagnostics; routing correctness never depends on it.
+        self.request_id_to_started_at = {}
+        self._last_diagnostics_at = time.monotonic()
+        self.messages_received_total = 0
+        self.messages_received_by_header: dict[str, int] = {}
+        self.submissions_received_total = 0
+        self.replies_sent_total = 0
+        self.partial_replies_sent_total = 0
+        self.submissions_received_by_client: OrderedDict[bytes, int] = OrderedDict()
+        self.replies_sent_by_client: OrderedDict[bytes, int] = OrderedDict()
+        self._client_telemetry_max_entries = 4096
         self.removed_engine_identities = set()
         self.client_request_to_request_id = {}
 
@@ -263,6 +288,53 @@ class DataParallelInferenceCoordinator:
 
         # Header -> handler dispatch table, sourced from the handler registry.
         self._handlers = dict(HANDLERS)
+
+    def increment_client_telemetry(
+        self, counter: OrderedDict[bytes, int], identity: bytes
+    ) -> None:
+        """Increment and LRU-bound a per-client diagnostic counter."""
+        value = counter.pop(identity, 0) + 1
+        counter[identity] = value
+        while len(counter) > self._client_telemetry_max_entries:
+            counter.popitem(last=False)
+
+    @staticmethod
+    def _monitor_event_name(event: int) -> str:
+        names = {
+            zmq.EVENT_ACCEPTED: "ACCEPTED",
+            zmq.EVENT_ACCEPT_FAILED: "ACCEPT_FAILED",
+            zmq.EVENT_DISCONNECTED: "DISCONNECTED",
+            zmq.EVENT_CLOSED: "CLOSED",
+        }
+        return names.get(event, f"EVENT_{event}")
+
+    def _drain_monitor_events(self) -> None:
+        """Consume ROUTER connection events for historical transport diagnostics."""
+        while self._monitor_socket.poll(timeout=0):
+            try:
+                event = recv_monitor_message(self._monitor_socket, flags=zmq.NOBLOCK)
+            except zmq.Again:
+                break
+            event_name = self._monitor_event_name(int(event["event"]))
+            self._monitor_event_counts[event_name] = (
+                self._monitor_event_counts.get(event_name, 0) + 1
+            )
+            endpoint = event["endpoint"]
+            self._last_monitor_event = {
+                "event": event_name,
+                "value": int(event["value"]),
+                "endpoint": endpoint.decode("utf-8", errors="replace")
+                if isinstance(endpoint, bytes)
+                else str(endpoint),
+                "observed_at": time.monotonic(),
+            }
+            logging.warning(
+                "Coordinator transport event: event=%s value=%s endpoint=%s counts=%s",
+                event_name,
+                self._last_monitor_event["value"],
+                self._last_monitor_event["endpoint"],
+                self._monitor_event_counts,
+            )
 
     def get_least_loaded_data_parallel_rank(self):
         """
@@ -581,11 +653,15 @@ class DataParallelInferenceCoordinator:
         """
         # Todo [Siddharth]: Make this more robust to handle invalid messages.
         while True:
+            self._drain_monitor_events()
             # Messages are one or more frames. frames[0] is the metadata frame:
             # a header plus whatever the coordinator needs to route the message.
             # Any later frames are opaque payload bodies, forwarded without ever
             # being decoded here -- that is what keeps this loop's cost
             # independent of prompt length.
+            if not self.router_socket.poll(timeout=1000):
+                self._log_diagnostics_if_due()
+                continue
             sender_identity, *frames = self.router_socket.recv_multipart()
 
             # An empty payload is a data parallel rank (re-)registering itself.
@@ -595,12 +671,91 @@ class DataParallelInferenceCoordinator:
 
             metadata = msgpack.unpackb(frames[0], raw=False)
             header = Headers(metadata[0])
+            self.messages_received_total += 1
+            header_name = header.name
+            self.messages_received_by_header[header_name] = (
+                self.messages_received_by_header.get(header_name, 0) + 1
+            )
 
             handler = self._handlers.get(header)
             if handler is None:
                 raise UnknownHeaderError(header)
             if handler(self, sender_identity, metadata, frames[1:]):
                 break
+            self._log_diagnostics_if_due()
+
+    def _log_diagnostics_if_due(self) -> None:
+        """Emit a bounded fleet snapshot while requests are flowing."""
+        now = time.monotonic()
+        self._drain_monitor_events()
+        if now - self._last_diagnostics_at < 30.0:
+            return
+        self._last_diagnostics_at = now
+        ages = sorted(
+            (now - started_at, request_id)
+            for request_id, started_at in self.request_id_to_started_at.items()
+        )
+        oldest = [
+            {"request_id": request_id, "age_seconds": round(age, 1)}
+            for age, request_id in reversed(ages[-8:])
+        ]
+        pending = self._pending_counts.astype(np.int64)
+        client_pending: dict[str, int] = {}
+        for client_identity in self.request_id_to_client_id.values():
+            client_key = client_identity.decode("ascii", errors="replace")
+            client_pending[client_key] = client_pending.get(client_key, 0) + 1
+        client_flow = sorted(
+            (
+                {
+                    "client": identity.decode("ascii", errors="replace"),
+                    "received": received,
+                    "replied": self.replies_sent_by_client.get(identity, 0),
+                    "pending": client_pending.get(
+                        identity.decode("ascii", errors="replace"), 0
+                    ),
+                }
+                for identity, received in self.submissions_received_by_client.items()
+            ),
+            key=lambda item: item["received"] - item["replied"],
+            reverse=True,
+        )[:16]
+        try:
+            socket_events = int(self.router_socket.getsockopt(zmq.EVENTS))
+        except Exception:
+            socket_events = -1
+        logging.warning(
+            "Coordinator heartbeat: pending=%d nominal_capacity=%d ranks=%d "
+            "min=%d p50=%.1f p95=%.1f max=%d overloaded_ranks=%d "
+            "messages=%d headers=%s received=%d replies=%d "
+            "partial_replies=%d socket_events=%d monitor_events=%s "
+            "last_monitor_event=%s "
+            "client_flow=%s oldest=%s",
+            int(pending.sum()),
+            len(pending) * self.max_requests,
+            len(pending),
+            int(pending.min()) if len(pending) else 0,
+            float(np.percentile(pending, 50)) if len(pending) else 0.0,
+            float(np.percentile(pending, 95)) if len(pending) else 0.0,
+            int(pending.max()) if len(pending) else 0,
+            int((pending > self.max_requests).sum()),
+            self.messages_received_total,
+            self.messages_received_by_header,
+            self.submissions_received_total,
+            self.replies_sent_total,
+            self.partial_replies_sent_total,
+            socket_events,
+            self._monitor_event_counts,
+            (
+                {
+                    **self._last_monitor_event,
+                    "age_seconds": now - self._last_monitor_event["observed_at"],
+                }
+                if self._last_monitor_event is not None
+                else None
+            ),
+            client_flow,
+            oldest,
+        )
 
     def _handle_rank_registration(self, sender_identity):
         """Register a data parallel rank that connected to a running coordinator."""
@@ -726,5 +881,7 @@ class DataParallelInferenceCoordinator:
             }
             with open(self.schedule_output_path, "w") as f:
                 json.dump(schedule_data, f, indent=2)
+        self.router_socket.disable_monitor()
+        self._monitor_socket.close(linger=0)
         self.router_socket.close()
         self.context.term()

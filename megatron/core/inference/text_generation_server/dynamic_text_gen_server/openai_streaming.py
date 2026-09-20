@@ -11,6 +11,9 @@ import uuid
 from collections.abc import Iterable
 
 from megatron.core.inference.inference_request import unwrap_serialized_tensors
+from megatron.core.inference.text_generation_server.dynamic_text_gen_server.protocol import (
+    GENERATION_ABORTED_ERROR_CODE,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -477,3 +480,40 @@ async def openai_stream(
             task.cancel()
         for stream in streams:
             await stream.aclose()
+
+
+async def stream_with_deadline(chunks, timeout_seconds):
+    """Apply a request deadline to an SSE stream and close its engine streams.
+
+    HTTP status and headers are already committed after the first chunk, so a
+    streaming deadline is reported as a structured SSE error. Closing ``chunks``
+    runs :func:`openai_stream`'s ``finally`` block, which aborts every unfinished
+    engine request.
+    """
+    if timeout_seconds is None:
+        try:
+            async for chunk in chunks:
+                yield chunk
+        finally:
+            await chunks.aclose()
+        return
+
+    deadline = asyncio.timeout(timeout_seconds)
+    try:
+        async with deadline:
+            async for chunk in chunks:
+                yield chunk
+    except TimeoutError:
+        if not deadline.expired():
+            raise
+        payload = {
+            "error": {
+                "code": GENERATION_ABORTED_ERROR_CODE,
+                "message": "Inference request deadline expired and was aborted",
+                "retryable": False,
+            }
+        }
+        yield f"data: {json.dumps(payload)}\n\n"
+        yield "data: [DONE]\n\n"
+    finally:
+        await chunks.aclose()

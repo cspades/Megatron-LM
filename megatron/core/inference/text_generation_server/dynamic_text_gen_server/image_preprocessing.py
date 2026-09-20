@@ -9,7 +9,9 @@ can import it without circular dependencies.
 
 import io
 import json
+import logging
 import math
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -17,6 +19,8 @@ import torch
 
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.models.vision.encoder_registry import REGISTRY as _ENCODER_REGISTRY
+
+logger = logging.getLogger(__name__)
 
 
 def _resolve_pixel_stats(vision_model_type: str):
@@ -45,10 +49,12 @@ def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional
 
     from PIL import Image
 
+    started_at = time.perf_counter()
     try:
         manifest = json.loads(payload[len(frame_manifest_magic) :])
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Invalid frame-sequence manifest JSON.") from exc
+    manifest_parsed_at = time.perf_counter()
     if not isinstance(manifest, dict):
         raise ValueError("Frame-sequence manifest must be a JSON object.")
 
@@ -61,10 +67,31 @@ def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional
         raise ValueError("Frame-sequence manifest requires non-empty string frame_paths.")
 
     frames = []
+    path_resolution_seconds = 0.0
+    jpeg_decode_seconds = 0.0
+    max_frame_seconds = 0.0
     for frame_path in frame_paths:
+        frame_started_at = time.perf_counter()
+        path_started_at = frame_started_at
         resolved = Path(frame_path).expanduser().resolve()
+        path_resolution_seconds += time.perf_counter() - path_started_at
+        decode_started_at = time.perf_counter()
         with Image.open(resolved) as image:
             frames.append(image.convert("RGB").copy())
+        jpeg_decode_seconds += time.perf_counter() - decode_started_at
+        max_frame_seconds = max(max_frame_seconds, time.perf_counter() - frame_started_at)
+    elapsed_seconds = time.perf_counter() - started_at
+    log = logger.warning if elapsed_seconds >= 0.1 else logger.info
+    log(
+        "frame-sequence JPEG load: frames=%d total_ms=%.1f manifest_json_ms=%.1f "
+        "path_resolve_ms=%.1f jpeg_open_decode_copy_ms=%.1f max_frame_ms=%.1f",
+        len(frame_paths),
+        elapsed_seconds * 1000,
+        (manifest_parsed_at - started_at) * 1000,
+        path_resolution_seconds * 1000,
+        jpeg_decode_seconds * 1000,
+        max_frame_seconds * 1000,
+    )
     return frames
 
 
@@ -221,10 +248,29 @@ def preprocess_image_bytes(
     device: Optional[torch.device] = None,
 ) -> tuple:
     """Decode image bytes and return packed vision patches and its resized shape."""
+    result, _, _ = _preprocess_image_bytes_with_timing(
+        image_bytes, config, target_hw=target_hw, device=device
+    )
+    return result
+
+
+def _preprocess_image_bytes_with_timing(
+    image_bytes: bytes,
+    config: ImageProcessingConfig,
+    target_hw=None,
+    device: Optional[torch.device] = None,
+) -> tuple[tuple, float, float]:
+    """Preprocess image bytes and return decode and transform durations."""
     from PIL import Image
 
     with Image.open(io.BytesIO(image_bytes)) as image:
-        return preprocess_image(image, config, target_hw=target_hw, device=device)
+        decode_started_at = time.perf_counter()
+        image.load()
+        decode_seconds = time.perf_counter() - decode_started_at
+        transform_started_at = time.perf_counter()
+        result = preprocess_image(image, config, target_hw=target_hw, device=device)
+        transform_seconds = time.perf_counter() - transform_started_at
+    return result, decode_seconds, transform_seconds
 
 
 def preprocess_image_bytes_list(
@@ -275,13 +321,40 @@ def preprocess_image_bytes_list(
     # Preprocess each image independently so its aspect ratio is preserved.
     # Downstream (llava_model._preprocess_data / vision encoder pack) handles
     # per-image cu_seqlens, so ragged patch counts are fine.
+    total_started_at = time.perf_counter()
+    decode_seconds = 0.0
+    transform_seconds = 0.0
+    max_image_seconds = 0.0
     all_imgs, all_sizes = [], []
     for image_bytes in image_bytes_list:
-        imgs, imgs_sizes = preprocess_image_bytes(image_bytes, config, device=device)
+        image_started_at = time.perf_counter()
+        (imgs, imgs_sizes), image_decode_seconds, image_transform_seconds = (
+            _preprocess_image_bytes_with_timing(image_bytes, config, device=device)
+        )
+        image_seconds = time.perf_counter() - image_started_at
+        decode_seconds += image_decode_seconds
+        transform_seconds += image_transform_seconds
+        max_image_seconds = max(max_image_seconds, image_seconds)
         all_imgs.append(imgs)
         all_sizes.append(imgs_sizes)
+    concat_started_at = time.perf_counter()
     imgs = torch.cat(all_imgs, dim=1) if len(all_imgs) > 1 else all_imgs[0]
     imgs_sizes = torch.cat(all_sizes, dim=0) if len(all_sizes) > 1 else all_sizes[0]
+    concat_seconds = time.perf_counter() - concat_started_at
+    total_seconds = time.perf_counter() - total_started_at
+    logger.warning(
+        "image-list preprocessing complete: images=%d payload_bytes=%d "
+        "decode_ms=%.1f transform_transfer_ms=%.1f max_image_ms=%.1f "
+        "concat_ms=%.1f total_ms=%.1f imgs_shape=%s",
+        len(image_bytes_list),
+        sum(len(image_bytes) for image_bytes in image_bytes_list),
+        decode_seconds * 1000,
+        transform_seconds * 1000,
+        max_image_seconds * 1000,
+        concat_seconds * 1000,
+        total_seconds * 1000,
+        tuple(imgs.shape),
+    )
     return {"imgs": imgs, "imgs_sizes": imgs_sizes}
 
 
@@ -372,11 +445,16 @@ def preprocess_video_bytes_list(
     packed_videos = []
     packed_sizes = []
     frame_counts = []
+    total_started_at = time.perf_counter()
+    decode_seconds = 0.0
+    frame_preprocess_seconds = 0.0
 
     for encoded_video in video_bytes_list:
         if not isinstance(encoded_video, (bytes, bytearray)):
             raise TypeError("video payloads must contain only bytes.")
+        decode_started_at = time.perf_counter()
         frames, is_frame_sequence = decode_frames(bytes(encoded_video))
+        decode_seconds += time.perf_counter() - decode_started_at
         if not frames:
             raise ValueError("Decoded video contains no frames.")
 
@@ -390,6 +468,7 @@ def preprocess_video_bytes_list(
 
         frame_tensors = []
         frame_sizes = []
+        preprocess_started_at = time.perf_counter()
         reference_image = dynamic_res_preprocess(
             sampled_frames[0],
             min_patches=config.image_config.dynamic_resolution_min_patches,
@@ -410,9 +489,22 @@ def preprocess_video_bytes_list(
         packed_videos.append(torch.cat(frame_tensors, dim=1))
         packed_sizes.append(torch.cat(frame_sizes, dim=0))
         frame_counts.append(sample_count)
+        frame_preprocess_seconds += time.perf_counter() - preprocess_started_at
 
-    return {
+    result = {
         "imgs": torch.cat(packed_videos, dim=1),
         "imgs_sizes": torch.cat(packed_sizes, dim=0),
         "num_frames": torch.tensor(frame_counts, dtype=torch.int32, device=packed_videos[0].device),
     }
+    logger.warning(
+        "video preprocessing complete: videos=%d frames=%d payload_bytes=%d "
+        "decode_ms=%.1f frame_preprocess_ms=%.1f total_ms=%.1f imgs_shape=%s",
+        len(video_bytes_list),
+        sum(frame_counts),
+        sum(len(payload) for payload in video_bytes_list),
+        decode_seconds * 1000,
+        frame_preprocess_seconds * 1000,
+        (time.perf_counter() - total_started_at) * 1000,
+        tuple(result["imgs"].shape),
+    )
+    return result
