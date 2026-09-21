@@ -9,18 +9,16 @@ can import it without circular dependencies.
 
 import io
 import json
-import logging
 import math
-import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
 import torch
 
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.models.vision.encoder_registry import REGISTRY as _ENCODER_REGISTRY
-
-logger = logging.getLogger(__name__)
 
 
 def _resolve_pixel_stats(vision_model_type: str):
@@ -49,12 +47,10 @@ def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional
 
     from PIL import Image
 
-    started_at = time.perf_counter()
     try:
         manifest = json.loads(payload[len(frame_manifest_magic) :])
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise ValueError("Invalid frame-sequence manifest JSON.") from exc
-    manifest_parsed_at = time.perf_counter()
     if not isinstance(manifest, dict):
         raise ValueError("Frame-sequence manifest must be a JSON object.")
 
@@ -86,31 +82,10 @@ def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional
         raise ValueError("Frame-sequence manifest metadata.fps must be positive.")
 
     frames = []
-    path_resolution_seconds = 0.0
-    jpeg_decode_seconds = 0.0
-    max_frame_seconds = 0.0
     for frame_path in frame_paths:
-        frame_started_at = time.perf_counter()
-        path_started_at = frame_started_at
         resolved = Path(frame_path).expanduser().resolve()
-        path_resolution_seconds += time.perf_counter() - path_started_at
-        decode_started_at = time.perf_counter()
         with Image.open(resolved) as image:
             frames.append(image.convert("RGB").copy())
-        jpeg_decode_seconds += time.perf_counter() - decode_started_at
-        max_frame_seconds = max(max_frame_seconds, time.perf_counter() - frame_started_at)
-    elapsed_seconds = time.perf_counter() - started_at
-    log = logger.warning if elapsed_seconds >= 0.1 else logger.info
-    log(
-        "frame-sequence JPEG load: frames=%d total_ms=%.1f manifest_json_ms=%.1f "
-        "path_resolve_ms=%.1f jpeg_open_decode_copy_ms=%.1f max_frame_ms=%.1f",
-        len(frame_paths),
-        elapsed_seconds * 1000,
-        (manifest_parsed_at - started_at) * 1000,
-        path_resolution_seconds * 1000,
-        jpeg_decode_seconds * 1000,
-        max_frame_seconds * 1000,
-    )
     return frames, frame_indices, fps
 
 
@@ -123,6 +98,7 @@ def dynamic_res_preprocess(
     pixel_shuffle=False,
     spatial_merge_size=1,
     video_maintain_aspect_ratio=None,
+    rounding_mode="ceil",
 ):
     """Resize image to fit within [min_patches, max_patches] preserving aspect ratio.
 
@@ -132,13 +108,10 @@ def dynamic_res_preprocess(
     For pixel_shuffle, patch grid dimensions are rounded to even numbers for
     compatibility.
 
-    NOTE: Training uses ``DynamicResolutionImageTilingStrategy._process_single``
-    (in megatron.energon.task_encoder.multimodal.image_tiling) as the canonical
-    resize. The math here is intentionally a subset of that strategy and could
-    drift if energon's implementation changes (e.g. ``min_side`` floor, tiling
-    augmentation). For full parity, inference should call into the energon
-    strategy directly — TODO once we have a clean way to import it that doesn't
-    require energon at engine-drain time.
+    ``rounding_mode`` makes the source processor's grid contract explicit.
+    The default preserves MCore/Energon ceil behavior; ``round_plus_half``
+    reproduces HF processors that intentionally use Python's half-to-even
+    ``round(x + 0.5)`` rule.
     """
     orig_width, orig_height = image.size
 
@@ -168,17 +141,33 @@ def dynamic_res_preprocess(
                 target_patch_width = max(grid_multiple, target_patch_width - width_remainder)
     else:
         grid_multiple = max(2 if pixel_shuffle else 1, spatial_merge_size)
-        # Use math.ceil, not round(x + 0.5) — the latter is banker's rounding and
-        # produces off-by-one, non-monotonic patch counts on exactly-aligned sides.
-        closest_patch_height = math.ceil(orig_height / res_step)
-        closest_patch_width = math.ceil(orig_width / res_step)
+        if rounding_mode == "ceil":
+            closest_patch_height = math.ceil(orig_height / res_step)
+            closest_patch_width = math.ceil(orig_width / res_step)
+        elif rounding_mode == "round_plus_half":
+            # Some HF processors intentionally use Python's half-to-even
+            # ``round(x + 0.5)`` contract. Preserve it exactly: replacing this
+            # with ceil changes the projected-token count for aligned odd grids.
+            closest_patch_height = round(orig_height / res_step + 0.5)
+            closest_patch_width = round(orig_width / res_step + 0.5)
+        else:
+            raise ValueError(
+                "rounding_mode must be 'ceil' or 'round_plus_half', got "
+                f"{rounding_mode!r}."
+            )
         patches = closest_patch_height * closest_patch_width
 
         factor = min(math.sqrt(max_patches / patches), factor_max)
         target_patch_height = math.floor(factor * closest_patch_height)
         target_patch_width = math.floor(factor * closest_patch_width)
 
-        if target_patch_height * target_patch_width < min_patches:
+        should_enforce_minimum = (
+            rounding_mode != "round_plus_half" or max_patches > min_patches
+        )
+        if (
+            should_enforce_minimum
+            and target_patch_height * target_patch_width < min_patches
+        ):
             up_factor = math.sqrt(min_patches / max(target_patch_height * target_patch_width, 1))
             target_patch_height = math.ceil(up_factor * target_patch_height)
             target_patch_width = math.ceil(up_factor * target_patch_width)
@@ -220,6 +209,7 @@ def preprocess_image(
         ) from exc
 
     img = image.convert("RGB")
+    source_img = img
 
     patch_dim = config.patch_dim
 
@@ -234,6 +224,7 @@ def preprocess_image(
             res_step=patch_dim,
             pixel_shuffle=config.pixel_shuffle,
             spatial_merge_size=config.spatial_merge_size,
+            rounding_mode=config.dynamic_resolution_rounding_mode,
         )
 
     vision_type = config.vision_model_type
@@ -242,9 +233,38 @@ def preprocess_image(
     if pixel_mean is None or pixel_std is None:
         pixel_mean, pixel_std = _resolve_pixel_stats(vision_type)
 
-    transform = T.Compose([T.ToTensor(), T.Normalize(mean=pixel_mean, std=pixel_std)])
+    if config.dynamic_resolution_resize_mode == "pil":
+        transform = T.Compose(
+            [T.ToTensor(), T.Normalize(mean=pixel_mean, std=pixel_std)]
+        )
+        img_tensor = transform(img)  # [C, H, W]
+    elif config.dynamic_resolution_resize_mode == "torch_bicubic_antialias":
+        import torch.nn.functional as F
 
-    img_tensor = transform(img)  # [C, H, W]
+        target_hw = (img.height, img.width)
+        source_array = np.asarray(source_img, dtype=np.uint8)
+        img_tensor = (
+            torch.from_numpy(source_array)
+            .permute(2, 0, 1)
+            .unsqueeze(0)
+            .to(dtype=torch.float32)
+        )
+        if img_tensor.shape[-2:] != target_hw:
+            img_tensor = F.interpolate(
+                img_tensor,
+                size=target_hw,
+                mode="bicubic",
+                align_corners=False,
+                antialias=True,
+            )
+        mean = torch.tensor(pixel_mean, dtype=img_tensor.dtype).view(1, -1, 1, 1)
+        std = torch.tensor(pixel_std, dtype=img_tensor.dtype).view(1, -1, 1, 1)
+        img_tensor = ((img_tensor / 255.0 - mean) / std).squeeze(0)
+    else:
+        raise ValueError(
+            "dynamic_resolution_resize_mode must be 'pil' or "
+            f"'torch_bicubic_antialias', got {config.dynamic_resolution_resize_mode!r}."
+        )
     C, H, W = img_tensor.shape
 
     py, px = H // patch_dim, W // patch_dim
@@ -267,29 +287,10 @@ def preprocess_image_bytes(
     device: Optional[torch.device] = None,
 ) -> tuple:
     """Decode image bytes and return packed vision patches and its resized shape."""
-    result, _, _ = _preprocess_image_bytes_with_timing(
-        image_bytes, config, target_hw=target_hw, device=device
-    )
-    return result
-
-
-def _preprocess_image_bytes_with_timing(
-    image_bytes: bytes,
-    config: ImageProcessingConfig,
-    target_hw=None,
-    device: Optional[torch.device] = None,
-) -> tuple[tuple, float, float]:
-    """Preprocess image bytes and return decode and transform durations."""
     from PIL import Image
 
     with Image.open(io.BytesIO(image_bytes)) as image:
-        decode_started_at = time.perf_counter()
-        image.load()
-        decode_seconds = time.perf_counter() - decode_started_at
-        transform_started_at = time.perf_counter()
-        result = preprocess_image(image, config, target_hw=target_hw, device=device)
-        transform_seconds = time.perf_counter() - transform_started_at
-    return result, decode_seconds, transform_seconds
+        return preprocess_image(image, config, target_hw=target_hw, device=device)
 
 
 def preprocess_image_bytes_list(
@@ -337,43 +338,37 @@ def preprocess_image_bytes_list(
             "dynamic-resolution path that stays in-core."
         )
 
+    if config.dynamic_resolution_model_length is not None:
+        model_length = int(config.dynamic_resolution_model_length)
+        if model_length <= 4:
+            raise ValueError("dynamic_resolution_model_length must be greater than 4.")
+        merge_size = max(int(config.spatial_merge_size), 1)
+        model_patch_budget = (model_length - 4) * (merge_size * merge_size)
+        request_patch_budget = max(
+            model_patch_budget,
+            int(config.dynamic_resolution_min_patches) * len(image_bytes_list),
+        )
+        configured_max = int(config.dynamic_resolution_max_patches)
+        if configured_max > 0:
+            request_patch_budget = min(configured_max, request_patch_budget)
+        config = replace(
+            config,
+            dynamic_resolution_max_patches=max(
+                int(config.dynamic_resolution_min_patches),
+                request_patch_budget,
+            ),
+        )
+
     # Preprocess each image independently so its aspect ratio is preserved.
     # Downstream (llava_model._preprocess_data / vision encoder pack) handles
     # per-image cu_seqlens, so ragged patch counts are fine.
-    total_started_at = time.perf_counter()
-    decode_seconds = 0.0
-    transform_seconds = 0.0
-    max_image_seconds = 0.0
     all_imgs, all_sizes = [], []
     for image_bytes in image_bytes_list:
-        image_started_at = time.perf_counter()
-        (imgs, imgs_sizes), image_decode_seconds, image_transform_seconds = (
-            _preprocess_image_bytes_with_timing(image_bytes, config, device=device)
-        )
-        image_seconds = time.perf_counter() - image_started_at
-        decode_seconds += image_decode_seconds
-        transform_seconds += image_transform_seconds
-        max_image_seconds = max(max_image_seconds, image_seconds)
+        imgs, imgs_sizes = preprocess_image_bytes(image_bytes, config, device=device)
         all_imgs.append(imgs)
         all_sizes.append(imgs_sizes)
-    concat_started_at = time.perf_counter()
     imgs = torch.cat(all_imgs, dim=1) if len(all_imgs) > 1 else all_imgs[0]
     imgs_sizes = torch.cat(all_sizes, dim=0) if len(all_sizes) > 1 else all_sizes[0]
-    concat_seconds = time.perf_counter() - concat_started_at
-    total_seconds = time.perf_counter() - total_started_at
-    logger.warning(
-        "image-list preprocessing complete: images=%d payload_bytes=%d "
-        "decode_ms=%.1f transform_transfer_ms=%.1f max_image_ms=%.1f "
-        "concat_ms=%.1f total_ms=%.1f imgs_shape=%s",
-        len(image_bytes_list),
-        sum(len(image_bytes) for image_bytes in image_bytes_list),
-        decode_seconds * 1000,
-        transform_seconds * 1000,
-        max_image_seconds * 1000,
-        concat_seconds * 1000,
-        total_seconds * 1000,
-        tuple(imgs.shape),
-    )
     return {"imgs": imgs, "imgs_sizes": imgs_sizes}
 
 
@@ -483,18 +478,13 @@ def preprocess_video_bytes_list(
     frame_counts = []
     video_frame_indices = []
     video_fps = []
-    total_started_at = time.perf_counter()
-    decode_seconds = 0.0
-    frame_preprocess_seconds = 0.0
 
     for encoded_video in video_bytes_list:
         if not isinstance(encoded_video, (bytes, bytearray)):
             raise TypeError("video payloads must contain only bytes.")
-        decode_started_at = time.perf_counter()
         frames, frame_indices, fps, is_frame_sequence = decode_frames(
             bytes(encoded_video)
         )
-        decode_seconds += time.perf_counter() - decode_started_at
         if not frames:
             raise ValueError("Decoded video contains no frames.")
 
@@ -512,7 +502,6 @@ def preprocess_video_bytes_list(
 
         frame_tensors = []
         frame_sizes = []
-        preprocess_started_at = time.perf_counter()
         reference_image = dynamic_res_preprocess(
             sampled_frames[0],
             min_patches=config.image_config.dynamic_resolution_min_patches,
@@ -535,24 +524,11 @@ def preprocess_video_bytes_list(
         frame_counts.append(sample_count)
         video_frame_indices.append(frame_indices)
         video_fps.append(fps)
-        frame_preprocess_seconds += time.perf_counter() - preprocess_started_at
 
-    result = {
+    return {
         "imgs": torch.cat(packed_videos, dim=1),
         "imgs_sizes": torch.cat(packed_sizes, dim=0),
         "num_frames": torch.tensor(frame_counts, dtype=torch.int32, device=packed_videos[0].device),
         "video_frame_indices": video_frame_indices,
         "video_fps": video_fps,
     }
-    logger.warning(
-        "video preprocessing complete: videos=%d frames=%d payload_bytes=%d "
-        "decode_ms=%.1f frame_preprocess_ms=%.1f total_ms=%.1f imgs_shape=%s",
-        len(video_bytes_list),
-        sum(frame_counts),
-        sum(len(payload) for payload in video_bytes_list),
-        decode_seconds * 1000,
-        frame_preprocess_seconds * 1000,
-        (time.perf_counter() - total_started_at) * 1000,
-        tuple(result["imgs"].shape),
-    )
-    return result

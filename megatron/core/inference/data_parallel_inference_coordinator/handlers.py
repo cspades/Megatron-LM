@@ -24,7 +24,6 @@ Returning a truthy value signals the event loop to stop.
 """
 
 import logging
-import time
 
 from megatron.core.inference.config import (
     MediaCacheCoordinatorPolicy,
@@ -44,18 +43,6 @@ except ImportError:
 # Maps a message header value to the function that handles it. Populated by the
 # @message_handler decorator at import time.
 HANDLERS = {}
-
-
-def _request_tag(request_id: int) -> str:
-    """Letters-only identifier that remains distinct under Ray log dedup."""
-    value = int(request_id)
-    chars = []
-    while True:
-        value, remainder = divmod(value, 26)
-        chars.append(chr(ord("a") + remainder))
-        if value == 0:
-            return "".join(reversed(chars))
-        value -= 1
 
 
 def message_handler(*headers):
@@ -101,13 +88,12 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
 
     Sent by ``InferenceClient.add_request`` / ``add_request_streaming``.
 
-    ``metadata``: ``[header, client_request_id, sampling_params, media_meta, trace]``,
+    ``metadata``: ``[header, client_request_id, sampling_params, media_meta]``,
         where ``sampling_params`` is the serialized dict and ``media_meta`` is the
         bounded media descriptor -- a content key plus modality and token-expansion
         flags -- carrying the identity the routing policy keys on. Both are small
         by construction, which is why they are decoded and repacked here on every
-        request. ``trace`` is optional for compatibility with older clients and
-        carries wall-clock boundary timestamps only for cross-process diagnostics.
+        request.
     ``bodies``: ``[prompt, block_hashes, media]``.
 
         ``prompt`` is a string or token id list. It is forwarded to the engine
@@ -133,12 +119,11 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         logging.info(f"Received message from unknown client {sender_identity}. Ignoring.")
         return
 
-    handler_started_at = time.perf_counter()
     # Drop a malformed submission rather than unpacking it. This loop serves every
     # rank and every client, so an IndexError raised out of it takes the whole
     # coordinator down; a client that framed its request wrongly should only cost
     # itself that request.
-    if len(metadata) not in (4, 5) or len(bodies) != 3:
+    if len(metadata) != 4 or len(bodies) != 3:
         logging.error(
             "Coordinator: malformed SUBMIT_REQUEST with %d metadata fields, %d bodies",
             len(metadata) - 1,
@@ -146,18 +131,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         )
         return
 
-    _, client_request_id, sampling_params, media_meta, *trace_fields = metadata
-    coordinator.submissions_received_total += 1
-    coordinator.increment_client_telemetry(
-        coordinator.submissions_received_by_client, sender_identity
-    )
-    client_trace = trace_fields[0] if trace_fields and isinstance(trace_fields[0], dict) else {}
-    client_ready_wall_ns = client_trace.get("client_ready_wall_ns")
-    client_to_coordinator_ms = (
-        (time.time_ns() - client_ready_wall_ns) / 1e6
-        if isinstance(client_ready_wall_ns, int)
-        else None
-    )
+    _, client_request_id, sampling_params, media_meta = metadata
     prompt_frame = bodies[0]
     media_frame = bodies[2]
 
@@ -168,18 +142,11 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
-    coordinator.request_id_to_started_at[request_id] = time.monotonic()
 
     # Rebuilding the metadata frame is cheap: it holds neither prompt tokens nor
     # media bytes, only the bounded media descriptor.
     engine_metadata = msgpack.packb(
-        [
-            Headers.SUBMIT_REQUEST.value,
-            request_id,
-            sampling_params,
-            media_meta,
-        ],
-        use_bin_type=True,
+        [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta], use_bin_type=True
     )
 
     # Media identity is read straight from the metadata frame; it salts the
@@ -193,7 +160,6 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     # Same predicate the client uses to decide whether hashing was worth doing,
     # rather than a second spelling of it: a policy added to one and not the
     # other would have the client skip hashes this handler still expects.
-    hash_started_at = time.perf_counter()
     if (
         coordinator.enable_prefix_caching
         and coordinator.block_size_tokens is not None
@@ -218,7 +184,6 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
             )
     else:
         request_hashes = []
-    hash_elapsed_ms = (time.perf_counter() - hash_started_at) * 1000
 
     if (
         coordinator.prefix_caching_coordinator_policy
@@ -227,7 +192,6 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         request_hashes = request_hashes[:1]
 
     # Account for the fact that some engines may have died.
-    send_started_at = time.perf_counter()
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
         next_identity = coordinator.get_best_data_parallel_rank(
             request_hashes, media_cache_key=media_cache_key
@@ -240,46 +204,10 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         del coordinator.request_id_to_client_id[request_id]
         del coordinator.request_id_to_client_request_id[request_id]
         del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
-        coordinator.request_id_to_started_at.pop(request_id, None)
         return True
-    send_elapsed_ms = (time.perf_counter() - send_started_at) * 1000
 
     coordinator.request_id_to_rank[request_id] = next_identity
-    rank_index = coordinator.identity_to_rank_index[next_identity]
-    coordinator._pending_counts[rank_index] += 1
-    handler_elapsed_ms = (time.perf_counter() - handler_started_at) * 1000
-    log = (
-        logging.warning
-        if handler_elapsed_ms >= 100.0
-        or coordinator._pending_counts[rank_index] > coordinator.max_requests
-        else logging.info
-    )
-    log(
-        "Coordinator request routed: tag=%s server_id=%d client_id=%d zmq_client=%s rank=%d "
-        "wall_client_to_coordinator_ms=%s handler_ms=%.1f hash_ms=%.1f send_ms=%.1f "
-        "frame_bytes=%s total_bytes=%d "
-        "rank_pending=%d/%d fleet_pending=%d hashes=%d media_key=%s",
-        _request_tag(request_id),
-        request_id,
-        client_request_id,
-        sender_identity.decode("ascii", errors="replace"),
-        rank_index,
-        (
-            f"{client_to_coordinator_ms:.1f}"
-            if client_to_coordinator_ms is not None
-            else "unknown"
-        ),
-        handler_elapsed_ms,
-        hash_elapsed_ms,
-        send_elapsed_ms,
-        [len(engine_metadata), len(prompt_frame), len(media_frame)],
-        len(engine_metadata) + len(prompt_frame) + len(media_frame),
-        int(coordinator._pending_counts[rank_index]),
-        coordinator.max_requests,
-        int(coordinator._pending_counts.sum()),
-        len(request_hashes),
-        media_cache_key[:12] if isinstance(media_cache_key, str) else "none",
-    )
+    coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
     if (
         isinstance(media_cache_key, str)
         and coordinator.vision_embedding_cache_enabled
@@ -336,7 +264,6 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
     coordinator.request_id_to_client_id[request_id] = sender_identity
     coordinator.request_id_to_client_request_id[request_id] = client_request_id
     coordinator.client_request_to_request_id[(sender_identity, client_request_id)] = request_id
-    coordinator.request_id_to_started_at[request_id] = time.monotonic()
 
     # Rebuilding the metadata frame is cheap: it holds no prompt tokens.
     engine_metadata = msgpack.packb(
@@ -353,7 +280,6 @@ def handle_submit_request_with_kv(coordinator, sender_identity, metadata, bodies
         del coordinator.request_id_to_client_id[request_id]
         del coordinator.request_id_to_client_request_id[request_id]
         del coordinator.client_request_to_request_id[(sender_identity, client_request_id)]
-        coordinator.request_id_to_started_at.pop(request_id, None)
         return True
 
     coordinator.request_id_to_rank[request_id] = next_identity
@@ -461,22 +387,18 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
         logging.warning("Coordinator: ENGINE_REPLY from removed engine %r", sender_identity)
 
     for (fid, needs_detokenize), body in zip(metadata[1], bodies):
-        finished_at = time.monotonic()
         client_identity = coordinator.request_id_to_client_id[fid]
         client_request_id = coordinator.request_id_to_client_request_id[fid]
         del coordinator.request_id_to_client_id[fid]
         del coordinator.request_id_to_client_request_id[fid]
         del coordinator.client_request_to_request_id[(client_identity, client_request_id)]
         assigned_rank = coordinator.request_id_to_rank.pop(fid, None)
-        started_at = coordinator.request_id_to_started_at.pop(fid, None)
-        rank_index = None
         if assigned_rank is not None:
-            rank_index = coordinator.identity_to_rank_index.get(assigned_rank)
-            if rank_index is not None:
-                assert coordinator._pending_counts[rank_index] >= 1
-                coordinator._pending_counts[rank_index] -= 1
+            idx = coordinator.identity_to_rank_index.get(assigned_rank)
+            if idx is not None:
+                assert coordinator._pending_counts[idx] >= 1
+                coordinator._pending_counts[idx] -= 1
 
-        finalize_started_at = time.perf_counter()
         if needs_detokenize:
             # Detokenization writes generated_text into the reply, so the body must
             # be unpacked and repacked. The OpenAI endpoints detokenize in the
@@ -484,48 +406,11 @@ def handle_engine_reply(coordinator, sender_identity, metadata, bodies):
             finished_request = msgpack.unpackb(body, raw=False)
             coordinator.finalize_text(finished_request)
             body = msgpack.packb(finished_request, use_bin_type=True)
-        finalized_at = time.perf_counter()
 
         reply_metadata = msgpack.packb(
             [Headers.ENGINE_REPLY.value, client_request_id], use_bin_type=True
         )
-        send_started_at = time.perf_counter()
         coordinator.router_socket.send_multipart([client_identity, reply_metadata, body])
-        sent_at = time.perf_counter()
-        coordinator.replies_sent_total += 1
-        coordinator.increment_client_telemetry(
-            coordinator.replies_sent_by_client, client_identity
-        )
-        elapsed_seconds = finished_at - started_at if started_at is not None else None
-        finalize_ms = (finalized_at - finalize_started_at) * 1000
-        send_ms = (sent_at - send_started_at) * 1000
-        log = (
-            logging.warning
-            if (elapsed_seconds is not None and elapsed_seconds >= 30.0)
-            or finalize_ms >= 100.0
-            or send_ms >= 100.0
-            else logging.info
-        )
-        log(
-            "Coordinator request done: tag=%s server_id=%d client_id=%d "
-            "zmq_client=%s rank=%s elapsed=%s finalize_ms=%.1f send_ms=%.1f "
-            "body_bytes=%d rank_pending=%s fleet_pending=%d",
-            _request_tag(fid),
-            fid,
-            client_request_id,
-            client_identity.decode("ascii", errors="replace"),
-            rank_index,
-            f"{elapsed_seconds:.1f}s" if elapsed_seconds is not None else "unknown",
-            finalize_ms,
-            send_ms,
-            len(body),
-            (
-                int(coordinator._pending_counts[rank_index])
-                if rank_index is not None
-                else "unknown"
-            ),
-            int(coordinator._pending_counts.sum()),
-        )
 
 
 @message_handler(Headers.ENGINE_REPLY_PARTIAL)
@@ -561,7 +446,6 @@ def handle_engine_reply_partial(coordinator, sender_identity, metadata, bodies):
                 body,
             ]
         )
-        coordinator.partial_replies_sent_total += 1
 
 
 @message_handler(Headers.ABORT_REQUEST)
@@ -583,16 +467,6 @@ def handle_abort_request(coordinator, sender_identity, metadata, bodies):
         return
     assigned_rank = coordinator.request_id_to_rank.get(request_id)
     if assigned_rank is not None:
-        started_at = coordinator.request_id_to_started_at.get(request_id)
-        logging.warning(
-            "Coordinator request abort: tag=%s server_id=%d client_id=%d "
-            "rank=%s age=%.1fs",
-            _request_tag(request_id),
-            request_id,
-            client_request_id,
-            coordinator.identity_to_rank_index.get(assigned_rank),
-            time.monotonic() - started_at if started_at is not None else -1.0,
-        )
         coordinator._send_to_engine(
             assigned_rank,
             [msgpack.packb([Headers.ABORT_REQUEST.value, request_id], use_bin_type=True)],

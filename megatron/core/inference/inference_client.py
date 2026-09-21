@@ -1,11 +1,9 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import asyncio
-import contextlib
 import functools
 import logging
 import time
-import uuid
 from typing import List, Optional, Union
 
 import torch
@@ -25,7 +23,6 @@ from .headers import Headers
 
 try:
     import zmq
-    from zmq.utils.monitor import recv_monitor_message
 
     HAVE_ZMQ = True
 except:
@@ -37,18 +34,6 @@ try:
     HAVE_MSGPACK = True
 except:
     HAVE_MSGPACK = False
-
-
-def _request_tag(request_id: int) -> str:
-    """Letters-only request identifier that remains distinct under Ray log dedup."""
-    value = int(request_id)
-    chars = []
-    while True:
-        value, remainder = divmod(value, 26)
-        chars.append(chr(ord("a") + remainder))
-        if value == 0:
-            return "".join(reversed(chars))
-        value -= 1
 
 
 class InferenceClient:
@@ -106,21 +91,6 @@ class InferenceClient:
         ), "please install the messagepack library to use InferenceClient - pip install msgpack"
         self.context = zmq.Context()
         socket = self.context.socket(zmq.DEALER)
-        self.client_trace_id = uuid.uuid4().hex[:12]
-        socket.setsockopt(zmq.IDENTITY, self.client_trace_id.encode("ascii"))
-        monitor_endpoint = f"inproc://inference-client-monitor-{self.client_trace_id}"
-        monitor_events = (
-            zmq.EVENT_CONNECTED
-            | zmq.EVENT_CONNECT_DELAYED
-            | zmq.EVENT_CONNECT_RETRIED
-            | zmq.EVENT_DISCONNECTED
-            | zmq.EVENT_CLOSED
-        )
-        socket.monitor(monitor_endpoint, monitor_events)
-        self._monitor_socket = self.context.socket(zmq.PAIR)
-        self._monitor_socket.connect(monitor_endpoint)
-        self._monitor_event_counts: dict[str, int] = {}
-        self._last_monitor_event: Optional[dict] = None
 
         # Prevent socket.send() from thread-blocking at >1000 concurrent requests
         socket.setsockopt(zmq.SNDHWM, 0)
@@ -132,61 +102,12 @@ class InferenceClient:
         self.socket = socket
         self.deserialize = deserialize
         self.completion_futures = {}
-        # Set once the reply listener stops. Everything this client owns is
-        # undeliverable from that moment, so it is also the error reported to
-        # callers instead of letting them wait on a future nothing will resolve.
-        self._listener_failure: Optional[BaseException] = None
         self.request_submission_times = {}
-        self._listener_started_at: Optional[float] = None
-        self._last_reply_received_at: Optional[float] = None
-        self._reply_frames_received = 0
         self.next_request_id = 0
         self.streams: dict[int, AsyncStream[dict]] = {}
         self.aborted_request_ids: set[int] = set()
         self.block_size_tokens = block_size_tokens
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
-
-    @staticmethod
-    def _monitor_event_name(event: int) -> str:
-        names = {
-            zmq.EVENT_CONNECTED: "CONNECTED",
-            zmq.EVENT_CONNECT_DELAYED: "CONNECT_DELAYED",
-            zmq.EVENT_CONNECT_RETRIED: "CONNECT_RETRIED",
-            zmq.EVENT_DISCONNECTED: "DISCONNECTED",
-            zmq.EVENT_CLOSED: "CLOSED",
-        }
-        return names.get(event, f"EVENT_{event}")
-
-    def _drain_monitor_events(self) -> None:
-        """Consume connection events so transient disconnects remain observable."""
-        while self._monitor_socket.poll(timeout=0):
-            try:
-                event = recv_monitor_message(self._monitor_socket, flags=zmq.NOBLOCK)
-            except zmq.Again:
-                break
-            event_name = self._monitor_event_name(int(event["event"]))
-            self._monitor_event_counts[event_name] = (
-                self._monitor_event_counts.get(event_name, 0) + 1
-            )
-            self._last_monitor_event = {
-                "event": event_name,
-                "value": int(event["value"]),
-                "endpoint": event["endpoint"].decode(
-                    "utf-8", errors="replace"
-                )
-                if isinstance(event["endpoint"], bytes)
-                else str(event["endpoint"]),
-                "observed_at": time.perf_counter(),
-            }
-            logging.warning(
-                "Inference client transport event: zmq_client=%s event=%s "
-                "value=%s endpoint=%s counts=%s",
-                self.client_trace_id,
-                event_name,
-                self._last_monitor_event["value"],
-                self._last_monitor_event["endpoint"],
-                self._monitor_event_counts,
-            )
 
     def _block_hashes(self, prompt, media_meta):
         """Hash the prompt into per-block routing hashes for the coordinator.
@@ -291,22 +212,7 @@ class InferenceClient:
         """
         request_id = self.next_request_id
         self.next_request_id += 1
-        pack_started_at = time.perf_counter()
         frames = self._pack_submit_frames(request_id, prompt, sampling_params, multi_modal_data)
-        frame_bytes = [len(frame) for frame in frames]
-        pack_elapsed_ms = (time.perf_counter() - pack_started_at) * 1000
-        log = logging.warning if pack_elapsed_ms >= 100.0 else logging.info
-        log(
-            "Inference client packed: tag=%s client_id=%d elapsed_ms=%.1f "
-            "zmq_client=%s frame_bytes=%s total_bytes=%d prompt_tokens=%s",
-            _request_tag(request_id),
-            request_id,
-            pack_elapsed_ms,
-            self.client_trace_id,
-            frame_bytes,
-            sum(frame_bytes),
-            len(prompt) if not isinstance(prompt, str) else "string",
-        )
         return request_id, self._submit_request(frames, request_id)
 
     def _pack_submit_frames(self, request_id, prompt, sampling_params, multi_modal_data):
@@ -344,44 +250,23 @@ class InferenceClient:
         Returns:
             list: The frames to send, in wire order.
         """
-        started_at = time.perf_counter()
-        serialized_media = serialize_multimodal_data(multi_modal_data)
-        media_serialized_at = time.perf_counter()
-        media_meta, media_payload = split_multimodal_data(serialized_media)
-        prompt_frame = self._pack_prompt(prompt)
-        prompt_packed_at = time.perf_counter()
-        # Routing hashes, when the caller computed them. None means it did
-        # not, and the coordinator hashes the prompt itself -- deliberately
-        # distinct from an empty list, which means the caller hashed and the
-        # prompt was shorter than one block.
-        hash_frame = msgpack.packb(self._block_hashes(prompt, media_meta), use_bin_type=True)
-        hashes_packed_at = time.perf_counter()
-        media_frame = msgpack.packb(media_payload, use_bin_type=True)
-        metadata_frame = msgpack.packb(
-            [
-                Headers.SUBMIT_REQUEST.value,
-                request_id,
-                sampling_params.serialize(),
-                media_meta,
-            ],
-            use_bin_type=True,
+        media_meta, media_payload = split_multimodal_data(
+            # If multi_modal_data is already serialized, then this is an identity function.
+            serialize_multimodal_data(multi_modal_data)
         )
-        finished_at = time.perf_counter()
-        pack_elapsed_ms = (finished_at - started_at) * 1000
-        log = logging.warning if pack_elapsed_ms >= 100.0 else logging.info
-        log(
-            "Inference client pack stages: tag=%s client_id=%d zmq_client=%s "
-            "media_serialize_ms=%.1f metadata_prompt_pack_ms=%.1f "
-            "hash_ms=%.1f media_pack_ms=%.1f",
-            _request_tag(request_id),
-            request_id,
-            self.client_trace_id,
-            (media_serialized_at - started_at) * 1000,
-            (prompt_packed_at - media_serialized_at) * 1000,
-            (hashes_packed_at - prompt_packed_at) * 1000,
-            (finished_at - hashes_packed_at) * 1000,
-        )
-        return [metadata_frame, prompt_frame, hash_frame, media_frame]
+        return [
+            msgpack.packb(
+                [Headers.SUBMIT_REQUEST.value, request_id, sampling_params.serialize(), media_meta],
+                use_bin_type=True,
+            ),
+            self._pack_prompt(prompt),
+            # Routing hashes, when the caller computed them. None means it did
+            # not, and the coordinator hashes the prompt itself -- deliberately
+            # distinct from an empty list, which means the caller hashed and the
+            # prompt was shorter than one block.
+            msgpack.packb(self._block_hashes(prompt, media_meta), use_bin_type=True),
+            msgpack.packb(media_payload, use_bin_type=True),
+        ]
 
     @staticmethod
     def _pack_prompt(prompt):
@@ -518,74 +403,6 @@ class InferenceClient:
         payload = [Headers.ABORT_REQUEST.value, request_id]
         self.socket.send(msgpack.packb(payload, use_bin_type=True))
 
-    def pending_request_diagnostics(self, request_ids: list[int]) -> dict:
-        """Describe which named requests are still awaiting an engine reply.
-
-        This is intentionally a local, allocation-free snapshot used by HTTP
-        frontend watchdogs. ``request_submission_times`` starts immediately
-        before the coordinator send, so age includes coordinator queueing,
-        engine admission, prefill, and decode, but excludes HTTP preprocessing.
-        """
-        now = time.perf_counter()
-        self._drain_monitor_events()
-        listener_task = getattr(self, "listener_task", None)
-        listener_done = listener_task.done() if listener_task is not None else None
-        listener_error = None
-        if listener_task is not None and listener_done and not listener_task.cancelled():
-            with contextlib.suppress(BaseException):
-                error = listener_task.exception()
-                listener_error = (
-                    f"{type(error).__name__}: {error}" if error is not None else None
-                )
-        try:
-            socket_events = int(self.socket.getsockopt(zmq.EVENTS))
-        except Exception:
-            socket_events = -1
-        pending = []
-        for request_id in request_ids:
-            submitted = self.request_submission_times.get(int(request_id))
-            if submitted is None:
-                continue
-            pending.append(
-                {
-                    "request_id": int(request_id),
-                    "age_seconds": now - submitted,
-                }
-            )
-        pending.sort(key=lambda item: item["age_seconds"], reverse=True)
-        return {
-            "requested": len(request_ids),
-            "pending": len(pending),
-            "completed": len(request_ids) - len(pending),
-            "oldest_seconds": pending[0]["age_seconds"] if pending else 0.0,
-            "oldest": pending[:8],
-            "client_trace_id": self.client_trace_id,
-            "all_client_pending": len(self.completion_futures) + len(self.streams),
-            "listener_done": listener_done,
-            "listener_error": listener_error,
-            "listener_age_seconds": (
-                now - self._listener_started_at
-                if self._listener_started_at is not None
-                else None
-            ),
-            "reply_frames_received": self._reply_frames_received,
-            "seconds_since_last_reply": (
-                now - self._last_reply_received_at
-                if self._last_reply_received_at is not None
-                else None
-            ),
-            "socket_events": socket_events,
-            "monitor_event_counts": dict(self._monitor_event_counts),
-            "last_monitor_event": (
-                {
-                    **self._last_monitor_event,
-                    "age_seconds": now - self._last_monitor_event["observed_at"],
-                }
-                if self._last_monitor_event is not None
-                else None
-            ),
-        }
-
     def add_request_streaming(
         self,
         prompt: Union[str, List[int]],
@@ -634,135 +451,22 @@ class InferenceClient:
 
     def _submit_request(self, frames: list, request_id: int) -> asyncio.Future:
         """Send a prepared request and register its completion future."""
-        self._raise_if_listener_dead()
-        submitted_at = time.perf_counter()
-        self.request_submission_times[request_id] = submitted_at
+        self.socket.send_multipart(frames)
         assert request_id not in self.completion_futures
         future = asyncio.get_running_loop().create_future()
         self.completion_futures[request_id] = future
-        try:
-            self.socket.send_multipart(frames)
-        except BaseException:
-            self.request_submission_times.pop(request_id, None)
-            self.completion_futures.pop(request_id, None)
-            future.cancel()
-            raise
-        send_elapsed_ms = (time.perf_counter() - submitted_at) * 1000
-        log = logging.warning if send_elapsed_ms >= 100.0 else logging.info
-        log(
-            "Inference client sent: tag=%s client_id=%d zmq_client=%s "
-            "send_ms=%.1f total_bytes=%d",
-            _request_tag(request_id),
-            request_id,
-            self.client_trace_id,
-            send_elapsed_ms,
-            sum(len(frame) for frame in frames),
-        )
+        self.request_submission_times[request_id] = time.perf_counter()
         return future
 
     def _submit_stream(self, frames: list, request_id: int) -> AsyncStream[dict]:
         """Send a prepared streaming request and register its response stream."""
-        self._raise_if_listener_dead()
+        self.socket.send_multipart(frames)
         stream = AsyncStream(
             request_id, functools.partial(self.abort_request, request_id), loop=self._loop
         )
         self.streams[request_id] = stream
         self.request_submission_times[request_id] = time.perf_counter()
-        try:
-            self.socket.send_multipart(frames)
-        except BaseException:
-            self.streams.pop(request_id, None)
-            self.request_submission_times.pop(request_id, None)
-            stream.finish()
-            raise
         return stream
-
-    def _listener_dead_error(self) -> RuntimeError:
-        """The error reported to callers once the listener has stopped."""
-        cause = self._listener_failure
-        return RuntimeError(
-            "Megatron inference reply listener is dead "
-            f"({type(cause).__name__}: {cause}); this frontend replica can no longer "
-            "complete requests"
-        )
-
-    def _on_listener_done(self, task: "asyncio.Task") -> None:
-        """Report and fail everything outstanding when the listener stops.
-
-        Attached to the listener task so every exit path is covered, not just the
-        ones the loop anticipates. Cancellation is stop() tearing the client down
-        and is already handled there.
-        """
-        if task.cancelled():
-            return
-        error = task.exception() or RuntimeError("listener exited without raising")
-        self._listener_failure = error
-        outstanding = len(self.completion_futures) + len(self.streams)
-        # logging.exception is not usable here: this runs from a done-callback,
-        # outside the raising context, so the traceback must be passed explicitly.
-        logging.error(
-            "Client: reply listener stopped (%s: %s); failing %d outstanding request(s). "
-            "This process cannot serve further requests.",
-            type(error).__name__,
-            error,
-            outstanding,
-            exc_info=error,
-        )
-        outstanding_ids = set(self.completion_futures) | set(self.streams)
-        for request_id in outstanding_ids:
-            try:
-                payload = [Headers.ABORT_REQUEST.value, request_id]
-                self.socket.send(msgpack.packb(payload, use_bin_type=True))
-            except Exception:
-                logging.exception(
-                    "Client: failed to abort request %d after reply listener stopped.",
-                    request_id,
-                )
-        dead = self._listener_dead_error()
-        for future in list(self.completion_futures.values()):
-            if not future.done():
-                future.set_exception(dead)
-        self.completion_futures.clear()
-        for stream in list(self.streams.values()):
-            # finish() with no argument queues STOP_ITERATION, which reads to the
-            # consumer as a normally completed generation; a half-streamed reply
-            # would be accepted as the whole answer. Hand it the error so
-            # __anext__ raises instead.
-            stream.finish(dead)
-        self.streams.clear()
-        self.request_submission_times.clear()
-        self.aborted_request_ids.clear()
-
-    def _raise_if_listener_dead(self) -> None:
-        """Reject a submission this client could never deliver a reply for."""
-        if self._listener_failure is not None:
-            raise self._listener_dead_error()
-
-    def _fail_local_request(self, request_id: int, error: BaseException) -> bool:
-        """Fail one reply owner after a malformed request-scoped frame.
-
-        Returns whether this client still owned the request. The best-effort
-        abort is sent directly instead of using :meth:`abort_request`, whose
-        normal stream-close semantics would hide ``error`` from the caller.
-        """
-        self.request_submission_times.pop(request_id, None)
-        stream = self.streams.pop(request_id, None)
-        future = self.completion_futures.pop(request_id, None)
-        if stream is None and future is None:
-            return False
-        if stream is not None:
-            stream.finish(error)
-        if future is not None and not future.done():
-            future.set_exception(error)
-        try:
-            payload = [Headers.ABORT_REQUEST.value, request_id]
-            self.socket.send(msgpack.packb(payload, use_bin_type=True))
-        except Exception:
-            logging.exception(
-                "Client: failed to abort request %d after malformed reply.",
-                request_id,
-            )
-        return True
 
     @trace_async_exceptions
     async def _recv_task(self):
@@ -778,14 +482,9 @@ class InferenceClient:
         This method is started as a background task by the `start()` method.
         """
         while True:
-            request_id = None
             try:
-                self._drain_monitor_events()
                 # frames[0] is metadata; a reply body, when present, follows it.
                 frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
-                received_at = time.perf_counter()
-                self._last_reply_received_at = received_at
-                self._reply_frames_received += 1
                 data = msgpack.unpackb(frames[0], raw=False)
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
@@ -794,76 +493,26 @@ class InferenceClient:
                         self.aborted_request_ids.discard(request_id)
                         continue
                     reply = msgpack.unpackb(frames[1], raw=False)
-                    unpacked_at = time.perf_counter()
-                    submitted = self.request_submission_times.get(request_id)
+                    submitted = self.request_submission_times.pop(request_id, None)
                     if submitted is not None:
                         reply['latency'] = time.perf_counter() - submitted
-                    try:
+                    # Streaming path: deliver final reply + sentinel and stop.
+                    if request_id in self.streams:
+                        stream = self.streams.pop(request_id)
                         completed_request = (
                             DynamicInferenceRequest.deserialize(reply)
                             if self.deserialize
                             else reply
                         )
-                    except Exception as error:
-                        # A malformed reply belongs to exactly one request. Fail
-                        # that owner without killing the process-wide listener or
-                        # leaving an HTTP request waiting forever.
-                        self._fail_local_request(request_id, error)
-                        logging.exception(
-                            "Client: failed to deserialize reply for request %d.",
-                            request_id,
-                        )
-                        continue
-                    # Streaming path: deliver final reply + sentinel and stop.
-                    if request_id in self.streams:
-                        stream = self.streams.pop(request_id)
-                        self.request_submission_times.pop(request_id, None)
                         stream.put({"final": completed_request})
                         stream.finish()
                         continue
-                    completion_future = self.completion_futures.get(request_id)
-                    if completion_future is None:
-                        # No waiting future: a duplicate reply, or one arriving
-                        # after an abort whose first reply already discarded the
-                        # id above. Dropping it has to stay non-fatal -- this task
-                        # resolves every future in the process, so an exception
-                        # here leaves the frontend accepting requests it can never
-                        # answer.
-                        logging.warning(
-                            f"Client: no pending future for request {request_id}; dropping reply."
-                        )
-                        self.request_submission_times.pop(request_id, None)
-                        continue
+                    completion_future = self.completion_futures.pop(request_id)
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
-                        self.completion_futures.pop(request_id, None)
-                        self.request_submission_times.pop(request_id, None)
                         continue
-                    self.completion_futures.pop(request_id, None)
-                    self.request_submission_times.pop(request_id, None)
-                    deserialized_at = time.perf_counter()
-                    total_ms = (
-                        (received_at - submitted) * 1000 if submitted is not None else None
-                    )
-                    log = (
-                        logging.warning
-                        if total_ms is not None and total_ms >= 30_000.0
-                        else logging.info
-                    )
-                    log(
-                        "Inference client reply: tag=%s client_id=%d zmq_client=%s total_ms=%s "
-                        "frame_bytes=%s unpack_ms=%.1f deserialize_ms=%.1f",
-                        _request_tag(request_id),
-                        request_id,
-                        self.client_trace_id,
-                        (
-                            f"{total_ms:.1f}"
-                            if total_ms is not None
-                            else "unknown"
-                        ),
-                        [len(frame) for frame in frames],
-                        (unpacked_at - received_at) * 1000,
-                        (deserialized_at - unpacked_at) * 1000,
+                    completed_request = (
+                        DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
                     )
                     completion_future.set_result(completed_request)
                 elif header == Headers.ENGINE_REPLY_PARTIAL:
@@ -876,22 +525,6 @@ class InferenceClient:
                 continue
             except KeyboardInterrupt:
                 break
-            except Exception as error:
-                if request_id is not None:
-                    self._fail_local_request(request_id, error)
-                    logging.exception(
-                        "Client: failed to process reply for request %d; owner failed.",
-                        request_id,
-                    )
-                    continue
-                # Without a request id there is no safe owner to fail. Stop the
-                # listener so its done callback aborts and fails every outstanding
-                # request instead of silently orphaning an unknown subset.
-                logging.exception(
-                    "Client: malformed coordinator frame without a request id; "
-                    "stopping the listener."
-                )
-                raise
 
     def _connect_with_inference_coordinator(self, timeout_seconds: Optional[float] = None):
         """
@@ -924,9 +557,7 @@ class InferenceClient:
         logging.info("Client: Connecting to InferenceCoordinator...")
         self._loop = get_asyncio_loop(loop)
         self._connect_with_inference_coordinator(connect_timeout_seconds)
-        self._listener_started_at = time.perf_counter()
         self.listener_task = self._loop.create_task(self._recv_task())
-        self.listener_task.add_done_callback(self._on_listener_done)
 
     def _send_signal_to_engines(self, signal, *args):
         """
@@ -1023,7 +654,5 @@ class InferenceClient:
             stream.finish()
         self.streams.clear()
         self.aborted_request_ids.clear()
-        self.socket.disable_monitor()
-        self._monitor_socket.close(linger=0)
         self.socket.close(linger=0)
         self.context.term()

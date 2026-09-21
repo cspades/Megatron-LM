@@ -1,21 +1,10 @@
 # Copyright (c) 2024, NVIDIA CORPORATION. All rights reserved.
 
-import asyncio
 import logging
 import threading
-import time
-from collections import Counter
-from itertools import count
 from typing import TYPE_CHECKING, Iterable
 
 import torch
-
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.protocol import (
-    ERROR_CODE_HEADER,
-    GENERATION_ABORTED_ERROR_CODE,
-    REQUEST_TIMEOUT_HEADER,
-    RETRYABLE_HEADER,
-)
 
 if TYPE_CHECKING:
     from megatron.core.inference.inference_client import InferenceClient
@@ -24,130 +13,6 @@ GENERATE_NUM = 0
 LOCK = threading.Lock()
 
 logger = logging.getLogger(__name__)
-
-_FRONTEND_REQUEST_SEQUENCE = count()
-_ACTIVE_FRONTEND_REQUESTS: dict[str, dict] = {}
-_FRONTEND_HEARTBEAT_TASK = None
-
-
-async def _frontend_request_heartbeat() -> None:
-    """Report requests blocked before or after engine submission."""
-    while True:
-        await asyncio.sleep(30.0)
-        now = time.perf_counter()
-        states = list(_ACTIVE_FRONTEND_REQUESTS.values())
-        phases = Counter(state["phase"] for state in states)
-        oldest = sorted(
-            (
-                {
-                    "trace": state["trace"],
-                    "endpoint": state["endpoint"],
-                    "phase": state["phase"],
-                    "age_s": round(now - state["started_at"], 1),
-                    "phase_age_s": round(now - state["phase_started_at"], 1),
-                    "content_length": state["content_length"],
-                }
-                for state in states
-            ),
-            key=lambda item: item["age_s"],
-            reverse=True,
-        )[:10]
-        logger.warning(
-            "frontend request heartbeat: active=%d phases=%s oldest=%s",
-            len(states),
-            dict(phases),
-            oldest,
-        )
-
-
-def frontend_request_started(endpoint: str, headers) -> str:
-    """Register an HTTP request before any potentially blocking body read."""
-    global _FRONTEND_HEARTBEAT_TASK
-    router_id = headers.get("X-Nemo-Router-Request-Id", "direct")
-    trace = f"{router_id}:{next(_FRONTEND_REQUEST_SEQUENCE)}"
-    now = time.perf_counter()
-    content_length = headers.get("Content-Length", "unknown")
-    _ACTIVE_FRONTEND_REQUESTS[trace] = {
-        "trace": trace,
-        "endpoint": endpoint,
-        "phase": "reading_json_body",
-        "started_at": now,
-        "phase_started_at": now,
-        "content_length": content_length,
-    }
-    if _FRONTEND_HEARTBEAT_TASK is None or _FRONTEND_HEARTBEAT_TASK.done():
-        _FRONTEND_HEARTBEAT_TASK = asyncio.create_task(_frontend_request_heartbeat())
-    logger.warning(
-        "frontend request stage: trace=%s endpoint=%s event=start "
-        "phase=reading_json_body content_length=%s",
-        trace,
-        endpoint,
-        content_length,
-    )
-    return trace
-
-
-def frontend_request_phase(trace: str, phase: str, **fields) -> None:
-    """Advance one frontend request and log the completed phase duration."""
-    state = _ACTIVE_FRONTEND_REQUESTS.get(trace)
-    if state is None:
-        return
-    now = time.perf_counter()
-    logger.warning(
-        "frontend request stage: trace=%s endpoint=%s event=transition "
-        "from=%s to=%s previous_phase_ms=%.1f total_ms=%.1f fields=%s",
-        trace,
-        state["endpoint"],
-        state["phase"],
-        phase,
-        (now - state["phase_started_at"]) * 1000,
-        (now - state["started_at"]) * 1000,
-        fields,
-    )
-    state["phase"] = phase
-    state["phase_started_at"] = now
-
-
-def frontend_request_finished(trace: str, outcome: str) -> None:
-    """Remove one HTTP request from diagnostics when its handler returns."""
-    state = _ACTIVE_FRONTEND_REQUESTS.pop(trace, None)
-    if state is None:
-        return
-    now = time.perf_counter()
-    logger.warning(
-        "frontend request stage: trace=%s endpoint=%s event=finished "
-        "last_phase=%s outcome=%s phase_ms=%.1f total_ms=%.1f",
-        trace,
-        state["endpoint"],
-        state["phase"],
-        outcome,
-        (now - state["phase_started_at"]) * 1000,
-        (now - state["started_at"]) * 1000,
-    )
-
-
-def non_retryable_error_headers(error_code: str):
-    """Return transport metadata for an error callers must not replay."""
-    return {
-        RETRYABLE_HEADER: "false",
-        ERROR_CODE_HEADER: error_code,
-    }
-
-
-def remaining_request_timeout(headers, started_at: float):
-    """Return the proxy-supplied generation budget remaining at the frontend."""
-    raw_timeout = headers.get(REQUEST_TIMEOUT_HEADER)
-    if raw_timeout is None:
-        return None
-    try:
-        timeout_s = float(raw_timeout)
-    except (TypeError, ValueError):
-        logger.warning("Ignoring invalid %s=%r", REQUEST_TIMEOUT_HEADER, raw_timeout)
-        return None
-    if not 0.0 < timeout_s <= 24 * 60 * 60:
-        logger.warning("Ignoring out-of-range %s=%r", REQUEST_TIMEOUT_HEADER, raw_timeout)
-        return None
-    return max(0.0, timeout_s - (time.perf_counter() - started_at))
 
 
 def abort_requests(client: "InferenceClient", request_ids: Iterable[int], reason: str) -> None:
@@ -259,10 +124,7 @@ def log_sampling_defaults_once(tokenizer, resolved):
     _LOGGED_SAMPLING_DEFAULTS = True
 
     gen_cfg = getattr(tokenizer, "generation_config", None)
-    # Root INFO is suppressed by the inference frontend's normal logging setup.
-    # Keep this at WARNING so every research run records whether the model's
-    # generation_config.json was actually loaded and applied.
-    logging.warning(
+    logging.info(
         "Sampling defaults: generation_config=%s -> defaults=%s; first request "
         "resolved to temperature=%s top_p=%s top_k=%s",
         (

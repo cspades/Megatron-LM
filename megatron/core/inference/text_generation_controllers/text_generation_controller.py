@@ -55,8 +55,6 @@ from megatron.core.utils import (
     unwrap_model,
 )
 
-logger = logging.getLogger(__name__)
-
 try:
     import transformer_engine as te  # pylint: disable=unused-import
 
@@ -412,10 +410,7 @@ class TextGenerationController(MTPControllerMixin):
         is_rank0 = (not torch.distributed.is_initialized()) or torch.distributed.get_rank() == 0
         if is_rank0:
             gen_cfg_eos = gen_cfg.get("eos_token_id") if isinstance(gen_cfg, dict) else None
-            # The inference worker's root logger is normally WARNING. Using
-            # logging.info() here made this startup proof disappear even when the
-            # multi-EOS path was active, obscuring regressions after rebases.
-            logger.warning(
+            logging.info(
                 "Inference termination EOS ids: tokenizer.eod=%s, "
                 "generation_config.eos_token_id=%s -> eos set=%s (multi-eos active=%s)",
                 eod,

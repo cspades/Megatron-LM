@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-import contextlib
 import ipaddress
 import json
 import logging
@@ -31,14 +30,8 @@ from megatron.core.inference.text_generation_controllers.text_generation_control
     TextGenerationController,
 )
 from megatron.core.inference.text_generation_server.dynamic_text_gen_server.endpoints.common import (
-    GENERATION_ABORTED_ERROR_CODE,
-    frontend_request_finished,
-    frontend_request_phase,
-    frontend_request_started,
     generation_config_sampling_defaults,
     log_sampling_defaults_once,
-    non_retryable_error_headers,
-    remaining_request_timeout,
     resolve_sampling_default,
 )
 from megatron.core.tokenizers.text.parsers import PARSER_MAPPING
@@ -49,73 +42,12 @@ from ..openai_streaming import (
     json_safe_logprobs,
     json_safe_top_n_logprobs,
     openai_stream,
-    stream_with_deadline,
 )
 from .common import abort_requests
 
 logger = logging.getLogger(__name__)
 
 # pylint: disable=line-too-long
-
-
-def _request_tag(request_id: int) -> str:
-    """Letters-only request tag so Ray does not deduplicate lifecycle logs."""
-    value = int(request_id)
-    chars = []
-    while True:
-        value, remainder = divmod(value, 26)
-        chars.append(chr(ord("a") + remainder))
-        if value == 0:
-            return "".join(reversed(chars))
-        value -= 1
-
-
-async def _log_pending_requests(
-    client,
-    request_ids: list[int],
-    *,
-    http_started_at: float,
-    prompt_length: int,
-    max_tokens: int,
-) -> None:
-    """Expose coordinator/admission/decode waits hidden behind one HTTP await."""
-    next_tick = time.perf_counter() + 30.0
-    while True:
-        await asyncio.sleep(max(0.0, next_tick - time.perf_counter()))
-        woke_at = time.perf_counter()
-        event_loop_lag = max(0.0, woke_at - next_tick)
-        next_tick += 30.0
-        snapshot = client.pending_request_diagnostics(request_ids)
-        if not snapshot["pending"]:
-            return
-        logger.warning(
-            "chat request pending: tag=%s ids=%s http_age=%.1fs "
-            "engine_pending=%d/%d oldest_engine=%.1fs prompt_length=%d "
-            "max_new_tokens=%d event_loop_lag=%.3fs listener_done=%s "
-            "reply_frames=%d reply_idle=%s socket_events=%d "
-            "monitor_events=%s last_monitor=%s oldest=%s",
-            _request_tag(request_ids[0]),
-            request_ids,
-            time.perf_counter() - http_started_at,
-            snapshot["pending"],
-            snapshot["requested"],
-            snapshot["oldest_seconds"],
-            prompt_length,
-            max_tokens,
-            event_loop_lag,
-            snapshot["listener_done"],
-            snapshot["reply_frames_received"],
-            (
-                f"{snapshot['seconds_since_last_reply']:.1f}s"
-                if snapshot["seconds_since_last_reply"] is not None
-                else "never"
-            ),
-            snapshot["socket_events"],
-            snapshot["monitor_event_counts"],
-            snapshot["last_monitor_event"],
-            snapshot["oldest"],
-        )
-
 
 _TOKEN_ID_FIELDS_TO_REDACT = {
     "prompt_tokens",
@@ -791,25 +723,9 @@ except ImportError:
 
 
 try:
-    from quart import Blueprint, Response, current_app, g, jsonify, request
+    from quart import Blueprint, Response, current_app, jsonify, request
 
     bp = Blueprint('chat_completions_api', __name__)
-
-    @bp.after_request
-    async def _finish_frontend_request(response):
-        trace = getattr(g, "nemo_frontend_trace", None)
-        if trace is not None:
-            frontend_request_phase(trace, "handler_returned", status=response.status_code)
-            frontend_request_finished(trace, f"http-{response.status_code}")
-        return response
-
-    @bp.teardown_request
-    async def _finish_failed_frontend_request(error):
-        if error is None:
-            return
-        trace = getattr(g, "nemo_frontend_trace", None)
-        if trace is not None:
-            frontend_request_finished(trace, f"exception-{type(error).__name__}")
 
     def apply_parsers(
         message_text, tools, parsers_list, tools_requested, chat_template_kwargs=None
@@ -861,20 +777,11 @@ try:
     @bp.route('/v1/chat/completions', methods=['POST'])
     async def chat_completions():
         """Handles async POST requests for chat completions."""
-        http_started_at = time.perf_counter()
-        frontend_trace = frontend_request_started("chat_completions", request.headers)
-        g.nemo_frontend_trace = frontend_trace
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
         parsers = current_app.config['parsers']
 
         req = await request.get_json()
-        json_parsed_at = time.perf_counter()
-        frontend_request_phase(
-            frontend_trace,
-            "extract_multimodal",
-            json_keys=sorted(req.keys()) if isinstance(req, dict) else [],
-        )
         prevent_retokenization = req.get(
             "prevent_retokenization", not current_app.config.get('eval_mode', False)
         )
@@ -898,13 +805,6 @@ try:
             )
         except ValueError as error:
             return Response(str(error), status=400)
-        media_extracted_at = time.perf_counter()
-        frontend_request_phase(
-            frontend_trace,
-            "tokenize",
-            images=len(image_bytes_list),
-            videos=len(video_bytes_list),
-        )
         multi_modal_data = None
         if image_bytes_list:
             multi_modal_data = {"image": image_bytes_list}
@@ -1096,7 +996,6 @@ try:
             return Response(f"Error processing 'messages': {e}", status=500)
 
         # --- 2. Parse Sampling Params ---
-        frontend_request_phase(frontend_trace, "sampling_parameters")
         try:
             # For a field the request omits: an explicitly configured server default
             # wins, then the model's generation_config.json, then the previous
@@ -1197,10 +1096,7 @@ try:
         # multiple independently sampled choices. Each request still carries
         # its own media payload, while coordinator affinity keeps equivalent
         # requests on the engine that owns the cached vision embedding.
-        frontend_request_phase(frontend_trace, "prepare_multimodal")
-        media_prepare_started_at = time.perf_counter()
         prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
-        media_prepared_at = time.perf_counter()
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
             # Streaming currently supports only Hugging Face fast tokenizers.
@@ -1212,21 +1108,12 @@ try:
             except ValueError as error:
                 return Response(str(error), status=400)
 
-            streams = []
-            try:
-                for _ in range(n):
-                    streams.append(
-                        client.add_request_streaming(
-                            prompt_tokens,
-                            sampling_params,
-                            multi_modal_data=prepared_multimodal_data,
-                        )
-                    )
-            except Exception as error:
-                for stream in streams:
-                    await stream.aclose()
-                logger.exception("Error submitting streaming chat request")
-                return Response(f"Error submitting request: {error}", status=500)
+            streams = [
+                client.add_request_streaming(
+                    prompt_tokens, sampling_params, multi_modal_data=prepared_multimodal_data
+                )
+                for _ in range(n)
+            ]
             chat_parsers = None
             if parsers:
                 marker_prefixes = (
@@ -1262,19 +1149,15 @@ try:
                     for _ in range(n)
                 ]
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
-            chunks = openai_stream(
-                streams,
-                tokenizer,
-                incremental_detokenizers,
-                chat=True,
-                return_log_probs=return_log_probs,
-                include_usage=include_usage,
-                chat_parsers=chat_parsers,
-            )
             response = Response(
-                stream_with_deadline(
-                    chunks,
-                    remaining_request_timeout(request.headers, http_started_at),
+                openai_stream(
+                    streams,
+                    tokenizer,
+                    incremental_detokenizers,
+                    chat=True,
+                    return_log_probs=return_log_probs,
+                    include_usage=include_usage,
+                    chat_parsers=chat_parsers,
                 ),
                 content_type="text/event-stream",
             )
@@ -1292,8 +1175,6 @@ try:
         # the same leak the abort below the gather closes.
         request_ids = []
         tasks = []
-        submission_started_at = time.perf_counter()
-        frontend_request_phase(frontend_trace, "engine_submit", choices=n)
         try:
             for _ in range(n):
                 request_id, future = client.add_request_with_id(
@@ -1305,81 +1186,12 @@ try:
             abort_requests(client, request_ids, f"submission failed: {e}")
             logger.error(f"Error submitting request: {e}")
             return Response(f"Error submitting request: {e}", status=500)
-        submission_finished_at = time.perf_counter()
-        logger.warning(
-            "chat frontend submitted: router_id=%s zmq_client=%s tag=%s ids=%s "
-            "json_ms=%.1f media_extract_ms=%.1f "
-            "tokenize_ms=%.1f media_prepare_ms=%.1f client_pack_send_ms=%.1f "
-            "http_to_submit_ms=%.1f prompt_tokens=%d media_items=%d",
-            request.headers.get("X-Nemo-Router-Request-Id", "direct"),
-            getattr(client, "client_trace_id", "unknown"),
-            _request_tag(request_ids[0]),
-            request_ids,
-            (json_parsed_at - http_started_at) * 1000,
-            (media_extracted_at - json_parsed_at) * 1000,
-            (media_prepare_started_at - media_extracted_at) * 1000,
-            (media_prepared_at - media_prepare_started_at) * 1000,
-            (submission_finished_at - submission_started_at) * 1000,
-            (submission_finished_at - http_started_at) * 1000,
-            len(prompt_tokens),
-            len(image_bytes_list) + len(video_bytes_list),
-        )
-        frontend_request_phase(
-            frontend_trace,
-            "engine_await",
-            request_ids=request_ids,
-            prompt_tokens=len(prompt_tokens),
-            media_items=len(image_bytes_list) + len(video_bytes_list),
-        )
 
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
-        pending_watchdog = asyncio.create_task(
-            _log_pending_requests(
-                client,
-                request_ids,
-                http_started_at=http_started_at,
-                prompt_length=len(prompt_tokens),
-                max_tokens=sampling_params.num_tokens_to_generate,
-            )
-        )
         try:
-            remaining_timeout = remaining_request_timeout(request.headers, http_started_at)
-            if remaining_timeout is None:
-                batch_results = await asyncio.gather(*tasks)
-            else:
-                async with asyncio.timeout(remaining_timeout):
-                    batch_results = await asyncio.gather(*tasks)
-        except TimeoutError:
-            snapshot = client.pending_request_diagnostics(request_ids)
-            abort_requests(client, request_ids, "frontend request deadline")
-            logger.error(
-                "FRONTEND GENERATION TIMEOUT: endpoint=chat_completions "
-                "router_id=%s zmq_client=%s tag=%s ids=%s http_age=%.1fs "
-                "classification=local_deadline_exceeded "
-                "engine_exception_observed=false pending=%s",
-                request.headers.get("X-Nemo-Router-Request-Id", "direct"),
-                getattr(client, "client_trace_id", "unknown"),
-                _request_tag(request_ids[0]),
-                request_ids,
-                time.perf_counter() - http_started_at,
-                snapshot,
-            )
-            response = jsonify(
-                {
-                    "error": {
-                        "code": GENERATION_ABORTED_ERROR_CODE,
-                        "message": "Inference request deadline expired and was aborted",
-                        "retryable": False,
-                    }
-                }
-            )
-            response.status_code = 500
-            response.headers.update(
-                non_retryable_error_headers(GENERATION_ABORTED_ERROR_CODE)
-            )
-            return response
+            batch_results = await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             # Quart cancels this handler when the peer goes away (its ASGI
             # connection races handle_messages against handle_request and
@@ -1390,86 +1202,8 @@ try:
             abort_requests(client, request_ids, "client disconnected")
             raise
         except Exception as e:
-            snapshot = client.pending_request_diagnostics(request_ids)
-            abort_requests(client, request_ids, "inference failed")
-            logger.exception(
-                "chat inference failed: tag=%s ids=%s http_age=%.1fs "
-                "error=%s: %r pending=%s",
-                _request_tag(request_ids[0]),
-                request_ids,
-                time.perf_counter() - http_started_at,
-                type(e).__name__,
-                e,
-                snapshot,
-            )
-            return Response(
-                f"Error during inference: {type(e).__name__}: {e!r}", status=500
-            )
-        finally:
-            pending_watchdog.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await pending_watchdog
-
-        frontend_request_phase(frontend_trace, "format_response", request_ids=request_ids)
-        formatting_started_at = time.perf_counter()
-        http_elapsed = time.perf_counter() - http_started_at
-        if http_elapsed >= 30.0:
-            generation_config = getattr(tokenizer, "generation_config", None)
-            configured_eos = (
-                generation_config.get("eos_token_id")
-                if isinstance(generation_config, dict)
-                else None
-            )
-            model_eos_ids = {
-                int(token_id)
-                for token_id in (
-                    configured_eos
-                    if isinstance(configured_eos, (list, tuple))
-                    else [configured_eos]
-                )
-                if isinstance(token_id, int) and not isinstance(token_id, bool)
-            }
-            finish_diagnostics = []
-            for result in batch_results:
-                generated_tokens = result.get("generated_tokens") or []
-                result_sampling_params = result.get("sampling_params") or {}
-                token_limit = result_sampling_params.get("num_tokens_to_generate")
-                termination_id = result_sampling_params.get("termination_id")
-                if token_limit is not None and len(generated_tokens) >= token_limit:
-                    finish_cause = "length"
-                elif (
-                    termination_id is not None
-                    and termination_id >= 0
-                    and termination_id in generated_tokens
-                ):
-                    finish_cause = "termination_id"
-                elif generated_tokens and generated_tokens[-1] in model_eos_ids:
-                    finish_cause = "model_eos"
-                else:
-                    finish_cause = "stop_word_or_other"
-                finish_diagnostics.append(
-                    {
-                        "cause": finish_cause,
-                        "limit": token_limit,
-                        "termination_id": termination_id,
-                        "model_eos_ids": sorted(model_eos_ids),
-                        "termination_seen": termination_id in generated_tokens
-                        if termination_id is not None and termination_id >= 0
-                        else False,
-                        "last_token_ids": generated_tokens[-8:],
-                    }
-                )
-            logger.warning(
-                "chat request done: tag=%s ids=%s http_elapsed=%.1fs "
-                "engine_latencies=%s output_tokens=%s eos_token_id=%s finishes=%s",
-                _request_tag(request_ids[0]),
-                request_ids,
-                http_elapsed,
-                [result.get("latency") for result in batch_results],
-                [len(result.get("generated_tokens") or []) for result in batch_results],
-                getattr(tokenizer, "eos_id", None),
-                finish_diagnostics,
-            )
+            logger.error(f"Error during inference: {e}")
+            return Response(f"Error during inference: {e}", status=500)
 
         if current_app.config['verbose']:
             logging.info(
@@ -1686,21 +1420,6 @@ try:
             },
         }
 
-        logger.warning(
-            "chat frontend response ready: router_id=%s tag=%s ids=%s "
-            "format_ms=%.1f total_ms=%.1f",
-            request.headers.get("X-Nemo-Router-Request-Id", "direct"),
-            _request_tag(request_ids[0]),
-            request_ids,
-            (time.perf_counter() - formatting_started_at) * 1000,
-            (time.perf_counter() - http_started_at) * 1000,
-        )
-        frontend_request_phase(
-            frontend_trace,
-            "serialize_response",
-            choices=len(choices),
-            completion_tokens=total_completion_tokens,
-        )
         if HAVE_ORJSON:
             # Use orjson for faster serialization
             return Response(orjson.dumps(response), mimetype="application/json")

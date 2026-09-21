@@ -282,6 +282,35 @@ class ImageProcessingConfig:
     max_num_tiles: int = 1
     use_thumbnail: bool = False
     num_img_embeddings_per_tile: int = 0
+    dynamic_resolution_model_length: Optional[int] = None
+    """Model-length budget used by processors that divide capacity across images."""
+    dynamic_resolution_rounding_mode: str = "ceil"
+    """Patch-grid rounding contract: ``ceil`` or ``round_plus_half``."""
+    dynamic_resolution_resize_mode: str = "pil"
+    """Resize contract: ``pil`` or ``torch_bicubic_antialias``."""
+
+    def __post_init__(self):
+        if self.dynamic_resolution_rounding_mode not in ("ceil", "round_plus_half"):
+            raise ValueError(
+                "ImageProcessingConfig.dynamic_resolution_rounding_mode must be "
+                "'ceil' or 'round_plus_half'."
+            )
+        if self.dynamic_resolution_resize_mode not in (
+            "pil",
+            "torch_bicubic_antialias",
+        ):
+            raise ValueError(
+                "ImageProcessingConfig.dynamic_resolution_resize_mode must be "
+                "'pil' or 'torch_bicubic_antialias'."
+            )
+        if (
+            self.dynamic_resolution_model_length is not None
+            and self.dynamic_resolution_model_length <= 4
+        ):
+            raise ValueError(
+                "ImageProcessingConfig.dynamic_resolution_model_length must be "
+                "greater than 4."
+            )
 
 
 @dataclass

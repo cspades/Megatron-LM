@@ -2,7 +2,6 @@
 
 import asyncio
 import base64
-import contextlib
 import logging
 import time
 
@@ -14,123 +13,32 @@ from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
 
 from .common import (
-    GENERATION_ABORTED_ERROR_CODE,
-    frontend_request_finished,
-    frontend_request_phase,
-    frontend_request_started,
     generation_config_sampling_defaults,
     log_sampling_defaults_once,
-    non_retryable_error_headers,
-    remaining_request_timeout,
     resolve_sampling_default,
 )
 from ..incremental_detokenizer import HuggingFaceFastIncrementalDetokenizer
-from ..openai_streaming import (
-    json_safe_logprobs,
-    json_safe_top_n_logprobs,
-    openai_stream,
-    stream_with_deadline,
-)
+from ..openai_streaming import json_safe_logprobs, json_safe_top_n_logprobs, openai_stream
 from .common import abort_requests
 
 logger = logging.getLogger(__name__)
 
 
-def _request_tag(request_id: int) -> str:
-    """Letters-only request tag so Ray does not deduplicate lifecycle logs."""
-    value = int(request_id)
-    chars = []
-    while True:
-        value, remainder = divmod(value, 26)
-        chars.append(chr(ord("a") + remainder))
-        if value == 0:
-            return "".join(reversed(chars))
-        value -= 1
-
-
-async def _log_pending_requests(
-    client,
-    request_ids: list[int],
-    *,
-    http_started_at: float,
-    prompt_lengths: list[int],
-    max_tokens: int,
-) -> None:
-    """Expose coordinator/admission/decode waits hidden behind one HTTP await."""
-    next_tick = time.perf_counter() + 30.0
-    while True:
-        await asyncio.sleep(max(0.0, next_tick - time.perf_counter()))
-        woke_at = time.perf_counter()
-        event_loop_lag = max(0.0, woke_at - next_tick)
-        next_tick += 30.0
-        snapshot = client.pending_request_diagnostics(request_ids)
-        if not snapshot["pending"]:
-            return
-        logger.warning(
-            "completion request pending: tag=%s ids=%s http_age=%.1fs "
-            "engine_pending=%d/%d oldest_engine=%.1fs prompt_lengths=%s "
-            "max_new_tokens=%d event_loop_lag=%.3fs listener_done=%s "
-            "reply_frames=%d reply_idle=%s socket_events=%d "
-            "monitor_events=%s last_monitor=%s oldest=%s",
-            _request_tag(request_ids[0]),
-            request_ids,
-            time.perf_counter() - http_started_at,
-            snapshot["pending"],
-            snapshot["requested"],
-            snapshot["oldest_seconds"],
-            prompt_lengths,
-            max_tokens,
-            event_loop_lag,
-            snapshot["listener_done"],
-            snapshot["reply_frames_received"],
-            (
-                f"{snapshot['seconds_since_last_reply']:.1f}s"
-                if snapshot["seconds_since_last_reply"] is not None
-                else "never"
-            ),
-            snapshot["socket_events"],
-            snapshot["monitor_event_counts"],
-            snapshot["last_monitor_event"],
-            snapshot["oldest"],
-        )
-
-
 try:
-    from quart import Blueprint, Response, current_app, g, jsonify, request
+    from quart import Blueprint, Response, current_app, jsonify, request
 
     bp = Blueprint('completions_api', __name__)
-
-    @bp.after_request
-    async def _finish_frontend_request(response):
-        trace = getattr(g, "nemo_frontend_trace", None)
-        if trace is not None:
-            frontend_request_phase(trace, "handler_returned", status=response.status_code)
-            frontend_request_finished(trace, f"http-{response.status_code}")
-        return response
-
-    @bp.teardown_request
-    async def _finish_failed_frontend_request(error):
-        if error is None:
-            return
-        trace = getattr(g, "nemo_frontend_trace", None)
-        if trace is not None:
-            frontend_request_finished(trace, f"exception-{type(error).__name__}")
 
     @bp.route('/completions', methods=['POST'])
     @bp.route('/v1/completions', methods=['POST'])
     async def completions():
         """Handles async POST requests for completions."""
-        http_started_at = time.perf_counter()
-        frontend_trace = frontend_request_started("completions", request.headers)
-        g.nemo_frontend_trace = frontend_trace
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
 
         req = await request.get_json(force=True)
         if req is None:
             return "Invalid or missing JSON body", 400
-        json_parsed_at = time.perf_counter()
-        frontend_request_phase(frontend_trace, "parse_inputs")
 
         # --- 1. Parse Prompt ---
         prompt_data = req.get("prompt")
@@ -167,7 +75,6 @@ try:
                 return "Invalid 'prompt' type. Must be str or list", 400
         except Exception as e:
             return f"Error tokenizing prompt: {e}", 500
-        tokenized_at = time.perf_counter()
 
         # --- 2. Parse Sampling Params ---
         try:
@@ -299,13 +206,10 @@ try:
         # escapes the handler and those requests generate to their token limit
         # holding batch slots, the same leak the abort below closes.
         #
-        submission_started_at = time.perf_counter()
-        frontend_request_phase(
-            frontend_trace,
-            "engine_submit",
-            prompts=len(prompts_as_tokens),
-            media_items=len(encoded_media) if populated_modalities else 0,
-        )
+        # TODO: streaming submissions made before a mid-loop failure are not
+        # covered. Their handles are AsyncStreams, not ids, and they abort
+        # through openai_stream's finally, which never runs because the
+        # generator is never started.
         try:
             serialized_multimodal_data = serialize_multimodal_data(multi_modal_data)
             for prompt_tokens in prompts_as_tokens:
@@ -345,54 +249,22 @@ try:
                     request_ids.append(request_id)
                     tasks.append(future)
         except Exception as e:
-            if stream_requested:
-                for stream in tasks:
-                    await stream.aclose()
-            else:
-                abort_requests(client, request_ids, f"submission failed: {e}")
+            abort_requests(client, request_ids, f"submission failed: {e}")
             logger.error(f"Error submitting request: {e}")
             return f"Error submitting request: {e}", 500
-        submission_finished_at = time.perf_counter()
-        if request_ids:
-            logger.warning(
-                "completion frontend submitted: router_id=%s zmq_client=%s "
-                "tag=%s ids=%s json_ms=%.1f "
-                "tokenize_ms=%.1f prepare_ms=%.1f client_pack_send_ms=%.1f "
-                "http_to_submit_ms=%.1f prompt_lengths=%s",
-                request.headers.get("X-Nemo-Router-Request-Id", "direct"),
-                getattr(client, "client_trace_id", "unknown"),
-                _request_tag(request_ids[0]),
-                request_ids,
-                (json_parsed_at - http_started_at) * 1000,
-                (tokenized_at - json_parsed_at) * 1000,
-                (submission_started_at - tokenized_at) * 1000,
-                (submission_finished_at - submission_started_at) * 1000,
-                (submission_finished_at - http_started_at) * 1000,
-                [len(prompt) for prompt in prompts_as_tokens],
-            )
-        frontend_request_phase(
-            frontend_trace,
-            "engine_await" if not stream_requested else "stream_response",
-            request_ids=request_ids,
-            prompt_lengths=[len(prompt) for prompt in prompts_as_tokens],
-        )
 
         if stream_requested:
             include_usage = bool((req.get("stream_options") or {}).get("include_usage", False))
-            chunks = openai_stream(
-                tasks,
-                tokenizer,
-                incremental_detokenizers,
-                chat=False,
-                return_log_probs=return_log_probs,
-                include_usage=include_usage,
-                echo_prompts=prompts_as_strings if echo else None,
-                prompt_token_ids=prompts_as_tokens if echo else None,
-            )
             response = Response(
-                stream_with_deadline(
-                    chunks,
-                    remaining_request_timeout(request.headers, http_started_at),
+                openai_stream(
+                    tasks,
+                    tokenizer,
+                    incremental_detokenizers,
+                    chat=False,
+                    return_log_probs=return_log_probs,
+                    include_usage=include_usage,
+                    echo_prompts=prompts_as_strings if echo else None,
+                    prompt_token_ids=prompts_as_tokens if echo else None,
                 ),
                 content_type="text/event-stream",
             )
@@ -402,51 +274,8 @@ try:
         if current_app.config['verbose']:
             start_time = time.perf_counter()
 
-        pending_watchdog = asyncio.create_task(
-            _log_pending_requests(
-                client,
-                request_ids,
-                http_started_at=http_started_at,
-                prompt_lengths=[len(prompt) for prompt in prompts_as_tokens],
-                max_tokens=sampling_params.num_tokens_to_generate,
-            )
-        )
         try:
-            remaining_timeout = remaining_request_timeout(request.headers, http_started_at)
-            if remaining_timeout is None:
-                batch_results = await asyncio.gather(*tasks)
-            else:
-                async with asyncio.timeout(remaining_timeout):
-                    batch_results = await asyncio.gather(*tasks)
-        except TimeoutError:
-            snapshot = client.pending_request_diagnostics(request_ids)
-            abort_requests(client, request_ids, "frontend request deadline")
-            logger.error(
-                "FRONTEND GENERATION TIMEOUT: endpoint=completions "
-                "router_id=%s zmq_client=%s tag=%s ids=%s http_age=%.1fs "
-                "classification=local_deadline_exceeded "
-                "engine_exception_observed=false pending=%s",
-                request.headers.get("X-Nemo-Router-Request-Id", "direct"),
-                getattr(client, "client_trace_id", "unknown"),
-                _request_tag(request_ids[0]),
-                request_ids,
-                time.perf_counter() - http_started_at,
-                snapshot,
-            )
-            response = jsonify(
-                {
-                    "error": {
-                        "code": GENERATION_ABORTED_ERROR_CODE,
-                        "message": "Inference request deadline expired and was aborted",
-                        "retryable": False,
-                    }
-                }
-            )
-            response.status_code = 500
-            response.headers.update(
-                non_retryable_error_headers(GENERATION_ABORTED_ERROR_CODE)
-            )
-            return response
+            batch_results = await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             # Quart cancels this handler when the peer goes away (its ASGI
             # connection races handle_messages against handle_request and
@@ -457,37 +286,7 @@ try:
             abort_requests(client, request_ids, "client disconnected")
             raise
         except Exception as e:
-            snapshot = client.pending_request_diagnostics(request_ids)
-            abort_requests(client, request_ids, "inference failed")
-            logger.exception(
-                "completion inference failed: tag=%s ids=%s http_age=%.1fs "
-                "error=%s: %r pending=%s",
-                _request_tag(request_ids[0]),
-                request_ids,
-                time.perf_counter() - http_started_at,
-                type(e).__name__,
-                e,
-                snapshot,
-            )
-            return f"Error during inference: {type(e).__name__}: {e!r}", 500
-        finally:
-            pending_watchdog.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await pending_watchdog
-
-        frontend_request_phase(frontend_trace, "format_response", request_ids=request_ids)
-        formatting_started_at = time.perf_counter()
-        http_elapsed = time.perf_counter() - http_started_at
-        if http_elapsed >= 30.0:
-            logger.warning(
-                "completion request done: tag=%s ids=%s http_elapsed=%.1fs "
-                "engine_latencies=%s output_tokens=%s",
-                _request_tag(request_ids[0]),
-                request_ids,
-                http_elapsed,
-                [result.get("latency") for result in batch_results],
-                [len(result.get("generated_tokens") or []) for result in batch_results],
-            )
+            return f"Error during inference: {e}", 500
 
         if current_app.config['verbose']:
             logging.info(
@@ -646,7 +445,7 @@ try:
             request_idx += 1
 
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
-        response = jsonify(
+        return jsonify(
             {
                 "id": response_uid,
                 "object": "text_completion",  # as per the openAI spec
@@ -660,22 +459,6 @@ try:
                 },
             }
         )
-        logger.warning(
-            "completion frontend response ready: router_id=%s tag=%s ids=%s "
-            "format_ms=%.1f total_ms=%.1f",
-            request.headers.get("X-Nemo-Router-Request-Id", "direct"),
-            _request_tag(request_ids[0]),
-            request_ids,
-            (time.perf_counter() - formatting_started_at) * 1000,
-            (time.perf_counter() - http_started_at) * 1000,
-        )
-        frontend_request_phase(
-            frontend_trace,
-            "serialize_response",
-            choices=len(choices),
-            completion_tokens=total_completion_tokens,
-        )
-        return response
 
 except ImportError as e:
     logger.warning(f"Could not import quart: {e}")

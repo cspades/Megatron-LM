@@ -13,6 +13,7 @@ from megatron.core.inference.text_generation_server.dynamic_text_gen_server.imag
     _decode_sampled_video_frames,
     _load_frame_sequence_manifest,
     _video_sample_indices,
+    dynamic_res_preprocess,
     preprocess_image_bytes_list,
     preprocess_video_bytes_list,
 )
@@ -148,6 +149,62 @@ def test_image_bytes_list_preserves_per_image_aspect_ratios():
 
     assert result["imgs"].shape == (1, 4, 12)
     assert result["imgs_sizes"].tolist() == [[2, 4], [4, 2]]
+
+
+def test_round_plus_half_matches_observed_hf_grid_contract():
+    image_module = pytest.importorskip("PIL.Image")
+    image = image_module.new("RGB", (368, 656))
+
+    old_megatron = dynamic_res_preprocess(
+        image,
+        min_patches=1024,
+        max_patches=13312,
+        res_step=16,
+        pixel_shuffle=True,
+        spatial_merge_size=2,
+        rounding_mode="ceil",
+    )
+    hf_compatible = dynamic_res_preprocess(
+        image,
+        min_patches=1024,
+        max_patches=13312,
+        res_step=16,
+        pixel_shuffle=True,
+        spatial_merge_size=2,
+        rounding_mode="round_plus_half",
+    )
+
+    assert old_megatron.size == (384, 704)
+    assert hf_compatible.size == (416, 704)
+
+
+def test_image_list_applies_model_length_budget_per_request(monkeypatch):
+    observed_budgets = []
+
+    def fake_preprocess(_payload, config, target_hw=None, device=None):
+        del target_hw, device
+        observed_budgets.append(config.dynamic_resolution_max_patches)
+        return torch.zeros(1, 1, 3), torch.ones(1, 2, dtype=torch.int32)
+
+    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
+        image_preprocessing,
+    )
+
+    monkeypatch.setattr(image_preprocessing, "preprocess_image_bytes", fake_preprocess)
+    config = ImageProcessingConfig(
+        patch_dim=2,
+        dynamic_resolution=True,
+        pixel_shuffle=True,
+        spatial_merge_size=2,
+        dynamic_resolution_min_patches=2,
+        dynamic_resolution_max_patches=32,
+        dynamic_resolution_model_length=5,
+    )
+
+    preprocess_image_bytes_list([b"first", b"second", b"third"], config)
+
+    # (5 - 4) * 2**2 = 4 base patches, raised to 2 patches * 3 images.
+    assert observed_budgets == [6, 6, 6]
 
 
 def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):

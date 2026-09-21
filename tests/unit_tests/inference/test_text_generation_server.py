@@ -133,7 +133,7 @@ def test_start_server_forwards_multimodal_prompt_config_to_worker(monkeypatch):
     monkeypatch.setattr(
         text_generation_server,
         "_SERVER_PROCESS_CONTEXT",
-        SimpleNamespace(Process=FakeProcess, Event=object),
+        SimpleNamespace(Process=FakeProcess),
     )
 
     handed_in_socket = FakeSocket()
