@@ -492,7 +492,7 @@ def _extract_multimodal_from_messages(messages, prompt_config: MultimodalPromptC
     return rewritten, image_bytes_list, video_bytes_list, media_slots
 
 
-def _sanitize_messages_for_template(messages):
+def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None):
     """Prepare messages so tokenizer chat templates can safely consume them.
 
     This only normalizes tool-call argument payloads inside each message:
@@ -510,7 +510,11 @@ def _sanitize_messages_for_template(messages):
     if not isinstance(messages, list):
         return messages
     sanitized = []
-    for message in messages:
+    media_modalities_by_message = {}
+    for _sentinel, modality, message_index in media_slots:
+        media_modalities_by_message.setdefault(message_index, set()).add(modality)
+
+    for message_index, message in enumerate(messages):
         if not isinstance(message, dict):
             sanitized.append(message)
             continue
@@ -528,7 +532,21 @@ def _sanitize_messages_for_template(messages):
                         text_chunks.append(str(chunk.get("text", "")))
                 elif isinstance(chunk, str):
                     text_chunks.append(chunk)
-            msg_copy["content"] = "".join(text_chunks)
+            separator = ""
+            message_modalities = media_modalities_by_message.get(message_index, set())
+            if message_modalities:
+                if prompt_config is None:
+                    raise ValueError("Media content normalization requires a prompt config.")
+                separators = {
+                    prompt_config.get_spec(modality).content_part_separator
+                    for modality in message_modalities
+                }
+                if len(separators) != 1:
+                    raise ValueError(
+                        "Media types in one message must use the same content-part separator."
+                    )
+                separator = separators.pop()
+            msg_copy["content"] = separator.join(chunk for chunk in text_chunks if chunk)
         elif isinstance(content, dict):
             msg_copy["content"] = str(content.get("text", ""))
         elif content is None:
@@ -892,7 +910,9 @@ try:
             multi_modal_data = {"image": image_bytes_list}
         elif video_bytes_list:
             multi_modal_data = {"video": video_bytes_list}
-        template_messages = _sanitize_messages_for_template(messages)
+        template_messages = _sanitize_messages_for_template(
+            messages, media_slots, prompt_config
+        )
         template_tools = _sanitize_tools_for_template(tools)
 
         # Inject the server-configured chat template (e.g. pretraining.jinja for
@@ -1603,7 +1623,7 @@ try:
             if return_raw_text:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
                 message["raw_text"] = prompt_str + text_output
-            # Small RL/debug scalars (a few bytes each); harmless to keep for NeMo-RL compatibility.
+            # Preserve small diagnostic scalars returned by the inference engine.
             message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 

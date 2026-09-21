@@ -43,7 +43,7 @@ def _resolve_pixel_stats(vision_model_type: str):
 
 
 def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional[bytes]):
-    """Load PIL images from a configured frame-sequence manifest."""
+    """Load frames and timing metadata from a configured frame-sequence manifest."""
     if not frame_manifest_magic or not payload.startswith(frame_manifest_magic):
         return None
 
@@ -65,6 +65,25 @@ def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional
         or not all(isinstance(path, str) and path for path in frame_paths)
     ):
         raise ValueError("Frame-sequence manifest requires non-empty string frame_paths.")
+    metadata = manifest.get("metadata") or {}
+    if not isinstance(metadata, dict):
+        raise ValueError("Frame-sequence manifest metadata must be an object.")
+    frame_indices = metadata.get("frames_indices", list(range(len(frame_paths))))
+    fps = metadata.get("fps", 1.0)
+    if (
+        not isinstance(frame_indices, list)
+        or len(frame_indices) != len(frame_paths)
+        or any(type(index) is not int or index < 0 for index in frame_indices)
+    ):
+        raise ValueError(
+            "Frame-sequence manifest metadata.frames_indices must contain one "
+            "non-negative integer per frame."
+        )
+    if isinstance(fps, bool) or not isinstance(fps, (int, float)) or not math.isfinite(fps):
+        raise ValueError("Frame-sequence manifest metadata.fps must be a finite number.")
+    fps = float(fps)
+    if fps <= 0:
+        raise ValueError("Frame-sequence manifest metadata.fps must be positive.")
 
     frames = []
     path_resolution_seconds = 0.0
@@ -92,7 +111,7 @@ def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional
         jpeg_decode_seconds * 1000,
         max_frame_seconds * 1000,
     )
-    return frames
+    return frames, frame_indices, fps
 
 
 def dynamic_res_preprocess(
@@ -362,7 +381,12 @@ def _video_sample_indices(total_frames: int, config: VideoProcessingConfig) -> l
     """Return the existing uniformly spaced sample indices for a video."""
     import numpy as np
 
-    sample_count = min(config.num_frames, total_frames)
+    if total_frames <= 0:
+        return []
+    if total_frames < config.temporal_patch_size:
+        sample_count = min(config.num_frames, config.temporal_patch_size)
+    else:
+        sample_count = min(config.num_frames, total_frames)
     if config.temporal_patch_size > 1 and sample_count % config.temporal_patch_size:
         rounded_down = (sample_count // config.temporal_patch_size) * config.temporal_patch_size
         sample_count = (
@@ -372,35 +396,43 @@ def _video_sample_indices(total_frames: int, config: VideoProcessingConfig) -> l
 
 
 def _decode_sampled_video_frames(encoded_video: bytes, config: VideoProcessingConfig):
-    """Decode the stream while converting only uniformly sampled frames to RGB."""
+    """Decode sampled frames once and retain their source indices and FPS."""
     import av
 
     def decode_selected(total_frames: int):
         sample_indices = _video_sample_indices(total_frames, config)
         wanted = set(sample_indices)
-        sampled_frames = []
+        sampled_frames_by_index = {}
         decoded_count = 0
         with av.open(io.BytesIO(encoded_video)) as container:
             stream = container.streams.video[0]
             for index, frame in enumerate(container.decode(stream)):
                 decoded_count = index + 1
                 if index in wanted:
-                    sampled_frames.append(frame.to_image().convert("RGB"))
-        return sampled_frames, decoded_count
+                    sampled_frames_by_index[index] = frame.to_image().convert("RGB")
+        sampled_frames = [
+            sampled_frames_by_index[index]
+            for index in sample_indices
+            if index in sampled_frames_by_index
+        ]
+        return sampled_frames, decoded_count, sample_indices
 
     # Prefer container metadata so indexed streams need only one decode pass.
     with av.open(io.BytesIO(encoded_video)) as container:
-        declared_frames = int(container.streams.video[0].frames or 0)
+        stream = container.streams.video[0]
+        declared_frames = int(stream.frames or 0)
+        average_rate = stream.average_rate
+        fps = float(average_rate) if average_rate is not None else 0.0
 
     if declared_frames > 0:
-        sampled_frames, decoded_count = decode_selected(declared_frames)
+        sampled_frames, decoded_count, sample_indices = decode_selected(declared_frames)
         if decoded_count == declared_frames:
-            return sampled_frames
+            return sampled_frames, sample_indices, fps
         # Some containers report an inaccurate frame count. Redecode using the
         # observed count to preserve the original exact uniform indices.
         if decoded_count > 0:
-            sampled_frames, _ = decode_selected(decoded_count)
-        return sampled_frames
+            sampled_frames, _, sample_indices = decode_selected(decoded_count)
+        return sampled_frames, sample_indices, fps
 
     # Unindexed streams need a count-only pass before exact uniform indices can
     # be selected. No AVFrame or RGB image is retained during this pass.
@@ -410,9 +442,9 @@ def _decode_sampled_video_frames(encoded_video: bytes, config: VideoProcessingCo
         for total_frames, _ in enumerate(container.decode(stream), start=1):
             pass
     if total_frames == 0:
-        return []
-    sampled_frames, _ = decode_selected(total_frames)
-    return sampled_frames
+        return [], [], fps
+    sampled_frames, _, sample_indices = decode_selected(total_frames)
+    return sampled_frames, sample_indices, fps
 
 
 def preprocess_video_bytes_list(
@@ -436,15 +468,21 @@ def preprocess_video_bytes_list(
         )
 
     def decode_frames(encoded_video):
-        frames = _load_frame_sequence_manifest(encoded_video, config.frame_manifest_magic)
-        if frames is not None:
-            return frames, True
+        manifest_result = _load_frame_sequence_manifest(
+            encoded_video, config.frame_manifest_magic
+        )
+        if manifest_result is not None:
+            frames, frame_indices, fps = manifest_result
+            return frames, frame_indices, fps, True
 
-        return _decode_sampled_video_frames(encoded_video, config), False
+        frames, frame_indices, fps = _decode_sampled_video_frames(encoded_video, config)
+        return frames, frame_indices, fps, False
 
     packed_videos = []
     packed_sizes = []
     frame_counts = []
+    video_frame_indices = []
+    video_fps = []
     total_started_at = time.perf_counter()
     decode_seconds = 0.0
     frame_preprocess_seconds = 0.0
@@ -453,7 +491,9 @@ def preprocess_video_bytes_list(
         if not isinstance(encoded_video, (bytes, bytearray)):
             raise TypeError("video payloads must contain only bytes.")
         decode_started_at = time.perf_counter()
-        frames, is_frame_sequence = decode_frames(bytes(encoded_video))
+        frames, frame_indices, fps, is_frame_sequence = decode_frames(
+            bytes(encoded_video)
+        )
         decode_seconds += time.perf_counter() - decode_started_at
         if not frames:
             raise ValueError("Decoded video contains no frames.")
@@ -465,6 +505,10 @@ def preprocess_video_bytes_list(
             )
         sampled_frames = frames
         sample_count = len(sampled_frames)
+        if len(frame_indices) != sample_count:
+            raise ValueError(
+                "Video timing metadata must contain one frame index per sampled frame."
+            )
 
         frame_tensors = []
         frame_sizes = []
@@ -489,12 +533,16 @@ def preprocess_video_bytes_list(
         packed_videos.append(torch.cat(frame_tensors, dim=1))
         packed_sizes.append(torch.cat(frame_sizes, dim=0))
         frame_counts.append(sample_count)
+        video_frame_indices.append(frame_indices)
+        video_fps.append(fps)
         frame_preprocess_seconds += time.perf_counter() - preprocess_started_at
 
     result = {
         "imgs": torch.cat(packed_videos, dim=1),
         "imgs_sizes": torch.cat(packed_sizes, dim=0),
         "num_frames": torch.tensor(frame_counts, dtype=torch.int32, device=packed_videos[0].device),
+        "video_frame_indices": video_frame_indices,
+        "video_fps": video_fps,
     }
     logger.warning(
         "video preprocessing complete: videos=%d frames=%d payload_bytes=%d "

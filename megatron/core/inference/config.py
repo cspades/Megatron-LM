@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
 import warnings
-from dataclasses import InitVar, dataclass, field
+from dataclasses import InitVar, dataclass, field, replace
 from enum import Enum
 from typing import List, Literal, Optional, Tuple
 
@@ -304,6 +304,24 @@ class MediaPromptSpec:
     prefix: str = ""
     suffix: str = ""
     input_marker: Optional[str] = None
+    content_part_separator: str = ""
+    expansion_mode: Literal["single", "temporal_patch"] = "single"
+    include_frame_timestamps_for_nemotron_vl: bool = False
+
+    def __post_init__(self):
+        if self.expansion_mode not in ("single", "temporal_patch"):
+            raise ValueError(
+                "MediaPromptSpec.expansion_mode must be 'single' or "
+                f"'temporal_patch', got {self.expansion_mode!r}."
+            )
+        if (
+            self.include_frame_timestamps_for_nemotron_vl
+            and self.expansion_mode != "temporal_patch"
+        ):
+            raise ValueError(
+                "MediaPromptSpec.include_frame_timestamps_for_nemotron_vl requires "
+                "expansion_mode='temporal_patch'."
+            )
 
 
 @dataclass(frozen=True)
@@ -322,13 +340,18 @@ class MultimodalPromptConfig:
         raise ValueError(f"Unsupported media modality: {modality!r}")
 
     @classmethod
-    def from_dict(cls, value):
-        """Build from image and video specs."""
+    def from_dict(cls, value, defaults=None):
+        """Build from image and video overrides, preserving optional defaults."""
         if not value:
-            return cls()
+            return defaults or cls()
+        defaults = defaults or cls()
         return cls(
-            image_spec=MediaPromptSpec(**value.get("image_spec", {})),
-            video_spec=MediaPromptSpec(**value.get("video_spec", {})),
+            image_spec=replace(
+                defaults.image_spec, **dict(value.get("image_spec", {}))
+            ),
+            video_spec=replace(
+                defaults.video_spec, **dict(value.get("video_spec", {}))
+            ),
         )
 
 
@@ -477,6 +500,9 @@ class InferenceConfig:
 
     video_preprocessing_config: Optional[VideoProcessingConfig] = None
     """Configuration for decoding and preprocessing raw video payloads."""
+
+    multimodal_prompt_config: Optional[MultimodalPromptConfig] = None
+    """Optional per-engine overrides for the inference wrapper's media prompt contract."""
 
     use_flashinfer_fused_rope: Optional[bool] = False
     """

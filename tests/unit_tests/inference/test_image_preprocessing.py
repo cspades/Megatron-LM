@@ -35,7 +35,9 @@ class _FakeFrame:
 class _FakeContainer:
     def __init__(self, frames, declared_frames):
         self._frames = frames
-        self.streams = SimpleNamespace(video=[SimpleNamespace(frames=declared_frames)])
+        self.streams = SimpleNamespace(
+            video=[SimpleNamespace(frames=declared_frames, average_rate=30.0)]
+        )
 
     def __enter__(self):
         return self
@@ -60,13 +62,21 @@ def test_video_sample_indices_preserve_temporal_rounding():
     assert _video_sample_indices(3, config) == [0, 2]
 
 
+def test_video_sample_indices_repeat_short_clip_to_temporal_patch():
+    config = SimpleNamespace(num_frames=64, temporal_patch_size=2)
+
+    assert _video_sample_indices(1, config) == [0, 0]
+
+
 def test_declared_frame_count_converts_only_sampled_frames(monkeypatch):
     frames = _install_fake_av(monkeypatch, total_frames=10, declared_frames=10)
     config = SimpleNamespace(num_frames=3, temporal_patch_size=1)
 
-    sampled = _decode_sampled_video_frames(b"video", config)
+    sampled, frame_indices, fps = _decode_sampled_video_frames(b"video", config)
 
     assert sampled == [0, 4, 9]
+    assert frame_indices == [0, 4, 9]
+    assert fps == 30.0
     assert sum(frame.conversions for frame in frames) == 3
 
 
@@ -74,9 +84,11 @@ def test_unindexed_stream_counts_then_converts_only_sampled_frames(monkeypatch):
     frames = _install_fake_av(monkeypatch, total_frames=10, declared_frames=0)
     config = SimpleNamespace(num_frames=3, temporal_patch_size=1)
 
-    sampled = _decode_sampled_video_frames(b"video", config)
+    sampled, frame_indices, fps = _decode_sampled_video_frames(b"video", config)
 
     assert sampled == [0, 4, 9]
+    assert frame_indices == [0, 4, 9]
+    assert fps == 30.0
     assert sum(frame.conversions for frame in frames) == 3
 
 
@@ -89,11 +101,18 @@ def test_frame_sequence_manifest_loads_rgb_copies(tmp_path):
         frame_paths.append(str(frame_path))
 
     magic = b"frames:"
-    payload = magic + json.dumps({"frame_paths": frame_paths}).encode()
-    frames = _load_frame_sequence_manifest(payload, magic)
+    payload = magic + json.dumps(
+        {
+            "frame_paths": frame_paths,
+            "metadata": {"frames_indices": [3, 7], "fps": 29.97},
+        }
+    ).encode()
+    frames, frame_indices, fps = _load_frame_sequence_manifest(payload, magic)
 
     assert [frame.mode for frame in frames] == ["RGB", "RGB"]
     assert [frame.size for frame in frames] == [(2, 2), (2, 2)]
+    assert frame_indices == [3, 7]
+    assert fps == 29.97
 
 
 @pytest.mark.parametrize(
@@ -144,7 +163,9 @@ def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):
     )
 
     monkeypatch.setattr(
-        image_preprocessing, "_load_frame_sequence_manifest", lambda _payload, _magic: frames
+        image_preprocessing,
+        "_load_frame_sequence_manifest",
+        lambda _payload, _magic: (frames, [0, 1], 1.0),
     )
     monkeypatch.setattr(
         image_preprocessing,
@@ -170,6 +191,8 @@ def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):
     assert result["imgs"].shape == (1, 2, 2)
     assert result["imgs_sizes"].tolist() == [[4, 6], [4, 6]]
     assert result["num_frames"].tolist() == [2]
+    assert result["video_frame_indices"] == [[0, 1]]
+    assert result["video_fps"] == [1.0]
 
 
 def test_video_manifest_rejects_wrong_frame_count(monkeypatch):
@@ -181,7 +204,11 @@ def test_video_manifest_rejects_wrong_frame_count(monkeypatch):
     monkeypatch.setattr(
         image_preprocessing,
         "_load_frame_sequence_manifest",
-        lambda _payload, _magic: [image_module.new("RGB", (2, 2))],
+        lambda _payload, _magic: (
+            [image_module.new("RGB", (2, 2))],
+            [0],
+            1.0,
+        ),
     )
     config = VideoProcessingConfig(
         image_config=ImageProcessingConfig(patch_dim=2, dynamic_resolution=True),

@@ -160,6 +160,8 @@ class _VisionCacheEntry:
     num_img_embeddings_per_tile: int
     imgs_sizes: Optional[Tensor]
     num_frames: Optional[Tensor]
+    video_frame_indices: Optional[List[List[int]]] = None
+    video_fps: Optional[List[float]] = None
 
 
 def format_mem_bytes(mem_bytes):
@@ -744,6 +746,14 @@ class DynamicInferenceEngine(AbstractEngine):
             expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
             if num_frames is not None:
                 expansion_kwargs["num_frames"] = num_frames
+                prompt_config = wrapper.multimodal_prompt_config
+                if (
+                    prompt_config is not None
+                    and prompt_config.video_spec.expansion_mode == "temporal_patch"
+                ):
+                    expansion_kwargs["tokenizer"] = self.controller.tokenizer
+                    expansion_kwargs["video_frame_indices"] = request.video_frame_indices
+                    expansion_kwargs["video_fps"] = request.video_fps
             _, mask_list = wrapper.expand_image_tokens(
                 [request.compact_prompt_tokens.tolist()],
                 image_token_id=media_token_id,
@@ -787,6 +797,8 @@ class DynamicInferenceEngine(AbstractEngine):
             num_img_embeddings_per_tile=request.num_img_embeddings_per_tile,
             imgs_sizes=imgs_sizes,
             num_frames=num_frames,
+            video_frame_indices=request.video_frame_indices,
+            video_fps=request.video_fps,
         )
         self.context.add_vlm_request_data(
             request.request_id, image_embeddings=embeddings, image_token_mask=mask
@@ -823,6 +835,8 @@ class DynamicInferenceEngine(AbstractEngine):
         num_img_embeddings_per_tile: int = 0,
         imgs_sizes: Optional[Tensor] = None,
         num_frames: Optional[Tensor] = None,
+        video_frame_indices: Optional[List[List[int]]] = None,
+        video_fps: Optional[List[float]] = None,
     ) -> None:
         if not cache_key or self.vision_embedding_cache_max_bytes == 0:
             return
@@ -834,6 +848,8 @@ class DynamicInferenceEngine(AbstractEngine):
             num_img_embeddings_per_tile=num_img_embeddings_per_tile,
             imgs_sizes=imgs_sizes,
             num_frames=num_frames,
+            video_frame_indices=video_frame_indices,
+            video_fps=video_fps,
         )
         cache_entry_bytes = self._vision_cache_entry_nbytes(entry)
         if cache_entry_bytes > self.vision_embedding_cache_max_bytes:
@@ -1880,6 +1896,8 @@ class DynamicInferenceEngine(AbstractEngine):
         num_img_embeddings_per_tile: int = 0,
         imgs_sizes: Optional[Tensor] = None,
         num_frames: Optional[Tensor] = None,
+        video_frame_indices: Optional[List[List[int]]] = None,
+        video_fps: Optional[List[float]] = None,
         media_tokens_preexpanded: bool = False,
         media_cache_key: Optional[str] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
@@ -1912,6 +1930,9 @@ class DynamicInferenceEngine(AbstractEngine):
             imgs_sizes (Optional[Tensor]): Per-image sizes [N, 2] with [H, W].
                 Dynamic resolution.
             num_frames (Optional[Tensor]): Number of frames per image/video item.
+            video_frame_indices (Optional[List[List[int]]]): Source indices for
+                each sampled video frame.
+            video_fps (Optional[List[float]]): Source FPS for each video item.
             media_tokens_preexpanded (bool): Whether prompt token IDs already contain
                 one model token per projected media embedding.
             media_cache_key (Optional[str]): Media identity computed by the submitting
@@ -1988,6 +2009,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     imgs_sizes=imgs_sizes,
                     precomputed_block_hashes=precomputed_block_hashes,
                     num_frames=num_frames,
+                    video_frame_indices=video_frame_indices,
+                    video_fps=video_fps,
                     media_tokens_preexpanded=media_tokens_preexpanded,
                     media_cache_key=media_cache_key,
                 )
@@ -2035,6 +2058,8 @@ class DynamicInferenceEngine(AbstractEngine):
         imgs_sizes: Optional[Tensor],
         precomputed_block_hashes: Optional[List[int]] = None,
         num_frames: Optional[Tensor] = None,
+        video_frame_indices: Optional[List[List[int]]] = None,
+        video_fps: Optional[List[float]] = None,
         media_tokens_preexpanded: bool = False,
         media_cache_key: Optional[str] = None,
     ) -> DynamicVLMInferenceRequest:
@@ -2049,6 +2074,8 @@ class DynamicInferenceEngine(AbstractEngine):
             num_img_embeddings_per_tile = cached_vision_entry.num_img_embeddings_per_tile
             imgs_sizes = cached_vision_entry.imgs_sizes
             num_frames = cached_vision_entry.num_frames
+            video_frame_indices = cached_vision_entry.video_frame_indices
+            video_fps = cached_vision_entry.video_fps
         elif num_frames is not None:
             modality = "video"
             missing = [
@@ -2102,6 +2129,8 @@ class DynamicInferenceEngine(AbstractEngine):
                 ("num_tiles", num_tiles),
                 ("imgs_sizes", imgs_sizes),
                 ("num_frames", num_frames),
+                ("video_frame_indices", video_frame_indices),
+                ("video_fps", video_fps),
             ):
                 if value is not None:
                     media_inputs[name] = value
@@ -2150,6 +2179,15 @@ class DynamicInferenceEngine(AbstractEngine):
                 expansion_kwargs = {"num_tiles": num_tiles, "imgs_sizes": imgs_sizes}
                 if num_frames is not None:
                     expansion_kwargs["num_frames"] = num_frames
+                    prompt_config = inference_wrapper.multimodal_prompt_config
+                    if (
+                        prompt_config is not None
+                        and prompt_config.video_spec.expansion_mode
+                        == "temporal_patch"
+                    ):
+                        expansion_kwargs["tokenizer"] = self.controller.tokenizer
+                        expansion_kwargs["video_frame_indices"] = video_frame_indices
+                        expansion_kwargs["video_fps"] = video_fps
                 expanded_tokens_list, mask_list = inference_wrapper.expand_image_tokens(
                     token_list, image_token_id=media_token_id, **expansion_kwargs
                 )
@@ -2230,6 +2268,8 @@ class DynamicInferenceEngine(AbstractEngine):
                     num_img_embeddings_per_tile=num_img_embeddings_per_tile,
                     imgs_sizes=imgs_sizes,
                     num_frames=num_frames,
+                    video_frame_indices=video_frame_indices,
+                    video_fps=video_fps,
                 )
 
         self.context.add_vlm_request_data(
@@ -2264,6 +2304,8 @@ class DynamicInferenceEngine(AbstractEngine):
             num_tiles=num_tiles,
             imgs_sizes=imgs_sizes,
             num_frames=num_frames,
+            video_frame_indices=video_frame_indices,
+            video_fps=video_fps,
             media_tokens_preexpanded=media_tokens_preexpanded,
             media_cache_key=media_cache_key,
             decoder_seq_length=0,
