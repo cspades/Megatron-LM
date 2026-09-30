@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 from itertools import repeat
-from typing import Dict, List, Optional, Tuple, TypedDict, Union
+from typing import Any, Dict, List, Optional, Tuple, TypedDict, Union
 
 import torch
 from torch import Tensor
@@ -2471,6 +2471,7 @@ class DynamicInferenceEngine(AbstractEngine):
         pre_fwd_active_token_count: Optional[int] = None,
         pre_fwd_step_count: Optional[int] = None,
         finished_routing_block_ids: Optional[Dict[int, list[int]]] = None,
+        finished_routing_block_snapshots: Optional[Dict[int, Any]] = None,
         finished_handoff_block_ids: Optional[Dict[int, list[int]]] = None,
         finished_handoff_ssm_slots: Optional[Dict[int, int]] = None,
         finished_handoff_decode_tokens: Optional[Dict[int, list[int]]] = None,
@@ -2709,13 +2710,22 @@ class DynamicInferenceEngine(AbstractEngine):
                     ).long()
 
                 if request_id in finished_request_ids:
-                    # Reconstruct routing from per-block storage before popping.
+                    # Reconstruct routing from per-block storage. Uses the
+                    # pre-update_requests() snapshot (finished_routing_block_snapshots)
+                    # when available, since update_requests() can release a finished
+                    # request's blocks back to the free pool and hand them to a
+                    # different, still-active request needing a new block in that
+                    # same call -- popping self.block_routing for that block id
+                    # before this lookup ever runs. See the snapshot comment in
+                    # text_generation_controller.py for the full race description.
                     if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
                         total_tokens = len(request.prompt_tokens) + len(request.generated_tokens)
                         request.routing_indices = (
                             self.context.kv_block_allocator.reconstruct_routing_from_blocks(
-                                block_ids, total_tokens - 1
+                                block_ids,
+                                total_tokens - 1,
+                                prefetched_blocks=finished_routing_block_snapshots,
                             )
                         )
 
@@ -3819,6 +3829,9 @@ class DynamicInferenceEngine(AbstractEngine):
             log_probs = step_result["log_probs"]
             top_n_logprobs = step_result.get("top_n_logprobs", None)
             finished_routing_block_ids = step_result.get("finished_routing_block_ids", None)
+            finished_routing_block_snapshots = step_result.get(
+                "finished_routing_block_snapshots", None
+            )
             finished_handoff_block_ids = step_result.get("finished_handoff_block_ids", None)
             finished_handoff_ssm_slots = step_result.get("finished_handoff_ssm_slots", None)
             finished_handoff_decode_tokens = step_result.get("finished_handoff_decode_tokens", None)
@@ -3843,6 +3856,7 @@ class DynamicInferenceEngine(AbstractEngine):
                 pre_fwd_active_token_count=context_state.get("active_token_count"),
                 pre_fwd_step_count=context_state.get("step_count"),
                 finished_routing_block_ids=finished_routing_block_ids,
+                finished_routing_block_snapshots=finished_routing_block_snapshots,
                 finished_handoff_block_ids=finished_handoff_block_ids,
                 finished_handoff_ssm_slots=finished_handoff_ssm_slots,
                 finished_handoff_decode_tokens=finished_handoff_decode_tokens,

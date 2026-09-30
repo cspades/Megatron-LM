@@ -89,9 +89,12 @@ def _redact_token_id_lists_for_logging(value):
     if isinstance(value, dict):
         redacted = {}
         for key, item in value.items():
-            if (
+            if key in _INDEX_FIELDS_TO_REDACT:
+                # Routed-expert arrays use the serialized-ndarray envelope
+                # ("ndarray", {shape, dtype, data}), not a plain integer list.
+                redacted[key] = "...truncated..."
+            elif (
                 key in _TOKEN_ID_FIELDS_TO_REDACT
-                or key in _INDEX_FIELDS_TO_REDACT
                 or key in _HASH_FIELDS_TO_REDACT
                 or key.endswith("_token_ids")
                 or key.endswith("_topk_indices")
@@ -1493,15 +1496,17 @@ try:
 
             if return_tokenized_data and not payload_offloaded:
                 # Wire contract matches vLLM: prompt_token_ids are model-input tokens
-                # (post vision/video expansion).
+                # (post vision/video expansion). Gym treats these three token
+                # metadata fields atomically. Calls that request token IDs but
+                # not logprobs therefore carry an empty list, never null.
                 message["prompt_token_ids"] = result["prompt_tokens"]
                 message["generation_token_ids"] = result["generated_tokens"]
+                message["generation_log_probs"] = (
+                    result.get("generated_log_probs") or []
+                )
             if return_raw_text and not payload_offloaded:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
                 message["raw_text"] = prompt_str + text_output
-            if not payload_offloaded:
-                # Small RL/debug scalars (a few bytes each); harmless to keep for compatibility.
-                message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
