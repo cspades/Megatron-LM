@@ -377,36 +377,29 @@ def post_completion(args, prompt_tokens, media_bytes) -> dict:
 async def run_completions(
     args, model, tokenizer, config, prompt_tokens, media_bytes
 ) -> None:
-    # Lifecycle synchronization must not use the default NCCL group while the
-    # background engine is running. A worker blocked in an NCCL barrier cannot
-    # participate in the TP/EP collectives required by rank 0's HTTP request.
-    lifecycle_group = dist.new_group(backend="gloo")
-    try:
-        async with MegatronAsyncLLM(
-            model=model,
-            tokenizer=tokenizer,
-            inference_config=config,
-            use_coordinator=True,
-            coordinator_port=args.coordinator_port,
-            inference_wrapper_cls=NemotronOmniInferenceWrapper,
-        ) as llm:
-            await llm.serve(
-                ServeConfig(
-                    host=args.http_host,
-                    port=args.http_port,
-                    frontend_replicas=1,
-                ),
-                blocking=False,
+    async with MegatronAsyncLLM(
+        model=model,
+        tokenizer=tokenizer,
+        inference_config=config,
+        use_coordinator=True,
+        coordinator_port=args.coordinator_port,
+        inference_wrapper_cls=NemotronOmniInferenceWrapper,
+    ) as llm:
+        # Workers serve until the primary's shutdown, on leaving this block,
+        # stops every engine through the coordinator.
+        await llm.serve(
+            ServeConfig(
+                host=args.http_host,
+                port=args.http_port,
+                frontend_replicas=1,
+            ),
+            blocking=not llm.is_primary_rank,
+        )
+        if llm.is_primary_rank:
+            response = await asyncio.to_thread(
+                post_completion, args, prompt_tokens, media_bytes
             )
-            dist.barrier(group=lifecycle_group)
-            if llm.is_primary_rank:
-                response = await asyncio.to_thread(
-                    post_completion, args, prompt_tokens, media_bytes
-                )
-                print_generated_text(response["choices"][0]["text"])
-            dist.barrier(group=lifecycle_group)
-    finally:
-        dist.destroy_process_group(lifecycle_group)
+            print_generated_text(response["choices"][0]["text"])
 
 
 def run_sync(args, model, tokenizer, config, prompt_tokens, media_bytes) -> None:
