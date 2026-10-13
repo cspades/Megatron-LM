@@ -108,27 +108,35 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
     understand vision-embedding cache identity. Tensor metadata is included to
     prevent equal byte streams with different shapes or dtypes from colliding.
     """
+    # Update a digest with all of the distinct fields of the multimodal data.
     digest = hashlib.sha256()
+    # Header
     digest.update(b"megatron-media-v2\0")
     digest.update(modality.encode())
     digest.update(b"\0")
 
     raw_items = _normalize_raw_media_items(modality_data)
     if raw_items is not None:
+        # Raw Media
         digest.update(b"raw\0")
         for item in raw_items:
+            # Size of the media.
             digest.update(len(item).to_bytes(8, "big"))
+            # Media bytes.
             digest.update(item)
         return digest.hexdigest()
 
     if isinstance(modality_data, dict):
+        # Preprocessed Media Tensors
         digest.update(b"preprocessed\0")
         cache_fields = set(_media_tensor_keys(modality)) | {"num_img_embeddings_per_tile"}
         for name in sorted(set(modality_data) & cache_fields):
             value = modality_data[name]
+            # Modality Field
             digest.update(name.encode())
             digest.update(b"\0")
             if isinstance(value, torch.Tensor):
+                # Tensor dtype, shape, and data.
                 tensor = value.detach().contiguous().cpu()
                 digest.update(str(tensor.dtype).encode())
                 digest.update(b"\0")
@@ -145,6 +153,7 @@ def compute_media_cache_key(modality: str, modality_data: Any) -> str:
                     f"Cannot compute a media cache key from field {name!r} "
                     f"of type {type(value).__name__}."
                 )
+            # Sep
             digest.update(b"\0")
         return digest.hexdigest()
 
@@ -192,6 +201,7 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
     if not isinstance(multi_modal_data, dict):
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
 
+    # multi_modal_data dict parsing...
     unsupported = set(multi_modal_data) - {"image", "video", "media_tokens_preexpanded"}
     if "media_cache_key" in unsupported:
         raise ValueError(
@@ -218,11 +228,21 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
             f"got {type(media_tokens_preexpanded)}."
         )
     metadata = {"media_tokens_preexpanded": True} if media_tokens_preexpanded else {}
-    raw_items = _normalize_raw_media_items(modality_data)
+
+    # Package the multimodal data into a dictionary for the inference request.
+    # Compute a media caching key. This key will be used everywhere for anything
+    # related to the identity of this media content, including DP routing as well
+    # as KV caching (when combined with the text / request hash).
+    raw_items = _normalize_raw_media_items(modality_data)  # returns None if we already have Tensor inputs coming from the client.
     if raw_items is not None:
+        # Raw media data, like PNG's or MP4's that have been serialized.
+        # These still need to be preprocessed into input Tensors by the
+        # engine before entering the vision encoder.
         media_cache_key = compute_media_cache_key(modality, raw_items)
         return {modality: raw_items, "media_cache_key": media_cache_key, **metadata}
     elif isinstance(modality_data, dict):
+        # Pre-processed multimodal Tensors. These pass straight into
+        # the inference engine without any preprocessing.
         media_cache_key = compute_media_cache_key(modality, modality_data)
         wire: Dict[str, Any] = {}
         for key in _media_tensor_keys(modality):
@@ -510,6 +530,7 @@ def compute_block_hashes_batched(
     tokens_bytes = tokens_cpu.numpy().tobytes()
     block_byte_size = block_size * tokens_cpu.element_size()  # 8 bytes per int64
 
+    # First 32 bytes is the hash for the media hash (or null if no media).
     hashes = []
     if cache_salt is None:
         parent_digest = b'\x00' * 32  # Preserve text-only hash compatibility.
@@ -518,15 +539,21 @@ def compute_block_hashes_batched(
             b"megatron-prefix-cache-salt-v1\0" + cache_salt.encode()
         ).digest()
 
+    # For each token block, compute a running digest for all tokens up to that block.
+    # Block hashes are based on all previous tokens up to and including the current block.
+    # The larger the block size, the fewer hashes and the higher prob of cache miss.
+    # The smaller the block size, the more hashes and the higher KV cache memory expenditure.
     for i in range(num_complete_blocks):
+        # Update the digest with the next block of bytes.
         block_bytes = tokens_bytes[i * block_byte_size : (i + 1) * block_byte_size]
         digest = hashlib.sha256(parent_digest + block_bytes).digest()
 
         # Map to positive int64 range [1, 2^63-1], avoiding sentinels -1 and 0
         raw = int.from_bytes(digest[:8], byteorder='little', signed=False)
         hash_val = (raw % (2**63 - 1)) + 1
-
+        # Track the new int64 block hash.
         hashes.append(hash_val)
+        # Increment digest.
         parent_digest = digest  # Full 32-byte digest chains into next block
 
     return hashes

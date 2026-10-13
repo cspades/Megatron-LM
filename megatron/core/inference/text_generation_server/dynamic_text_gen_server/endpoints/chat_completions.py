@@ -300,12 +300,14 @@ def _extract_media_url_bytes(url: str, *, max_fetch_bytes: int | None = None) ->
     bounds them instead.
     """
     if url.startswith("data:"):
+        # e.g. "data:image/png;base64,iVBORw0KGgo..."
         try:
             metadata, b64_data = url.split(",", 1)
         except ValueError as exc:
             raise ValueError(f"Malformed media data URL: {url[:40]!r}") from exc
         return base64.b64decode(b64_data)
     if url.startswith(("http://", "https://")):
+        # e.g. "https://upload.wikimedia.org/wikipedia/commons/a/a9/Example.jpg"
         parsed = urllib.parse.urlparse(url)
         if not parsed.hostname:
             raise ValueError(f"Invalid media URL: {url[:40]!r}")
@@ -324,6 +326,7 @@ def _extract_media_url_bytes(url: str, *, max_fetch_bytes: int | None = None) ->
             or ip.is_unspecified
         ):
             raise ValueError(f"Refusing to fetch media from non-public address: {parsed.hostname}")
+        # Read the HTTP URL.
         req = urllib.request.Request(url, headers={"User-Agent": _MEDIA_FETCH_USER_AGENT})
         with _no_redirect_opener.open(req, timeout=_MEDIA_FETCH_TIMEOUT_S) as response:
             if max_fetch_bytes is None:
@@ -340,8 +343,29 @@ def _extract_multimodal_from_messages(
 ):
     """Extract media bytes and replace structured blocks with internal slots.
 
+    Chat templates only render string content, so each media block becomes a unique text
+    sentinel that survives rendering and marks exactly where its model token IDs are spliced in.
+
     Remote image fetching is blocking, so callers must run this function off
     the event loop. ``max_fetch_bytes`` bounds each remote media response.
+
+    Example transformation:
+    Input:
+      [{"role": "user", "content": [
+          {"type": "text", "text": "Compare"},
+          {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}},
+          {"type": "text", "text": "with"},
+          {"type": "image_url", "image_url": {"url": "https://example.com/b.jpg"}}]}]
+    Output:
+      messages:
+        [{"role": "user", "content": [
+            {"type": "text", "text": "Compare"},
+            {"type": "text", "text": "__MCORE_MEDIA_SLOT_0__"},
+            {"type": "text", "text": "with"},
+            {"type": "text", "text": "__MCORE_MEDIA_SLOT_1__"}]}]
+      image_bytes_list: [<decoded PNG bytes>, <JPEG bytes fetched from example.com>]
+      video_bytes_list: []
+      media_slots: [("__MCORE_MEDIA_SLOT_0__", "image", 0), ("__MCORE_MEDIA_SLOT_1__", "image", 0)]
     """
     if not isinstance(messages, list):
         return messages, [], [], []
@@ -463,6 +487,7 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
         if isinstance(content, list):
             text_chunks = []
             for chunk in content:
+                # Text chunks and media "sentinel" text chunks as well.
                 if isinstance(chunk, dict):
                     if chunk.get("type") == "text":
                         text_chunks.append(str(chunk.get("text", "")))
@@ -471,6 +496,8 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
                 elif isinstance(chunk, str):
                     text_chunks.append(chunk)
             if prompt_config is not None and prompt_config.content_part_order == "media_first":
+                # Front-load all media chunks / parts of the message before the
+                # text part of the prompt, which is used for some trained models.
                 media_sentinels = media_sentinels_by_message.get(message_index, set())
                 media_chunks = [chunk for chunk in text_chunks if chunk in media_sentinels]
                 non_media_chunks = [chunk for chunk in text_chunks if chunk not in media_sentinels]
@@ -480,34 +507,45 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
             if message_modalities:
                 if prompt_config is None:
                     raise ValueError("Media content normalization requires a prompt config.")
+                # Add separators between content parts, so content_part_separator="\n"
+                # for a simple query-response would produce: "Hey what's up?\nNothing much."
                 separators = {
                     prompt_config.get_spec(modality).content_part_separator
                     for modality in message_modalities
                 }
+                # Only one separator for all parts of the entire message.
                 if len(separators) != 1:
                     raise ValueError(
                         "Media types in one message must use the same content-part separator."
                     )
                 separator = separators.pop()
+            # Join all of the message parts into a single string.
             msg_copy["content"] = separator.join(chunk for chunk in text_chunks if chunk)
         elif isinstance(content, dict):
+            # Single content part.
             msg_copy["content"] = str(content.get("text", ""))
         elif content is None:
+            # No content. Return an empty string.
             msg_copy["content"] = ""
         elif not isinstance(content, str):
+            # Convert non-str into string as a fall-back for templating.
             msg_copy["content"] = str(content)
 
+        # Sanitize tool calls, which are lists of tool-call dicts.
         tool_calls = msg_copy.get("tool_calls")
         if isinstance(tool_calls, list):
             sanitized_tool_calls = []
             for call in tool_calls:
                 if not isinstance(call, dict):
+                    # Non-JSON tool calls just passthrough.
+                    # Only sanitize the dicts.
                     sanitized_tool_calls.append(call)
                     continue
                 call_copy = dict(call)
                 function = call_copy.get("function")
                 if isinstance(function, dict):
                     function_copy = dict(function)
+                    # Only keep dictionaries / kwargs.
                     function_copy["arguments"] = _coerce_arguments_mapping(
                         function_copy.get("arguments", {})
                     )
@@ -737,12 +775,16 @@ def _coerce_to_token_id_list(result):
 
 def _tokenize_with_media_slots(media_message_str: str, media_slots, chat_tok, prompt_config):
     """Tokenize and convert media text placeholders into model media token IDs."""
+    # Insert media back into the text placeholders sent through the chat template:
+    # {"type": "text", "text": "__MCORE_MEDIA_SLOT_<INDEX>__"}
     positioned_slots = []
     for sentinel, modality, _message_index in media_slots:
         if media_message_str.count(sentinel) != 1:
             raise ValueError(f"Chat template did not preserve media slot {sentinel}.")
         positioned_slots.append((media_message_str.index(sentinel), sentinel, modality))
 
+    # Trace through the rendered prompt string and replace media placeholders
+    # with media token ID's defined by the model.
     prompt_tokens = []
     cursor = 0
     for position, sentinel, modality in sorted(positioned_slots):
@@ -761,18 +803,72 @@ def _tokenize_with_media_slots(media_message_str: str, media_slots, chat_tok, pr
             resolved_id = None
         if resolved_id is None:
             raise ValueError(f"Tokenizer does not define media token {spec.model_token!r}.")
+        # Add the media prefix, e.g. <img>.
         prompt_tokens.extend(
             _coerce_to_token_id_list(chat_tok(spec.prefix, add_special_tokens=False))
         )
+        # Add the media token ID, e.g. <image>.
         prompt_tokens.append(int(resolved_id))
+        # Add the media suffix, e.g. </img>
         prompt_tokens.extend(
             _coerce_to_token_id_list(chat_tok(spec.suffix, add_special_tokens=False))
         )
+        # Increment.
         cursor = position + len(sentinel)
 
+    # Tokenize the suffix of the entire message.
     prompt_tokens.extend(
         _coerce_to_token_id_list(chat_tok(media_message_str[cursor:], add_special_tokens=False))
     )
+    return prompt_tokens
+
+
+def _tokenize_chat_template_sync(
+    chat_tok,
+    messages,
+    media_slots,
+    prompt_config,
+    tools,
+    chat_template_kwargs,
+    add_generation_prompt=True,
+):
+    """Render a chat template and convert internal media slots to model media
+    tokens defined in the MediaPromptSpec.
+
+    Synchronous, and run whole on the frontend's tokenize executor rather than
+    piecewise. Rendering is only the first of 3N+1 tokenizer calls for N media
+    slots -- each slot encodes the text before it, then the model token's prefix
+    and suffix -- and awaiting just the render left the rest on the event loop,
+    where they stall every other request this replica owns.
+
+    One hop to the executor also means one thread touches the tokenizer for the
+    whole request. HF tokenizers are not thread-safe, and this runs on the
+    executor's private copy.
+    """
+    # Tokenize the message with a chat template.
+    rendered = chat_tok.apply_chat_template(
+        messages,
+        # Need to insert media placeholder tokens based on
+        # position of the media sentinels in the messages
+        # before tokenization.
+        tokenize=False if media_slots else True,
+        add_generation_prompt=add_generation_prompt,
+        tools=tools,
+        **chat_template_kwargs,
+    )
+    
+    if media_slots:
+        if not isinstance(rendered, str):
+            raise TypeError("Multimodal chat template rendering must return a string.")
+        prompt_tokens = _tokenize_with_media_slots(rendered, media_slots, chat_tok, prompt_config)
+    else:
+        # Standardize to list[int].
+        prompt_tokens = _coerce_to_token_id_list(rendered)
+
+    if not isinstance(prompt_tokens, list) or not all(
+        isinstance(i, int) and not isinstance(i, bool) for i in prompt_tokens
+    ):
+        raise TypeError(f"Tokenized output should be a list[int], got {prompt_tokens}.")
     return prompt_tokens
 
 
@@ -861,6 +957,25 @@ try:
         meta = {}
         for parser in parsers_list:
             prev_text = message_text
+            """
+            Parse the raw generated string produced by the LLM.
+
+            For example, DeepSeekR1ReasoningParser used on this generation:
+            <think>The user wants Paris weather. I should call the tool.</think>Let me check that.
+            <tool_call>
+            <function=get_weather>
+            <parameter=city>
+            Paris
+            </parameter>
+            </function>
+            </tool_call>
+            
+            turns into:
+            (
+                "Let me check that.\n<tool_call>\n<function=get_weather>\n...</tool_call>",
+                {"reasoning": "The user wants Paris weather. I should call the tool."},
+            )
+            """
             parsed_text, new_info = PARSER_MAPPING[parser].parse(
                 message_text,
                 tools=tools,
@@ -893,17 +1008,113 @@ try:
         tokenizer = current_app.config['tokenizer']
         parsers = current_app.config['parsers']
 
+        """
+        Consume an incoming JSON request. Should expect a OpenAI API.
+        {
+        "model": "policy_model",
+        "messages": [
+            {"role": "system", "content": "You are a helpful assistant with tool access."},
+            {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "I took this photo from my hotel window this morning:"},
+                {"type": "image_url", "image_url": {"url": "data:image/jpeg;base64,/9j/4AAQSkZJRg..."}},
+                {"type": "text", "text": "and this is the forecast my phone showed:"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/forecast.png"}},
+                {"type": "text", "text": "Do they agree? What's the weather in Paris right now?"}
+            ]
+            },
+            {
+            "role": "assistant",
+            "content": "",
+            "reasoning_content": "I should call the weather tool.",
+            "reasoning": "I should call the weather tool.",
+            "tool_calls": [
+                {
+                "id": "call_0",
+                "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\": \"Paris\"}"}
+                }
+            ],
+            "prompt_token_ids": [1, 1599, 1395, 1032],
+            "generation_token_ids": [12, 2394, 1278, 11],
+            "generation_log_probs": [-0.01, -0.42, -0.03, -0.001]
+            },
+            {
+            "role": "tool",
+            "tool_call_id": "call_0",
+            "content": [
+                {"type": "text", "text": "{\"temp_c\": 18, \"sky\": \"cloudy\"}"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,iVBORw0KGgo..."}}
+            ]
+            }
+        ],
+        "tools": [
+            {
+            "type": "function",
+            "function": {
+                "name": "get_weather",
+                "description": "Get current weather for a city.",
+                "parameters": {
+                "type": "object",
+                "properties": {"city": {"type": "string"}},
+                "required": ["city"]
+                }
+            }
+            }
+        ],
+        "tool_choice": "auto",
+        "parallel_tool_calls": true,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "max_tokens": 8192,
+        "logprobs": true,
+        "top_logprobs": 0,
+        "return_tokens_as_token_ids": true,
+        "chat_template_kwargs": {"enable_thinking": true},
+        "metadata": {"chat_template_kwargs": "{\"enable_thinking\": true}"},
+
+        "top_k": 0,
+        "seed": 1234,
+        "n": 1,
+        "stop": ["</answer>", "</tool_call>"],
+        "stop_token_ids": [2],
+        "ignore_eos": false,
+        "include_stop_str_in_output": false,
+        "stream": false,
+        "stream_options": {"include_usage": true},
+        "prevent_retokenization": true,
+        "return_tokenized_data": true,
+        "return_raw_text": false,
+        "skip_prompt_log_probs": true,
+        "add_BOS": false,
+        "streaming_interval": 1
+        }
+        """
         req = await request.get_json()
+        # Used to pass args/kwargs to the prompt preparer, payload stager,
+        # and multimodal prompt expansion info for multi-turn stitching.
+        # Refer to the various uses of this arg for what this dict has.
         offload_params = req.get("offload_params")
         offload_params_error = validate_offload_params(offload_params)
         if offload_params_error is not None:
             return Response(offload_params_error, status=400)
+        # Instead of re-tokenizing chat history, which can change from
+        # concatenating the generated tokens to the prefix, or even just
+        # detokenizing and re-tokenizing the generated sequence, e.g.
+        # "hel" and "lo" generated can be retokenized as "hello" which
+        # deviates from the original KV cache, makes debugging multi-turn
+        # responses difficult due to the changing tokenization across turns,
+        # and wastes time re-tokenizing.
         prevent_retokenization = req.get(
             "prevent_retokenization", not current_app.config.get('eval_mode', False)
         )
+        # Tool-calling args. Introduces special strings like <tool_call> </tool_call>
+        # which contain arguments to agentic tools generated by the engine.
         tools = req.get("tools", None)
         tool_choice = req.get("tool_choice", None)
         parallel_tool_calls = req.get("parallel_tool_calls", True)
+        # Whether we should parse for tools or just ignore it as generated text.
         tools_requested = bool(tools) and tool_choice != "none"
         messages = req.get("messages")
         chat_template_kwargs = _sanitize_chat_template_kwargs(req.get("chat_template_kwargs"))
@@ -925,6 +1136,8 @@ try:
             )
         except ValueError as error:
             return Response(str(error), status=400)
+        # Attach the multimodal data to their respective field as an argument
+        # for the inference client.
         multi_modal_data = None
         if image_bytes_list:
             multi_modal_data = {"image": image_bytes_list}
@@ -948,7 +1161,11 @@ try:
                 "'offload_params' are mutually exclusive prefix sources",
                 status=400,
             )
+        # Use the exact previous tokens instead of retokenization.
+        # Get the previous tokens directly from the multi-turn input message.
         use_exact_prefix_stitching = prevent_retokenization and has_previous_turn_tokens
+        # If we offloaded the previously-tokenized prefix, this is what we need to get
+        # those tokens back. It's not in the input message.
         use_offloaded_prefix_stitching = (
             offload_params is not None and last_assistant_message is not None
         )
@@ -1164,14 +1381,16 @@ try:
                 start_idx = 0
                 while start_idx < len(prompt_tokens) and prompt_tokens[start_idx] == tokenizer.bos:
                     start_idx += 1
+                # Strip / dedupe any existing BOS token(s) (by default).
                 if start_idx > 0:
                     prompt_tokens = prompt_tokens[start_idx:]
-
+                # Prepend a single tokenizer BOS token.
                 if add_BOS:
                     prompt_tokens = [tokenizer.bos] + prompt_tokens
 
                 if offload_params and PREFIX_EXPANDED_TOKEN_COUNT_FIELD in offload_params:
-                    # BOS changes happen inside the expanded prefix.
+                    # BOS changes happen inside the expanded prefix, so it
+                    # should update the expanded prefix length as well.
                     offload_params[PREFIX_EXPANDED_TOKEN_COUNT_FIELD] += (
                         len(prompt_tokens) - prompt_length
                     )
@@ -1227,6 +1446,10 @@ try:
         prepared_multimodal_data = prepare_multimodal_data(multi_modal_data)
         stream_requested = bool(req.get("stream", False))
         if stream_requested:
+            """
+            Stream path covers generation, parsing, detokenization, etc.
+            and returns the result early.
+            """
             # Streaming currently supports only Hugging Face fast tokenizers.
             try:
                 incremental_detokenizers = [
@@ -1417,6 +1640,7 @@ try:
             payload_offloaded = bool(result.get("payload_offloaded"))
             logprobs_content = None
             if sampling_params.return_log_probs and not payload_offloaded:
+                # LogProb post-processing and tabulation.
                 token_logprobs = json_safe_logprobs(result.get("generated_log_probs") or [])
 
                 tokens_to_decode = [[tok] for tok in result["generated_tokens"]]
@@ -1454,6 +1678,7 @@ try:
             metadata = {}
             message_text = text_output
 
+            # Parsing.
             if parsers:
                 message_text, metadata = apply_parsers(
                     message_text,
@@ -1473,6 +1698,12 @@ try:
             # Determine content based on tool_choice (matches vLLM behavior):
             # - Named tool choice or "required": content is empty string
             # - Otherwise: content is the parsed message text
+            # Tool choice changes how the model to use the provided tools.
+            # auto = the model can answer in text or call tools
+            # none = don't call tools, text only
+            # required = the model has to call at least 1 tool
+            # function / named tool choice = the model must call a specific tool
+            #   example: {"type": "function", "function": {"name": "get_weather"}}
             is_named_tool_choice = isinstance(tool_choice, dict) and "function" in tool_choice
             if normalized_tool_calls and (is_named_tool_choice or tool_choice == "required"):
                 content = ""
@@ -1482,8 +1713,10 @@ try:
                 # continue the episode after a reasoning-only completion.
                 content = None
             else:
+                # Normal text response.
                 content = message_text if message_text is not None else ""
 
+            # Output OpenAI message JSON.
             message = {"role": "assistant", "content": content}
             if normalized_tool_calls:
                 message["tool_calls"] = normalized_tool_calls
@@ -1510,8 +1743,10 @@ try:
             if generation_finish_reason(result) == "length":
                 finish_reason = "length"
             elif normalized_tool_calls and not is_named_tool_choice:
+                # At least some tool was called but no specific named tool was requested.
                 finish_reason = "tool_calls"
             else:
+                # Either a stop token was hit, or a named tool was requested.
                 finish_reason = "stop"
 
             # Choice-level prompt/generation_token_ids, generation_log_probs and
@@ -1527,9 +1762,14 @@ try:
             if current_app.config['verbose']:
                 logging.info(_redact_token_id_lists_for_logging(result))
 
+            # Router replay data.
             if result["routing_indices"] is not None:
+                # Top K routing indices per token of shape:
+                # [total_tokens-1, num_moe_layers, topk]
+                # for all k expert assignments to all tokens across all MoE layers.
                 choice_data["moe_topk_indices"] = result["routing_indices"]
                 if prompt_tokens_count:
+                    # Only the prompt token indices.
                     choice_data["prompt_moe_topk_indices"] = result["routing_indices"][
                         :prompt_tokens_count
                     ]
@@ -1543,6 +1783,7 @@ try:
             total_completion_tokens += len(result["generated_tokens"])
             request_idx += 1
 
+        # Full OpenAI response JSON.
         prompt_token_count = max(prompt_tokens_counts) if prompt_tokens_counts else 0
         cached_token_count = max(cached_tokens_counts) if cached_tokens_counts else 0
         response = {

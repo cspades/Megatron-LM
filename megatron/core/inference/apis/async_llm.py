@@ -212,6 +212,8 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 start_text_gen_server,
             )
 
+            # Start text generation server which spawns multiple front-ends that serve
+            # completions, chat_completions, etc.
             assert self._coord_runtime is not None
             start_text_gen_server(
                 coordinator_addr=self._coord_runtime.coord_addr,

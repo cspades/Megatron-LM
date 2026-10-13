@@ -292,6 +292,9 @@ class InferenceClient:
             # If multi_modal_data is already serialized, then this is an identity function.
             serialize_multimodal_data(multi_modal_data)
         )
+
+        # Split request data into 5 parts to only decode parts that we need in
+        # various places in the inference engine.
         return [
             msgpack.packb(
                 [Headers.SUBMIT_REQUEST.value, request_id, sampling_params.serialize(), media_meta],
@@ -539,6 +542,7 @@ class InferenceClient:
 
     def _submit_request(self, frames: list, request_id: int) -> asyncio.Future:
         """Send a prepared request and register its completion future."""
+        # Send a request from the inference client to the DP coordinator.
         self._pending_source_requests.add(request_id)
         self.socket.send_multipart(frames)
         assert request_id not in self.completion_futures
@@ -575,17 +579,22 @@ class InferenceClient:
             try:
                 # frames[0] is metadata; a reply body, when present, follows it.
                 frames = self.socket.recv_multipart(flags=zmq.NOBLOCK)
+                # Unpack the metadata: [SUBMIT_REQUEST, Request ID, SamplingParams, Media Metadata]
                 data = msgpack.unpackb(frames[0], raw=False)
                 header = Headers(data[0])
                 if header == Headers.ENGINE_REPLY:
+                    # Request ID
                     request_id = data[1]
                     self._mark_source_safe(request_id)
                     if request_id in self.aborted_request_ids:
+                        # Discard aborted requests.
                         self.aborted_request_ids.discard(request_id)
                         continue
+                    # Prompt unpack.
                     reply = msgpack.unpackb(frames[1], raw=False)
                     submitted = self.request_submission_times.pop(request_id, None)
                     if submitted is not None:
+                        # Measure the time it took to get a response for this prompt.
                         reply['latency'] = time.perf_counter() - submitted
                     # Streaming path: deliver final reply + sentinel and stop.
                     if request_id in self.streams:
@@ -607,6 +616,7 @@ class InferenceClient:
                     if completion_future.done():
                         logging.warning(f"Client: The future for {request_id} has been cancelled!")
                         continue
+                    # Deserialize the generation.
                     completed_request = (
                         DynamicInferenceRequest.deserialize(reply) if self.deserialize else reply
                     )
