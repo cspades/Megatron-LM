@@ -1361,7 +1361,11 @@ class DynamicInferenceEngine(AbstractEngine):
 
         local_ip = hostname or socket.gethostname()
 
-        # Spawn a DP coordinator process and get the connection info.
+        # Spawn a DP coordinator process in charge of routing requests from all
+        # front-end inference clients and the MLLM control client to the engines.
+        # The inference_coordinator_port is used to communicate with it.
+        # ONLY the DP coordinator rank (DP TP PP rank 0, effectively global rank 0)
+        # initializes and starts the coordinator, other engine ranks just attach.
         if disagg_config is not None:
             spawn_coordinator = disagg_config.spawn_coordinator and self.is_mp_coordinator
         else:
@@ -1404,6 +1408,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 },
             )
             self.inference_coordinator_process.start()
+
+            # Get the inference coordinator address from the initialized coordinator.
+            # Will be used to receive requests from the inference coordinator.
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
             dp_addr = dp_pipe.recv()
             dp_pipe.close()
@@ -1446,7 +1453,16 @@ class DynamicInferenceEngine(AbstractEngine):
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
+        # Engine identity for the coordinator to track and route to!
+        # Registered with the coordinator during initialization.
         identity = disagg_config.identity if disagg_config is not None else f'mp-coord-{dp_rank}'
+
+        # Only a single engine rank listens to the inference coordinator, and this
+        # rank will be responsible for broadcasting inference requests to all
+        # engine / model parallel ranks. This reduces the communication required
+        # between the inference router / coordinator and all the engines at scale.
+        # Even the inference clients also communicate prompts to the inference
+        # coordinator via the same port.
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -1456,6 +1472,7 @@ class DynamicInferenceEngine(AbstractEngine):
             self.socket_for_receiving_requests.connect(dp_addr)
 
             if disagg_config is not None:
+                # Disaggregated inference role registration.
                 self.socket_for_receiving_requests.send(
                     msgpack.packb(
                         [
@@ -1487,7 +1504,9 @@ class DynamicInferenceEngine(AbstractEngine):
                 self.socket_for_receiving_requests,
                 self.model_parallel_publisher_socket,
             ]
-        # All MP ranks subscribe to the publisher socket
+        # All MP ranks subscribe to the publisher socket to receive inference
+        # requests from the main engine rank after it receives a request from
+        # the inference coordinator.
         self.model_parallel_subscriber_socket = dp_replica_mp_request_broadcast.create_subscriber(
             self.zmq_context, mp_req_addr, mp_rank
         )
@@ -1495,6 +1514,9 @@ class DynamicInferenceEngine(AbstractEngine):
         self.zmq_sockets += [self.model_parallel_subscriber_socket]
 
         if self.is_mp_coordinator:
+            # Prevents torch dist hangs from subscribers not subscribing
+            # in time to the main MP coordinator before the main coordinator
+            # starts to send work to do, and hanging on the first MP collective.
             dp_replica_mp_request_broadcast.wait_for_subscribers(
                 self.model_parallel_publisher_socket, range(mp_size)
             )
@@ -4689,6 +4711,7 @@ class DynamicInferenceEngine(AbstractEngine):
 
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
+        # MP coordinator receives requests via ZMQ from the inference coordinator.
         if self.is_mp_coordinator:
             # Locally-generated notifications are single-frame messages, so they
             # are wrapped to match the frame-list shape of socket traffic.
@@ -4709,10 +4732,14 @@ class DynamicInferenceEngine(AbstractEngine):
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
+            # After receiving requests from the coordinator, publish the work
+            # to all engine ranks.
             self.model_parallel_publisher_socket.send_multipart(
                 self._pack_tp_broadcast(all_messages)
             )
         else:
+            # Other MP ranks wait for the main MP rank to publish work for
+            # each model parallel engine rank to run across Torch Dist.
             all_messages = self._unpack_tp_broadcast(
                 self.model_parallel_subscriber_socket.recv_multipart()
             )
@@ -5193,6 +5220,8 @@ class DynamicInferenceEngine(AbstractEngine):
 
         try:
             while True:
+                # Schedule requests for the engine by draining the publisher socket
+                # of work to do.
                 self.schedule_requests()
 
                 if self.state in (EngineState.RUNNING, EngineState.PAUSING):

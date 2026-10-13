@@ -169,9 +169,18 @@ class _CoordinatorRuntime:
         if self._coordinator_port is not None:
             kwargs["inference_coordinator_port"] = self._coordinator_port
 
+        # Create an inference coordinator from the inference engine and have the
+        # engine begin to listen to the coordinator via ZMQ.
+        # Only the DP coordinator rank (rank 0 in all groups) inits and starts
+        # the coordinator inside here, but the coordinator manages requests to
+        # all engines in a balanced way.
         coord_addr = await self._engine.start_listening_to_data_parallel_coordinator(**kwargs)
         self._coord_addr = coord_addr
 
+        # Initialize a global inference client use to communicate with all inference
+        # engines for control and state management. This client never sends any
+        # inference requests, it only is responsible for controlling the entire
+        # inference engine cluster.
         if self._is_primary:
             # Lazy import: keep this module importable without pyzmq/msgpack
             # installed when the user only needs direct mode.
@@ -191,6 +200,7 @@ class _CoordinatorRuntime:
                     self._engine.context.config.prefix_caching_coordinator_policy
                 ),
             )
+            # Start an inference client.
             client.start(loop=loop)
             self._client = client
 
@@ -292,7 +302,20 @@ class _MegatronLLMBase:
                     f"use_coordinator=True is required when expert_model_parallel_size > 1 "
                     f"(got EP={ep_size}). Use coordinator mode to handle EP routing."
                 )
-
+        """
+        Inference engine build starts here. The order of the initialization is:
+        1. Engine
+        Right below this comment. This initializes the inference model and engine.
+        2. Coordinator
+        _CoordinatorRuntime.__init__ and setup() further below. Each rank (and engine)
+        calls start_listening_to_data_parallel_coordinator(). DP coord rank builds it.
+        3. Server + Front-End Replicas + Clients if using coordinator.
+        Initialized and started in text_generation_server.start_text_gen_server() which
+        for every rank that calls this can build N replicas of front-ends that serve
+        completions/chat_completions ASGI quart blueprints/apps in _run_text_gen_server()
+        using a Hypercorn server (hypercorn.asyncio.serve).
+        """
+        # Build the inference engine and controller for the inference model.
         engine = build_dynamic_inference_engine(
             model=model,
             tokenizer=tokenizer,
@@ -318,6 +341,7 @@ class _MegatronLLMBase:
         self._serve_started: bool = False
 
         if use_coordinator:
+            # Initialize the DP inference coordinator and global inference client.
             loop_manager = _EventLoopManager()
             loop_manager.start()
             coord_runtime: "Optional[_CoordinatorRuntime]" = None
@@ -328,6 +352,7 @@ class _MegatronLLMBase:
                     coordinator_host=coordinator_host,
                     coordinator_port=coordinator_port,
                 )
+                # Run the inference coordinator.
                 loop_manager.run_sync(coord_runtime.setup(loop=loop_manager.loop))
             except BaseException:
                 if coord_runtime is not None:

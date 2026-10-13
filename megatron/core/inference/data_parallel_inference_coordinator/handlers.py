@@ -169,6 +169,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     offload_frame = bodies[3]
 
     if coordinator.is_disaggregated_inference():
+        # TODO(@cspades): Support multimodal disaggregation.
         if media_meta or media_frame != b"\xc0":
             # Native handoffs do not support VLM/media state yet. Reject only
             # this request, before allocating an ID or reserving engine capacity.
@@ -250,14 +251,22 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         )
         return
 
-    # Account for the fact that some engines may have died.
+    # Account for the fact that some engines may have died. Try to send to all
+    # currently available engines, and retry a different engine if the chosen
+    # engine has died or disconnected.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
+        # Compute DP rank affinity for each engine and forward the request
+        # to the highest affinity engine.
+        # Rank = argmax((media_hit * media_hit_token_weight + prefix_match_depth) / (media_hit_token_weight + sequence_block_depth) - a * load)
         next_identity = coordinator.get_best_data_parallel_rank(
             request_hashes, media_cache_key=media_cache_key
         )
+        # Try to submit to an engine. If it fails, the engine will be removed from
+        # the list of available engines in the coordinator.
         if coordinator._send_to_engine(
             next_identity, [engine_metadata, prompt_frame, media_frame, offload_frame]
         ):
+            # Engine submission succeeded.
             break
     else:
         # If all engines have died, we are in an abnormal state, and must exit cleanly.

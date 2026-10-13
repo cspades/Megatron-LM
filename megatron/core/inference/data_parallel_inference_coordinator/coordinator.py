@@ -172,6 +172,19 @@ class DataParallelInferenceCoordinator:
         # Get local IP.
         local_ip = hostname or socket.gethostname()
 
+        # Socket used for both receiving requests from the inference clients as well as
+        # sending requests to the inference engines using headers / identities.
+        """
+        1. Client sends SUBMIT_REQUEST
+        2. ROUTER receives [client_identity, request frames]
+        3. Coordinator saves request_id → client_identity
+        4. Coordinator selects engine_identity
+        5. ROUTER sends [engine_identity, request frames]
+        6. Engine gets SUBMIT_REQUEST(_WITH_KV for disagg) and sends ENGINE_REPLY
+        7. ROUTER receives [engine_identity, reply frames]
+        8. Coordinator looks up client_identity
+        9. ROUTER sends [client_identity, reply frames]
+        """
         self.router_socket = self.context.socket(zmq.ROUTER)
         # Raise error if the other side of the connection has dropped.
         self.router_socket.setsockopt(zmq.ROUTER_MANDATORY, 1)
@@ -204,6 +217,19 @@ class DataParallelInferenceCoordinator:
         self.identities_of_data_parallel_ranks = deque([])
         # time.sleep(5)  # Give data parallel ranks time to spawn and connect.
         for _ in range(data_parallel_size):
+            """
+            ZMQ identities for engines:
+            b"mp-coord-0"
+            b"mp-coord-1"
+            b"mp-coord-2"
+            b"mp-coord-3"
+            
+            for disaggregated, they look like:
+            b"prefill_s0_dp0"
+            b"prefill_s0_dp1"
+            b"decode_s1_dp0"
+            b"decode_s1_dp1"
+            """
             identity, _ = self.router_socket.recv_multipart()
             assert identity not in self.identities_of_data_parallel_ranks
             self.identities_of_data_parallel_ranks.append(identity)
@@ -386,11 +412,15 @@ class DataParallelInferenceCoordinator:
             True if the send succeeded, otherwise False.
         """
         try:
+            # Send the identity through the router socket.
             self.router_socket.send_multipart([identity, *frames])
             return True
         except zmq.error.ZMQError as e:
             if e.errno == zmq.EHOSTUNREACH:
                 if remove_unreachable:
+                    # De-register the engine, so the next call to this
+                    # send will no longer consider this engine, and
+                    # affinity scores will also be recomputed accordingly.
                     self._remove_engine(identity)
                 return False
             raise
@@ -464,6 +494,7 @@ class DataParallelInferenceCoordinator:
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
         """
+        # Computes (media_hit * media_hit_token_weight + prefix_match_depth) / (media_hit_token_weight + sequence_block_depth) - a * load for each DP rank to figure out which rank to route the request.
         return select_engine(
             self._identities_list,
             self._pending_counts,
@@ -503,6 +534,8 @@ class DataParallelInferenceCoordinator:
             return None
 
         # Compute text affinity.
+        # Prefix-match-depth, i.e. how many prefix blocks are already cached.
+        # The higher, the better.
         n_ranks = len(identities)
         prefix_blocks = np.zeros(n_ranks, dtype=np.float64)
         if use_prefix_affinity:
@@ -513,6 +546,12 @@ class DataParallelInferenceCoordinator:
                 ]
 
         # Compute multimodal affinity.
+        # Media hit multiplied by a configurable token-unit weight for whether an
+        # engine rank already has cached multimodal embeddings for this request.
+        # The higher the better.
+        # Can trade-off preprocessing + encoder cost vs. prefill cost, the former
+        # can be much more costly than the latter due to the encoder arch and
+        # the CPU-side image/video preprocessing latency.
         media_hit = np.zeros(n_ranks, dtype=np.float64)
         if use_media_affinity:
             media_identity = self._media_cache_affinity.get(media_cache_key)

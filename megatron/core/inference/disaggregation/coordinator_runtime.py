@@ -161,12 +161,14 @@ class DisaggCoordinatorRuntime:
 
     def _select_engine(self, role: str, request_id: int, block_hashes: list[int]):
         """Use shared affinity/load routing within one role's admission pool."""
+        # Prefill or decode load getter.
         load_for_role = (
             self.scheduler.prefill_load if role == PREFILL else self.scheduler.decode_load
         )
         loads = {
-            identity: load_for_role(identity)
+            identity: load_for_role(identity) # queues counts ssm_slot_usage
             for identity, engine_role in self.engine_role.items()
+            # Compute different affinity depending on the engine.
             if engine_role == role
         }
         if not loads:
@@ -174,18 +176,25 @@ class DisaggCoordinatorRuntime:
         coordinator = self.coordinator
         identities = sorted(loads, key=coordinator.identity_to_rank_index.__getitem__)
         counts = np.fromiter(
+            # queues + counts = total requests incoming = load
             (loads[engine][0] + loads[engine][1] for engine in identities), dtype=np.int64
         )
         identity = select_engine(
             identities,
             counts,
+            # TODO: needs media hash for media affinity
             affinity_scores=coordinator.get_routing_affinity(identities, counts, block_hashes),
             available_fractions=np.fromiter(
+                # Pass in the fraction of the engine that is available on load
+                # considering both request capacity and SSM slot capacity.
+                # Only used if affinity scores are None, which happens if you
+                # don't use prefix or media affinity.
                 (self.scheduler.available_fraction(engine, role) for engine in identities),
                 dtype=np.float64,
             ),
             routing_alpha=coordinator.prefix_caching_routing_alpha,
         )
+        # Assign the selected engine to this request.
         self.scheduler.assign_engine(role, request_id, identity)
         return identity
 
@@ -200,8 +209,10 @@ class DisaggCoordinatorRuntime:
         sampling_params: dict,
         block_hashes: list[int],
         offload_frame: bytes,
+        # TODO(@cspades): media frame as well
     ) -> None:
         """Reserve capacity and send a client request to a prefill instance."""
+        # Coordinator submission to prefill cluster for disagg.
 
         self.requests[request_id] = _RequestState(
             prompt_frame, sampling_params, block_hashes, offload_frame
@@ -217,13 +228,17 @@ class DisaggCoordinatorRuntime:
             )
             return
         try:
+            # Select the best prefill engine.
             prefill_id = self._select_engine(PREFILL, request_id, block_hashes)
         except RuntimeError as error:
             self.drop_request(request_id, f"cannot route to prefill: {error}", source_safe=True)
             return
 
+        # check engine ssm capacity
         capacity = self.scheduler.capacity(prefill_id)
+        # check engine prefill slot cost
         slot_cost = self.scheduler.prefill_slot_cost(prefill_id)
+        # if not slot_cost <= capacity then even a single request cannot fit
         if not self.scheduler.can_ever_fit(prefill_id, slot_cost):
             self.drop_request(
                 request_id,
@@ -232,11 +247,15 @@ class DisaggCoordinatorRuntime:
                 source_safe=True,
             )
             return
+        # if the engine has a nonempty prefill queue or we cannot immediately
+        # reserve slots for a prefill, then we add it to the queue in the back
         if self.scheduler.has_queued_prefill(prefill_id) or not self.scheduler.try_reserve_prefill(
             prefill_id, request_id, slot_cost
         ):
             self.scheduler.enqueue_prefill(prefill_id, request_id, slot_cost)
             return
+        # otherwise, the queue is empty and we have capacity to handle the request
+        # submit the prefill immediately
         self._submit_prefill(prefill_id, request_id)
 
     def _submit_prefill(self, prefill_id, request_id: int) -> None:

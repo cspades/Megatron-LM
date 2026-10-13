@@ -113,6 +113,28 @@ class MegatronAsyncLLM(_MegatronLLMBase):
             # here since single input is wrapped to a one-element list.
             return []
 
+        """
+        multi_modal_data supports both bytes and tensors such as:
+
+        # Image as raw bytes
+        {
+            "image": b"\x89PNG\r\n\x1a\n...",   # Path("cat.png").read_bytes()
+        }
+
+        # Video as preprocessed tensors (8 frames, 448x448, patch_dim=16)
+        {
+            "video": {
+                "imgs": torch.Tensor,           # shape [1, 6272, 768], float
+                "imgs_sizes": torch.Tensor,     # shape [8, 2], int32, each row [448, 448]
+                "num_frames": torch.Tensor,     # [8], int32
+                "video_frame_indices": [[0, 30, 60, 90, 120, 150, 180, 210]],
+                "video_fps": [30.0],
+            }
+        }
+
+        is_batch just means if the prompts are a batch of prompts like a list of strings,
+        or a single prompt such as a list of tokens.
+        """
         per_prompt_multi_modal_data = self._normalize_multi_modal_data_list(
             multi_modal_data, num_prompts=len(normalized), is_batch=is_batch
         )
@@ -185,9 +207,12 @@ class MegatronAsyncLLM(_MegatronLLMBase):
     async def serve(self, serve_config: ServeConfig, *, blocking: bool = True) -> None:
         """Start the OpenAI-compatible HTTP frontend.
 
-        Coordinator mode only. The HTTP frontend runs only on the primary
-        rank (global rank 0); other ranks no-op the HTTP setup but still
-        respect ``blocking`` (so all ranks return together).
+        Coordinator mode only. HTTP frontend replicas are spawned by global rank 0;
+        other distributed ranks do not spawn frontend processes.
+
+        Note(@cspades):
+        NeMo-RL calls start_text_gen_server() directly on a single model parallel
+        rank of each DP replica, so setting N replicas here will have DP x N frontends.
 
         With ``blocking=True`` (default), this awaits the engine loop until
         :meth:`shutdown` is called -- suitable for standalone serving scripts.
@@ -212,6 +237,9 @@ class MegatronAsyncLLM(_MegatronLLMBase):
                 start_text_gen_server,
             )
 
+            # Start text generation server which spawns multiple front-ends that serve
+            # completions, chat_completions, etc. Effectively the entrypoint for
+            # initializing the Megatron-Inference engine that is also used by Nemo-RL.
             assert self._coord_runtime is not None
             start_text_gen_server(
                 coordinator_addr=self._coord_runtime.coord_addr,

@@ -137,8 +137,11 @@ class DisaggCoordinatorScheduler:
         if identity in state.counts:
             raise ValueError(f"engine {identity!r} is already registered")
         entries = self._metadata_entries(instance_meta)
+        # Total SSM slot capacity
         capacity = self._capacity_from_entries(entries)
+        # Maximum concurrent request capacity
         request_capacity = self._request_capacity_from_entries(entries)
+        # SSM slots reserved per active prefill request: 0 for non-SSM, 1 for SSM
         prefill_slot_cost = (
             self._prefill_slot_cost_from_entries(entries) if role == PREFILL else None
         )
@@ -213,6 +216,7 @@ class DisaggCoordinatorScheduler:
 
     @staticmethod
     def _load(state: _RoleState, identity) -> tuple[int, int, int]:
+        # Return number of queues, counts, and SSM state slot usage.
         return (
             len(state.queues.get(identity, ())),
             state.counts.get(identity, 0),
@@ -234,6 +238,7 @@ class DisaggCoordinatorScheduler:
 
         state = self._state(role)
 
+        # concurrent request capacity
         request_capacity = self._request_capacity.get(identity)
         if request_capacity is None:
             return 0.0
@@ -241,15 +246,20 @@ class DisaggCoordinatorScheduler:
             max(
                 0.0,
                 request_capacity
+                # subtract the queued or in-flight requests
                 - state.counts.get(identity, 0)
                 - len(state.queues.get(identity, ())),
             )
             / request_capacity
         )
+        # ssm slot capacity
         state_capacity = self._capacity.get(identity)
         if state_capacity is None:
             return request_fraction
+        # subtract the state ssm slot usage
         state_fraction = max(0.0, state_capacity - state.usage.get(identity, 0)) / state_capacity
+        # consider both the request and ssm slot fraction and return the minimum
+        # for the available fractional bandwidth this engine can support
         return min(request_fraction, state_fraction)
 
     def prefill_slot_cost(self, identity) -> int:
@@ -266,11 +276,15 @@ class DisaggCoordinatorScheduler:
             )
         count = state.counts.get(identity, 0)
         if count >= self._request_capacity.get(identity, 0):
+            # current in-flight requests is at engine request cap
+            # cannot accept any more
             return False
         capacity = self._capacity.get(identity)
         usage = state.usage.get(identity, 0)
         if capacity is not None and usage + slot_cost > capacity:
+            # current slot usage + new slot cost exceeds capacity, reject
             return False
+        # update metrics
         state.usage[identity] = usage + slot_cost
         state.counts[identity] = count + 1
         state.reservations[request_id] = (identity, slot_cost)
