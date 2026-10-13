@@ -210,6 +210,8 @@ class KVBlockAllocator:
             return
 
         pool_returns, hashes_to_drop = self.pc_state.on_release_compute_pool_returns(blocks)
+        # Create a new free section of the pool with the about-to-be-unregistered blocks
+        # for future allocation use (by taking the block indices at the end of this bag).
         self._push_to_pool(pool_returns)
         if hashes_to_drop:
             self._notify_deregistered(pool_returns, hashes_to_drop)
@@ -223,6 +225,7 @@ class KVBlockAllocator:
         assert self.pc_state is not None, "retaining KV blocks requires prefix caching"
         if block_ids:
             blocks = torch.tensor(block_ids, dtype=torch.int32, device='cpu')
+            # Add a reference to each block ID by the number of times it appears in the list.
             self.pc_state.retain(blocks, self.context.prefix_cache_lru_clock)
 
     def reset(self) -> None:

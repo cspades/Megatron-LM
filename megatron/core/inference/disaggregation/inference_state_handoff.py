@@ -878,8 +878,10 @@ class InferenceStateHandoffMixin:
 
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
         hashes = compute_block_hashes_batched(
+            # Hand off the block hash salt as well, which will later have multimodal hashes as well.
             prompt_tensor, self.context.block_size_tokens, cache_salt=kv_meta.get("block_hash_salt")
         )
+        # Prompt KV Block Count (Prefill generated 1+D has not yet had its KV generated/cached yet.)
         num_blocks = transfer_block_count(kv_meta, src_block_ids)
         expected_blocks = (
             len(prompt) + self.context.block_size_tokens - 1
@@ -922,6 +924,7 @@ class InferenceStateHandoffMixin:
             )
             return future
 
+        # Try to launch the KV handoff and reshard.
         started = self._try_start_kv_handoff_import(handoff)
         if not started:
             self._deferred_kv_handoffs.append(handoff)
@@ -943,13 +946,19 @@ class InferenceStateHandoffMixin:
         if self.context.num_prefill_requests or self.context.chunked_prefill_request_id != -1:
             return False
         allocator = self.context.kv_block_allocator
+        # These blocks are already pulled and cached on the decode cluster.
         cached_blocks = self._find_cached_handoff_prefix(handoff.hashes, handoff.num_blocks)
-
+        # These are the rest needed for decode to run.
         hashes_to_import = handoff.hashes[len(cached_blocks) : handoff.num_blocks]
+        # Subtract cached blocks, we don't need to import them. These are all prompt tokens.
         num_blocks_to_import = handoff.num_blocks - len(cached_blocks)
         resume_tokens = handoff.resume_tokens
         resume_log_probs = handoff.resume_log_probs
         ssm_meta = handoff.kv_meta.get("ssm") if isinstance(handoff.kv_meta, dict) else None
+        # up to P + 2D (Prefill + D+1 + D-1) tokens to KV cache for the decode pass (which currently has no KV's cached yet)
+        # 1 committed token + up to D draft tokens to verify + D-1 more KV entries for the next draft of D tokens
+        # and we need KV cache blocks for all of these for the next decode of D+1 tokens
+        # continuation here is not including P, so just 2D
         continuation_block_count = (
             additional_decode_blocks(
                 len(handoff.prompt),
@@ -960,7 +969,9 @@ class InferenceStateHandoffMixin:
             if resume_tokens
             else 0
         )
+        # KV cache block allocator space
         if not self._handoff_capacity_available(
+            # Non-cached KV handoff + generated/drafted tokens KV (2D)
             num_blocks_to_import + continuation_block_count, cached_blocks
         ):
             return False
@@ -971,9 +982,12 @@ class InferenceStateHandoffMixin:
 
         retained_cached_blocks = False
         try:
+            # For cached blocks, increment reference count to each block ID.
             allocator.retain_memory_blocks(cached_blocks)
             retained_cached_blocks = True
+            # Allocate memory blocks for new KV cache slots.
             allocated_blocks_tensor = allocator.allocate_memory_blocks(
+                # (Prompt - Cached) + 2D (D+1 + D-1)
                 num_blocks_to_import + continuation_block_count
             )
             if allocated_blocks_tensor is None:

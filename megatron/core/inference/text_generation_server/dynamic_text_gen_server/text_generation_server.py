@@ -125,14 +125,17 @@ async def _run_text_gen_server(
 
         # Applying the chat template is synchronous and O(prompt); on the event loop it
         # stalls every other request this replica owns, including delivery of responses
-        # that already finished. One worker is enough - the point is the yield, not
-        # throughput. The copy is required: HF tokenizers are not thread-safe.
+        # that already finished. Thus, we need a separate executor for tokenization that
+        # run asynchronously and won't block the front-end event loop.
+        # One worker is enough - the point is the yield, not throughput.
+        # The copy is required: HF tokenizers are not thread-safe.
         app.config['tokenize_executor'] = ThreadPoolExecutor(
             max_workers=1, thread_name_prefix="tokenize"
         )
         app.config['tokenizer_copy'] = copy.deepcopy(tokenizer)
 
-        # Register all blueprints from the 'endpoints' package
+        # Register all blueprints from the 'endpoints' package:
+        # health, completions, chat_completions, profile, etc.
         for endpoint in endpoints.__all__:
             app.register_blueprint(endpoint)
 
@@ -144,6 +147,11 @@ async def _run_text_gen_server(
         )  # Allow many concurrent streams for HTTP/2 clients.
 
         # Held for this worker's lifetime; closing it would drop the listener.
+        # Every replica / socket binds to the same server port, but different
+        # sockets and thus accept queues make it so that connections to Gym
+        # and other user ports are hashed and distributed to each server replica
+        # approx. evenly, i.e. all connected ports will be evenly distributed
+        # to each socket / replica for port-based / connection-based load balancing.
         own_socket = _bind_reuseport_socket(server_port, bind_host)
         # Listen now so connections queue in the kernel from this point on;
         # hypercorn re-issues listen() on the fd when it starts accepting.
@@ -164,7 +172,9 @@ async def _run_text_gen_server(
             logger.info(f"Evaluation mode: {eval_mode}")
 
         try:
-            # Quart is natively ASGI, so we can serve the app directly
+            # Quart is natively ASGI, so we can serve the app directly.
+            # This will serve completions, chat_completions, etc.
+            # Look for the @bp.route flags for the app implementation.
             await serve(app, config)
         finally:
             own_socket.close()
@@ -331,6 +341,7 @@ def start_text_gen_server(
     replicas = []
     for i in range(num_replicas):
         ready_reader, ready_writer = mp.Pipe(duplex=False)
+        # Spawn, don't fork. Fork is unsafe in many frameworks.
         p = _SERVER_PROCESS_CONTEXT.Process(
             target=_server_process_worker,
             args=(

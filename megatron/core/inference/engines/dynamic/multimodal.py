@@ -28,6 +28,7 @@ _MULTIMODAL_STITCHING_FIELDS = {
         "a nonnegative integer counting the exact, already-expanded previous-turn tokens "
         "at the start of the prompt"
     ),
+    # NOTE(@cspades): THIS FIELD IS NO LONGER NECESSARY. THE ABOVE PREFIX LENGTH IS SUFFICIENT.
     PREFIX_MEDIA_COUNT_FIELD: (
         "a nonnegative integer counting logical image/video items in the previous prefix"
     ),
@@ -601,9 +602,12 @@ class MultimodalRequestMixin:
         """Prepare media tokens, run the vision encoder, register per-request
         media data on the context, and return a DynamicVLMInferenceRequest.
         """
+        # Unpack some multimodal prefix stitching args from offload params.
         prefix_stitching_metadata, offload_params = _take_expanded_prefix_stitching_metadata(
             offload_params
         )
+
+        # See if there's a multimodal cache hit using the media hash.
         cached_vision_entry = self._get_cached_vision_entry(media_cache_key)
         if cached_vision_entry is not None:
             modality = cached_vision_entry.modality
@@ -676,6 +680,8 @@ class MultimodalRequestMixin:
                 media_inputs["num_img_embeddings_per_tile"] = num_img_embeddings_per_tile
             media_cache_key = compute_media_cache_key(modality, media_inputs)
 
+        # Defer all image encode until before the prefill. Media tensors of the same type
+        # will be concatenated and encoded in a single forward pass of the encoder.
         device = torch.cuda.current_device()
         defer_image_encode = (
             imgs is not None
@@ -724,6 +730,7 @@ class MultimodalRequestMixin:
             # Compute input mask that provides multimodal embedding injection
             # guidelines for the inference wrapper decoder inputs.
             if media_tokens_preexpanded:
+                # Input text prompt already has expanded media placeholder tokens.
                 mask_tensor = inference_wrapper.build_preexpanded_media_token_mask(tokens, modality)
                 expected_embedding_count = int((mask_tensor >= 0).sum().item())
             else:
@@ -733,6 +740,7 @@ class MultimodalRequestMixin:
                 prefix_tokens = None
                 if prefix_stitching_metadata is not None:
                     # Split the exact, already-expanded prefix from the compact suffix.
+                    # Otherwise, all of the tokens are the suffix (first or only turn).
                     prefix_length = prefix_stitching_metadata[PREFIX_EXPANDED_TOKEN_COUNT_FIELD]
                     if prefix_length > len(tokens):
                         raise ValueError(
@@ -783,7 +791,7 @@ class MultimodalRequestMixin:
                             expansion_kwargs["tokenizer"] = self.controller.tokenizer
                             expansion_kwargs["video_frame_indices"] = expansion_video_frame_indices
                             expansion_kwargs["video_fps"] = expansion_video_fps
-                    # Expand and prompt-format multimodal placeholder tokens.
+                    # Expand and prompt-format multimodal placeholder (suffix) tokens.
                     expanded_tokens_list, mask_list = inference_wrapper.expand_image_tokens(
                         token_list, image_token_id=media_token_id, **expansion_kwargs
                     )

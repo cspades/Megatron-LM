@@ -680,6 +680,9 @@ class EngineLoopMixin:
         try:
             while True:
                 # Wait until there are active requests before proceeding.
+                # This condition variable is set by _notify_cond_for_new_request
+                # when the KV handoff for decode has started.
+                # This then waits for the handoff / import to finish.
                 async with self._cond:
                     await self._cond.wait_for(
                         lambda: (
@@ -727,9 +730,12 @@ class EngineLoopMixin:
 
         try:
             while True:
+                # Schedule requests for the engine by draining the publisher socket
+                # of work to do.
                 self.schedule_requests()
 
                 if self.state in (EngineState.RUNNING, EngineState.PAUSING):
+                    # checks for requests added to the waiting queue -> engine prefill or decode pass.
                     local_schedulable = (
                         self.context.get_active_request_count()
                         + len(self.waiting_request_ids)

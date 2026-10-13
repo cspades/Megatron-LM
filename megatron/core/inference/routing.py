@@ -26,6 +26,7 @@ def select_engine(
     if not identities:
         raise RuntimeError("No engines connected")
     if affinity_scores is None:
+        # only use available fractions if affinity scores are not provided.
         if available_fractions is None:
             return identities[int(np.argmin(loads))]
         scores = available_fractions

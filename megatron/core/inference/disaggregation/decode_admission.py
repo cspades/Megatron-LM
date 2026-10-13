@@ -14,11 +14,16 @@ def additional_decode_blocks(
 ) -> int:
     """Return blocks for verification and drafting beyond the imported prompt."""
 
+    # P (prompt) tokens all have KV blocks
     prompt_blocks = math.ceil(prompt_length / block_size)
+    # Need to prepare for up to 2D tokens, so lookahead is 2D - (D+1) = D - 1
+    # = (D+1) - 2 = input_toks - 2
     draft_lookahead = max(0, input_token_count - 2) if mtp_kv_cache else 0
+    # Number of blocks to hold P + 2D.
     blocks_after_input = math.ceil(
         (prompt_length + input_token_count + draft_lookahead) / block_size
     )
+    # Subtract prompt blocks.
     return blocks_after_input - prompt_blocks
 
 

@@ -398,6 +398,8 @@ async def run_completions(
                 ),
                 blocking=False,
             )
+            # Workers serve until the primary's shutdown, on leaving this block,
+            # stops every engine through the coordinator.
             dist.barrier(group=lifecycle_group)
             if llm.is_primary_rank:
                 response = await asyncio.to_thread(

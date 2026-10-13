@@ -358,9 +358,14 @@ def reply_prompt_length(result):
 
 def add_moe_routing_to_choice(choice_data, result, prompt_len):
     """Add MOE routing indices to a choice dict if present in the result."""
+    # Router replay data.
     if result["routing_indices"] is not None:
+        # Top K routing indices per token of shape:
+        # [total_tokens-1, num_moe_layers, topk]
+        # for all k expert assignments to all tokens across all MoE layers.
         choice_data["moe_topk_indices"] = result["routing_indices"]
         if prompt_len:
+            # Only the prompt token indices.
             choice_data["prompt_moe_topk_indices"] = result["routing_indices"][:prompt_len]
 
 
@@ -382,6 +387,7 @@ def build_response(response_uid, object_type, choices, usage, response_metadata)
     The OpenAI-shaped fields are reserved; a stager key colliding with one is a bug rather than
     something to overwrite silently.
     """
+    # Full OpenAI response JSON.
     response = {
         "id": response_uid,
         "object": object_type,

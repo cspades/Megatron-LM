@@ -220,7 +220,11 @@ class CoordinatorMixin:
 
         local_ip = hostname or socket.gethostname()
 
-        # Spawn a DP coordinator process and get the connection info.
+        # Spawn a DP coordinator process in charge of routing requests from all
+        # front-end inference clients and the MLLM control client to the engines.
+        # The inference_coordinator_port is used to communicate with it.
+        # ONLY the DP coordinator rank (DP TP PP rank 0, effectively global rank 0)
+        # initializes and starts the coordinator, other engine ranks just attach.
         if disagg_config is not None:
             spawn_coordinator = disagg_config.spawn_coordinator and self.is_mp_coordinator
         else:
@@ -263,6 +267,9 @@ class CoordinatorMixin:
                 },
             )
             self.inference_coordinator_process.start()
+
+            # Get the inference coordinator address from the initialized coordinator.
+            # Will be used to receive requests from the inference coordinator.
             await await_process_call(dp_pipe.poll, self.inference_coordinator_process)
             dp_addr = dp_pipe.recv()
             dp_pipe.close()
@@ -305,7 +312,16 @@ class CoordinatorMixin:
         torch.distributed.broadcast_object_list(bcast, src=mp_src, group=mp_group)
         [mp_req_addr] = bcast
 
+        # Engine identity for the coordinator to track and route to!
+        # Registered with the coordinator during initialization.
         identity = disagg_config.identity if disagg_config is not None else f'mp-coord-{dp_rank}'
+
+        # Only a single engine rank listens to the inference coordinator, and this
+        # rank will be responsible for broadcasting inference requests to all
+        # engine / model parallel ranks. This reduces the communication required
+        # between the inference router / coordinator and all the engines at scale.
+        # Even the inference clients also communicate prompts to the inference
+        # coordinator via the same port.
         if self.is_mp_coordinator:
             # 1. Create dealer sockets where tp_rank = 0 and pp_rank = 0
             #    These will receive requests from an InferenceCoordinator.
@@ -315,6 +331,7 @@ class CoordinatorMixin:
             self.socket_for_receiving_requests.connect(dp_addr)
 
             if disagg_config is not None:
+                # Disaggregated inference role registration.
                 self.socket_for_receiving_requests.send(
                     msgpack.packb(
                         [
@@ -346,7 +363,9 @@ class CoordinatorMixin:
                 self.socket_for_receiving_requests,
                 self.model_parallel_publisher_socket,
             ]
-        # All MP ranks subscribe to the publisher socket
+        # All MP ranks subscribe to the publisher socket to receive inference
+        # requests from the main engine rank after it receives a request from
+        # the inference coordinator.
         self.model_parallel_subscriber_socket = dp_replica_mp_request_broadcast.create_subscriber(
             self.zmq_context, mp_req_addr, mp_rank
         )
@@ -354,6 +373,9 @@ class CoordinatorMixin:
         self.zmq_sockets += [self.model_parallel_subscriber_socket]
 
         if self.is_mp_coordinator:
+            # Prevents torch dist hangs from subscribers not subscribing
+            # in time to the main MP coordinator before the main coordinator
+            # starts to send work to do, and hanging on the first MP collective.
             dp_replica_mp_request_broadcast.wait_for_subscribers(
                 self.model_parallel_publisher_socket, range(mp_size)
             )
@@ -716,6 +738,7 @@ class CoordinatorMixin:
 
         nvtx_range_push("drain_zmq_socket")
         all_messages = []
+        # MP coordinator receives requests via ZMQ from the inference coordinator.
         if self.is_mp_coordinator:
             # Locally-generated notifications are single-frame messages, so they
             # are wrapped to match the frame-list shape of socket traffic.
@@ -726,20 +749,25 @@ class CoordinatorMixin:
                         use_bin_type=True,
                     )
                 ]
+                # messages that have completed or failed the disagg handoff
                 for request_id, failed, source_safe in self._drain_handoff_completion_notifications()
             )
             while True:
                 try:
-                    # Receive messages in a non-blocking way.
+                    # Receive messages in a non-blocking way from the coordinator.
                     message = self.socket_for_receiving_requests.recv_multipart(flags=zmq.NOBLOCK)
                     all_messages.append(self._prepare_submit_request_message(message))
                 except zmq.Again:
                     # This exception is hit as soon as the socket is empty.
                     break
+            # After receiving requests from the coordinator, publish the work
+            # to all engine ranks.
             self.model_parallel_publisher_socket.send_multipart(
                 self._pack_tp_broadcast(all_messages)
             )
         else:
+            # Other MP ranks wait for the main MP rank to publish work for
+            # each model parallel engine rank to run across Torch Dist.
             all_messages = self._unpack_tp_broadcast(
                 self.model_parallel_subscriber_socket.recv_multipart()
             )
@@ -753,6 +781,7 @@ class CoordinatorMixin:
             data = msgpack.unpackb(message[0], raw=False)
             header = Headers(data[0])
             if header == Headers.SUBMIT_REQUEST:
+                # PREFILL HEADER
                 # Drop rather than raise: this loop runs on every MP rank over
                 # the same broadcast list, so a raise here takes the whole
                 # engine down for one version-skewed client, while `continue`
@@ -790,6 +819,7 @@ class CoordinatorMixin:
                         media_cache_key, media_modality
                     )
                     if cached_vision_entry is None:
+                        # Deserialize.
                         media_payload = msgpack.unpackb(message[2], raw=False)
                         multi_modal_data = merge_multimodal_data(media_meta, media_payload)
                     else:
@@ -799,6 +829,7 @@ class CoordinatorMixin:
                 finally:
                     nvtx_range_pop(nvtx_range)
                 if self._is_disaggregated_role("decode"):
+                    # decode needs SUBMIT_WITH_KV
                     self._notify_request_error(
                         request_id,
                         RuntimeError(
@@ -819,6 +850,7 @@ class CoordinatorMixin:
                     if cached_vision_entry is not None:
                         vlm_kwargs = {
                             "media_cache_key": media_cache_key,
+                            # if the tokens are preexpanded (direct engine generate call) or not
                             "media_tokens_preexpanded": bool(
                                 media_meta.get("media_tokens_preexpanded", False)
                             ),
@@ -835,6 +867,7 @@ class CoordinatorMixin:
                         )
                         nvtx_range_push(nvtx_range)
                         try:
+                            # Read and preprocess / deserialize media tensors for engine.
                             vlm_kwargs = resolve_multimodal_data_for_engine(
                                 multi_modal_data,
                                 image_preprocessing_config=(
@@ -873,6 +906,7 @@ class CoordinatorMixin:
                         msgpack.unpackb(message[3], raw=False) if len(message) > 3 else None
                     )
                     sampling_params = SamplingParams.deserialize(sampling_params)
+                    # Launch KV handoff and reshard and add the request for decode.
                     self.add_request_with_kv_handoff(
                         request_id,
                         prompt,
@@ -1045,9 +1079,13 @@ class CoordinatorMixin:
             if isinstance(prompt, torch.Tensor):
                 prompt = prompt.tolist()
             return [
+                # metadata
                 message[0],
+                # prompt
                 msgpack.packb(prompt, use_bin_type=True),
+                # media + media metadata
                 message[2],
+                # offload
                 msgpack.packb(offload_params, use_bin_type=True),
                 *message[4:],
             ]

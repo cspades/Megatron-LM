@@ -55,7 +55,24 @@ def _resolve_pixel_stats(vision_model_type: str):
 
 
 def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional[bytes]):
-    """Load frames and timing metadata from a configured frame-sequence manifest."""
+    """
+    Load frames and timing metadata from a configured frame-sequence manifest.
+    This allows for directories of video frames for video support.
+    If the payload isn't marked with the byte-prefix, then return None.
+    Otherwise, read each frame image and convert into tensors.
+
+    payload = b"<frame_manifest_magic>:" + json.dumps(manifest).encode("utf-8")
+    manifest = {
+        "frame_paths": [
+            "/data/video-frames/frame-0003.png",
+            "/data/video-frames/frame-0007.png",
+        ],
+        "metadata": {
+            "frames_indices": [3, 7],
+            "fps": 29.97,
+        },
+    }
+    """
     if not frame_manifest_magic or not payload.startswith(frame_manifest_magic):
         return None
 
@@ -95,6 +112,7 @@ def _load_frame_sequence_manifest(payload: bytes, frame_manifest_magic: Optional
     if fps <= 0:
         raise ValueError("Frame-sequence manifest metadata.fps must be positive.")
 
+    # Open each frame and convert into Tensors.
     frames = []
     for frame_path in frame_paths:
         resolved = Path(frame_path).expanduser().resolve()
@@ -472,9 +490,10 @@ def preprocess_video_bytes_list(
     def decode_frames(encoded_video):
         manifest_result = _load_frame_sequence_manifest(encoded_video, config.frame_manifest_magic)
         if manifest_result is not None:
+            # Input media is a directory of frames.
             frames, frame_indices, fps = manifest_result
             return frames, frame_indices, fps, True
-
+        # Input media are serialized tensors. Deserialize and sample.
         frames, frame_indices, fps = _decode_sampled_video_frames(encoded_video, config)
         return frames, frame_indices, fps, False
 

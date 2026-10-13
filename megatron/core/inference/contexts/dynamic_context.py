@@ -1244,6 +1244,8 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         if self.cache_mla_latent or len(block_ids) == 0:
             return
         block_ids = torch.as_tensor(block_ids, dtype=torch.int64, device=self.memory_buffer.device)
+        # [K_or_V, layer, block, token_offset, head, head_dim]
+        # value cache and then dim=1 -> blocks indices across all layers, offsets, heads, etc.
         self.memory_buffer[1].index_fill_(1, block_ids, 0)
 
     def _allocate_mamba_states(self):
