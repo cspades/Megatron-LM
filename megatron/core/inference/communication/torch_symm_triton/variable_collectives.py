@@ -8,6 +8,10 @@ a different number of tokens. The caller provides:
   - local_tokens: this rank's token count.
 
 One CTA processes one token; the outer loop is persistent over local_tokens.
+
+Do not autotune the number of blocks with Triton: every rank must launch the same
+grid of at most max_num_blocks blocks, or the barrier overflows the signal pad or
+hangs. See kernel_config.py.
 """
 
 from unittest.mock import MagicMock
@@ -33,6 +37,7 @@ except ImportError:
     _SymmetricMemory = MagicMock()
 
 from .barrier import symm_mem_sync
+from .kernel_config import SYMM_MEM_KERNEL_CONFIG
 from .multimem_asm import ld_64, ld_128, st_64, st_128
 from .utils import is_device_nvls_capable, sync_threads
 
@@ -121,7 +126,7 @@ def _multimem_all_gather_v_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 # Each 64-bit pack is exactly 1 uint64, so offsets index directly (no * 2 stride).
@@ -131,7 +136,7 @@ def _multimem_all_gather_v_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
     sync_threads()
@@ -238,9 +243,7 @@ def _multimem_reduce_scatter_v_kernel(
             )
             local_ptrs = local_ptr.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
 
-            (x, y, z, w) = ld_128(
-                multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32
-            )
+            x, y, z, w = ld_128(multicast_ptrs, mask=mask, multicast_op=True, reduce_f32=REDUCE_F32)
             st_128(local_ptrs, x, y, z, w, mask=mask, multicast_op=False)
 
 
@@ -312,9 +315,9 @@ def multimem_reduce_scatter_v(
         f"{row_bytes} bytes is not 16-byte aligned; RSV requires 128-bit alignment."
     )
 
-    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", 128)
-    MAX_BLOCK_SIZE = 1024
-    WARP_SIZE = 32
+    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
+    WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
 
     local_tokens = output_tensor.shape[0]
     numel_per_thread = 128 // (output_tensor.element_size() * 8)
@@ -323,6 +326,7 @@ def multimem_reduce_scatter_v(
     block_size = min(triton.next_power_of_2(numel_per_token), MAX_BLOCK_SIZE)
     num_warps = max(1, block_size // WARP_SIZE)
     num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     reduce_f32 = output_tensor.dtype == torch.float32
     _multimem_reduce_scatter_v_kernel[(num_blocks, 1, 1)](
@@ -439,7 +443,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr_0.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 multicast_ptrs = (
@@ -448,7 +452,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr_0.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
         # --- Tensor 1 ---
@@ -463,7 +467,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr_1.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 multicast_ptrs = (
@@ -472,7 +476,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr_1.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
         # --- Tensor 2 ---
@@ -487,7 +491,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets * 2
                 )
                 local_ptrs = local_ptr_2.to(tl.pointer_type(tl.uint64)) + local_offsets * 2
-                (x, y, z, w) = ld_128(local_ptrs, mask=mask, multicast_op=False)
+                x, y, z, w = ld_128(local_ptrs, mask=mask, multicast_op=False)
                 st_128(multicast_ptrs, x, y, z, w, mask=mask, multicast_op=True)
             else:
                 multicast_ptrs = (
@@ -496,7 +500,7 @@ def _multimem_all_gatherv_3tensor_kernel(
                     + global_offsets
                 )
                 local_ptrs = local_ptr_2.to(tl.pointer_type(tl.uint64)) + local_offsets
-                (x, y) = ld_64(local_ptrs, mask=mask)
+                x, y = ld_64(local_ptrs, mask=mask)
                 st_64(multicast_ptrs, x, y, mask=mask, multicast_op=True)
 
     sync_threads()
@@ -577,9 +581,9 @@ def multimem_all_gather_v(
     )
     bits = 128 if row_bytes % 16 == 0 else 64
 
-    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", 128)
-    MAX_BLOCK_SIZE = 1024
-    WARP_SIZE = 32
+    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
+    WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
 
     local_tokens = input_tensor.shape[0]
     numel_per_thread = bits // (input_tensor.element_size() * 8)
@@ -592,6 +596,7 @@ def multimem_all_gather_v(
     # All ranks launch the same fixed number of CTAs. CTAs with
     # pid >= ep_max_tokens exit immediately at kernel entry.
     num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     _multimem_all_gather_v_kernel[(num_blocks, 1, 1)](
         input_tensor.data_ptr(),
@@ -700,9 +705,9 @@ def multimem_all_gatherv_3tensor(
         symm_mem_hdl_0.world_size == symm_mem_hdl_1.world_size == symm_mem_hdl_2.world_size
     ), "All three symmetric memory handles must belong to the same EP group (world_size mismatch)."
 
-    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", 128)
-    MAX_BLOCK_SIZE = 1024
-    WARP_SIZE = 32
+    MAX_NUM_BLOCKS = kwargs.get("max_num_blocks", SYMM_MEM_KERNEL_CONFIG.max_num_blocks)
+    MAX_BLOCK_SIZE = SYMM_MEM_KERNEL_CONFIG.max_block_size
+    WARP_SIZE = SYMM_MEM_KERNEL_CONFIG.warp_size
 
     local_tokens = input_tensor_0.shape[0]
 
@@ -728,6 +733,7 @@ def multimem_all_gatherv_3tensor(
     block_size = max(block_size_0, block_size_1, block_size_2)
     num_warps = max(1, block_size // WARP_SIZE)
     num_blocks = min(per_rank_max_tokens, MAX_NUM_BLOCKS)
+    SYMM_MEM_KERNEL_CONFIG.check_num_blocks(num_blocks)
 
     _multimem_all_gatherv_3tensor_kernel[(num_blocks, 1, 1)](
         input_tensor_0.data_ptr(),
