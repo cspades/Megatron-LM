@@ -432,6 +432,29 @@ def _cuda_graph_mempool_bytes() -> Tuple[int, int]:
     return reserved, allocated
 
 
+def _slice_merged_segments(segments, attr: str, start: int, end: int) -> list:
+    """Slice `attr` over the concatenation of request checkpoint segments.
+
+    Equivalent to `merged[start:end]` where `merged` is the per-attribute
+    concatenation produced by `DynamicInferenceRequestRecord.merge()`, without
+    materializing the full merged list.
+    """
+    if len(segments) == 1:
+        return list((getattr(segments[0], attr, None) or [])[start:end])
+    out = []
+    offset = 0
+    for segment in segments:
+        values = getattr(segment, attr, None) or []
+        seg_start = max(start - offset, 0)
+        seg_end = min(end - offset, len(values))
+        if seg_start < seg_end:
+            out.extend(values[seg_start:seg_end])
+        offset += len(values)
+        if offset >= end:
+            break
+    return out
+
+
 @dataclass(kw_only=True)
 class RequestEntry:
     """Entry in the engine's `self.requests` dict."""
@@ -4057,16 +4080,26 @@ class DynamicInferenceEngine(AbstractEngine):
         return result, context_state, step_time
 
     def _try_send_streaming_partials(self) -> None:
-        """Send pending token deltas to the inference coordinator."""
+        """Send pending token deltas to the inference coordinator.
+
+        Stream offsets (`_partial_emit_lengths`) are indexed in the coordinates
+        of `record.merge()`, i.e. across all checkpoint segments of a request.
+        When a request is evicted or recomputed after a suspend,
+        `DynamicInferenceRequestRecord.checkpoint()` appends a new segment whose
+        prompt includes the earlier generations and whose `generated_tokens`
+        restart at 0, so the latest segment alone cannot be indexed by the
+        stream offset.
+        """
         partials: list = []
         emit_lengths: Dict[int, int] = {}
         for rid, entry in self.requests.items():
-            request = entry.record[-1]
-            prompt_request = entry.record[0]
+            segments = list(entry.record)
+            request = segments[-1]
+            prompt_request = segments[0]
             if not getattr(request.sampling_params, "streaming", False):
                 continue
             already = self._partial_emit_lengths.get(rid, 0)
-            total = len(request.generated_tokens)
+            total = sum(len(segment.generated_tokens) for segment in segments)
             stop_word_ids = getattr(request, "stop_word_ids", None)
             holdback = 0
             if stop_word_ids and not getattr(
@@ -4083,14 +4116,14 @@ class DynamicInferenceEngine(AbstractEngine):
                     and entry.prompt_logprobs_complete
                 ):
                     self._materialize_prompt_logprob_sidecars(entry, retain_state=True)
-                new_tokens = list(request.generated_tokens[already:emit_end])
+                new_tokens = _slice_merged_segments(segments, "generated_tokens", already, emit_end)
                 partial = {"request_id": rid, "new_tokens": new_tokens}
                 if request.sampling_params.return_log_probs:
-                    partial["new_log_probs"] = list(
-                        (request.generated_log_probs or [])[already:emit_end]
+                    partial["new_log_probs"] = _slice_merged_segments(
+                        segments, "generated_log_probs", already, emit_end
                     )
-                    partial["new_top_n_logprobs"] = list(
-                        (getattr(request, "generated_top_n_logprobs", None) or [])[already:]
+                    partial["new_top_n_logprobs"] = _slice_merged_segments(
+                        segments, "generated_top_n_logprobs", already, emit_end
                     )
                     if already == 0 and not prompt_request.sampling_params.skip_prompt_log_probs:
                         partial["prompt_log_probs"] = list(
