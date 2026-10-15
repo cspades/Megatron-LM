@@ -2918,6 +2918,10 @@ class DynamicInferenceEngine(AbstractEngine):
                             request_log_probs = request_log_probs[:-num_dropped]
                         if top_n_logprobs is not None and req_idx in top_n_logprobs:
                             top_n_logprobs[req_idx] = top_n_logprobs[req_idx][:-num_dropped]
+                if eos_mid_block_hit:
+                    eos_mid_block_hit = bool(tokens) and tokens[-1] in self._terminating_token_ids(
+                        request
+                    )
                 if request_id not in self.stop_word_being_finished_ids:
                     is_first_token = len(request.generated_tokens) == 0
                     request.generated_tokens += tokens
@@ -3022,8 +3026,14 @@ class DynamicInferenceEngine(AbstractEngine):
                         accepted_t != -1
                     ).long()
 
+                if (
+                    stop_word_hit or eos_mid_block_hit
+                ) and not request.sampling_params.do_kv_handoff:
+                    request.finish_reason = "stop"
+
                 request_finished = request_id in finished_request_ids
                 if request_finished:
+                    self._set_finish_reason(request)
                     # Reconstruct routing from per-block storage before popping.
                     if finished_routing_block_ids and request_id in finished_routing_block_ids:
                         block_ids = finished_routing_block_ids[request_id]
@@ -3255,6 +3265,16 @@ class DynamicInferenceEngine(AbstractEngine):
         # Clear the IDs that we're returning (they'll be marked as finished)
         self.stop_word_finished_request_ids -= result
         return result
+
+    def _set_finish_reason(self, request: DynamicInferenceRequest) -> None:
+        """Record final termination semantics without re-inferring them in clients."""
+        if request.finish_reason is not None or request.sampling_params.do_kv_handoff:
+            return
+        is_stop = request.request_id in self.stop_word_being_finished_ids or (
+            bool(request.generated_tokens)
+            and request.generated_tokens[-1] in self._terminating_token_ids(request)
+        )
+        request.finish_reason = "stop" if is_stop else "length"
 
     def _terminating_token_ids(self, request: DynamicInferenceRequest) -> frozenset:
         """Token ids that end generation for this request.
