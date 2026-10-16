@@ -1,15 +1,23 @@
 # Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Unit tests for stop word functionality in dynamic inference."""
+"""Unit tests for stop words and dynamic inference finish metadata."""
 
+import asyncio
 from dataclasses import dataclass, field
 from types import SimpleNamespace
 from typing import List, Optional
+from unittest import mock
 from unittest.mock import MagicMock, patch
 
 import pytest
+import torch
 
-from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine
+from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, RequestEntry
+from megatron.core.inference.inference_request import (
+    DynamicInferenceRequest,
+    DynamicInferenceRequestRecord,
+    Status,
+)
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
@@ -552,6 +560,148 @@ class TestMidSpeculativeBlockEos:
         engine._truncate_at_mid_block_eos(self._request(), [50, 2, 52], None, top_n, 1)
         assert top_n[0] == ["a", "b", "c"]
         assert top_n[1] == ["x", "y"]
+
+
+def _stop_metadata_engine():
+    controller = TextGenerationController.__new__(TextGenerationController)
+    controller.extra_eos_token_id_set = controller._build_extra_eos_token_id_set(
+        SimpleNamespace(eod=11, generation_config={"eos_token_id": [2, 11]})
+    )
+    engine = DynamicInferenceEngine.__new__(DynamicInferenceEngine)
+    engine.controller = controller
+    engine.stop_word_being_finished_ids = set()
+    return engine
+
+
+def _stop_metadata_request(tokens, termination_id=11):
+    return DynamicInferenceRequest(
+        request_id=0,
+        prompt="prompt",
+        prompt_tokens=torch.tensor([8]),
+        generated_tokens=tokens,
+        generated_log_probs=[-1.0] * len(tokens),
+        sampling_params=SamplingParams(termination_id=termination_id, num_tokens_to_generate=3),
+        status=Status.COMPLETED,
+    )
+
+
+@pytest.mark.parametrize(
+    "tokens,termination_id,expected",
+    [
+        ([4, 5, 6], 11, "length"),
+        ([4, 5, 11], 11, "stop"),
+        ([4, 5, 2], 11, "stop"),
+        ([4, 5, 2], -1, "length"),
+        ([], 11, "length"),
+    ],
+)
+def test_finish_reason_and_serialization(tokens, termination_id, expected):
+    request = _stop_metadata_request(tokens, termination_id)
+    _stop_metadata_engine()._set_finish_reason(request)
+    assert request.finish_reason == expected
+    restored = DynamicInferenceRequest.deserialize(request.serialize())
+    assert restored.finish_reason == expected
+    merged = DynamicInferenceRequestRecord.from_request(request).merge()
+    assert merged.finish_reason == expected
+
+
+def test_stripped_string_stop_reason_is_preserved():
+    request = _stop_metadata_request([4, 5, 6])
+    request.finish_reason = "stop"
+    _stop_metadata_engine()._set_finish_reason(request)
+    assert request.finish_reason == "stop"
+
+
+@pytest.mark.parametrize(
+    "tokens,budget,expected,kept,resume",
+    [
+        pytest.param([11], 1, "stop", [11], False, id="eod-at-length-boundary"),
+        pytest.param([2], 1, "stop", [2], False, id="generation-eos-at-length-boundary"),
+        pytest.param([5], 1, "length", [5], False, id="length"),
+        pytest.param([5, 2, 9], 3, "stop", [5, 2], False, id="speculative-mid-block-eos"),
+        pytest.param([5, 9, 2], 2, "length", [5, 9], False, id="length-before-speculative-eos"),
+        pytest.param([5, 2, 9], 4, "stop", [5, 2], False, id="deferred-speculative-eos"),
+        pytest.param([8], 3, "stop", [], False, id="deferred-stop-word"),
+        pytest.param([8], 3, "stop", [], True, id="checkpointed-stop-word"),
+        pytest.param([2], 1, None, [2], False, id="handoff-eos"),
+        pytest.param([8], 1, None, [], False, id="handoff-stripped-stop"),
+    ],
+)
+def test_postprocess_completion_and_deferred_stop(tokens, budget, expected, kept, resume):
+    async def run():
+        engine = _stop_metadata_engine()
+        engine.finished_request_count = 0
+        engine.evicted_request_count = 0
+        engine.track_generated_token_events = False
+        engine.num_speculative_tokens = len(tokens) - 1
+        engine._spec_steps = 0
+        engine.stop_word_finished_request_ids = set()
+        engine.context = SimpleNamespace(
+            kv_block_allocator=object(),
+            remove_vlm_request_data=lambda _: None,
+            chunked_prefill_request_id=-1,
+        )
+        request = _stop_metadata_request([])
+        request.stop_word_ids = [[8]]
+        if expected is None:
+            request.sampling_params.do_kv_handoff = True
+            engine._prepare_handoff_metadata_batch = mock.Mock(return_value={})
+            engine._capture_handoff_meta = mock.Mock()
+        request.status = Status.ACTIVE_AND_GENERATING_TOKENS
+        request.sampling_params.num_tokens_to_generate = budget
+        request.sampling_params.return_log_probs = True
+        request.sampling_params.skip_prompt_log_probs = False
+        request.add_event_add_engine()
+        future = asyncio.get_running_loop().create_future()
+        engine.requests = {
+            0: RequestEntry(
+                record=DynamicInferenceRequestRecord.from_request(request), future=future
+            )
+        }
+        # The controller finishes on the step's last token (model EOS) or the budget;
+        # stop words and mid-block EOS are found by the engine and finish next step.
+        finished = [0] if len(tokens) >= budget or tokens[-1] in [2, 11] else []
+        active, completed = engine.post_process_requests(
+            request_ids=torch.tensor([0]),
+            finished_request_ids=torch.tensor(finished),
+            evict_request_ids=None,
+            step_time=0.0,
+            sample=torch.tensor([tokens[-1]]),
+            accepted_tokens=torch.tensor([tokens[:-1]]) if len(tokens) > 1 else None,
+            log_probs=[[-1.0] * len(tokens)],
+            consumed_chunked_prefill_request_id=-1,
+        )
+        if active:
+            assert not future.done()
+            if resume:
+                # Eviction and recompute-suspend both checkpoint before re-admission.
+                engine.requests[0].record.checkpoint()
+                assert engine.get_request(0).generated_tokens == []
+                assert engine.get_request(0).finish_reason is None
+            assert engine._get_and_clear_stop_word_finished_ids(active) == {0}
+            # A speculative next step must not append its tokens or overwrite stop.
+            engine.num_speculative_tokens = 0
+            active, completed = engine.post_process_requests(
+                request_ids=torch.tensor([0]),
+                finished_request_ids=torch.tensor([0]),
+                evict_request_ids=None,
+                step_time=0.0,
+                sample=torch.tensor([9]),
+                accepted_tokens=None,
+                log_probs=[[-2.0]],
+                consumed_chunked_prefill_request_id=-1,
+            )
+        assert not active
+        assert len(completed) == 1
+        actual = future.result()
+        assert actual is completed[0]
+        assert actual.finish_reason == expected
+        assert actual.generated_tokens == kept
+        assert actual.generated_log_probs == [-1.0] * len(kept)
+        assert actual.generated_length == len(kept)
+        assert not engine.requests
+
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

@@ -443,3 +443,26 @@ async def test_completions_streaming_echoes_each_prompt_first(monkeypatch):
         for choice in payload["choices"]:
             texts[choice["index"]].append(choice["text"])
     assert texts == {0: ["a", "<12><13>", ""], 1: ["b", "<12><13>", ""]}
+
+
+@pytest.mark.asyncio
+@PATHS
+@pytest.mark.parametrize("payload_offloaded", [False, True])
+@pytest.mark.parametrize("reason", ["stop", "length"])
+async def test_engine_finish_reason_wins_at_token_budget(path, payload_offloaded, reason):
+    result = completed_reply(
+        "boundary",
+        [10, 11],
+        [12, 2],
+        finish_reason=reason,
+        sampling_params={"num_tokens_to_generate": 2},
+        payload_offloaded=payload_offloaded,
+    )
+    response = (
+        await build_app(path, ReplyingClient([result]))
+        .test_client()
+        .post(path, json={**BODIES[path], "max_tokens": 2})
+    )
+    assert response.status_code == 200, await response.get_data(as_text=True)
+    payload = await response.get_json()
+    assert payload["choices"][0]["finish_reason"] == reason

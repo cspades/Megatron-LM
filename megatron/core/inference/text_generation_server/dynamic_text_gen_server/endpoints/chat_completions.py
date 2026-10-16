@@ -46,6 +46,7 @@ from .common import (
     attach_stage_metadata,
     collect_stage_metadata,
     generation_config_sampling_defaults,
+    generation_finish_reason,
     log_sampling_defaults_once,
     resolve_sampling_default,
     validate_offload_params,
@@ -1225,6 +1226,9 @@ try:
                 top_n_logprobs=top_n_logprobs,
                 num_tokens_to_generate=(int(max_tokens) if max_tokens is not None else None),
                 stop_words=stop,
+                detokenize_stop_sequence=bool(
+                    _get_non_none(req, "include_stop_str_in_output", False)
+                ),
                 skip_prompt_log_probs=skip_prompt_log_probs,
                 add_BOS=add_BOS,
                 termination_id=-1 if ignore_eos else None,
@@ -1510,25 +1514,23 @@ try:
 
             if return_tokenized_data and not payload_offloaded:
                 # Wire contract matches vLLM: prompt_token_ids are model-input tokens
-                # (post vision/video expansion).
+                # (post vision/video expansion). The generation log probs travel with the ids as
+                # one bundle: clients such as NeMo Gym reject a message carrying only part of
+                # it, and a request that asked for no token data gets none. Per-token log probs
+                # for such a request are in the OpenAI `logprobs` block when it asks for them.
                 message["prompt_token_ids"] = result["prompt_tokens"]
                 message["generation_token_ids"] = result["generated_tokens"]
+                message["generation_log_probs"] = result.get("generated_log_probs", [])
             if return_raw_text and not payload_offloaded:
                 prompt_str = tokenizer.detokenize(result["prompt_tokens"])
                 message["raw_text"] = prompt_str + text_output
-            if not payload_offloaded:
-                # Small RL/debug scalars (a few bytes each); harmless to keep for compatibility.
-                message["generation_log_probs"] = result.get("generated_log_probs", [])
             return_log_probs = sampling_params.return_log_probs
 
             # Determine finish_reason following vLLM conventions:
             # - "tool_calls" for auto or required tool choice when tools are called
             # - "stop" for named tool choice (even when tools are called)
             # - "length" when max tokens is reached
-            if (
-                len(result["generated_tokens"])
-                >= result["sampling_params"]["num_tokens_to_generate"]
-            ):
+            if generation_finish_reason(result) == "length":
                 finish_reason = "length"
             elif normalized_tool_calls and not is_named_tool_choice:
                 finish_reason = "tool_calls"

@@ -200,13 +200,18 @@ def test_causal_conv1d_update_spec_decode_replays():
     )
 
 
-def test_causal_conv1d_varlen_replays():
+@pytest.mark.parametrize("strided", [False, True], ids=["dense", "strided"])
+def test_causal_conv1d_varlen_replays(strided):
+    """``strided`` reads ``x`` as a channel slice of a wider projection, as prefill does."""
     from megatron.core.ssm.ops.common.causal_conv1d_varlen import causal_conv1d_varlen_fn
 
     seeded()
     dim, width = 2048, 4
     bounds = [0, 1000, 1500, 2048, 4096, 8192]
-    x = torch.randn(bounds[-1], dim, device="cuda", dtype=torch.bfloat16)
+    if strided:
+        x = torch.randn(bounds[-1], dim + 384, device="cuda", dtype=torch.bfloat16)[:, 256:-128]
+    else:
+        x = torch.randn(bounds[-1], dim, device="cuda", dtype=torch.bfloat16)
     weight = torch.randn(dim, width, device="cuda", dtype=torch.bfloat16)
     bias = torch.randn(dim, device="cuda", dtype=torch.bfloat16)
     cu_seqlens = torch.tensor(bounds, dtype=torch.int32, device="cuda")
@@ -313,7 +318,9 @@ def test_fused_recurrent_gated_delta_rule_update_replays():
     )
 
 
-def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
+@pytest.mark.parametrize("M", [2, 3])
+@pytest.mark.parametrize("compact_output", [False, True])
+def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays(M, compact_output):
     """Speculative decode: ``S`` draft tokens of ``M`` Householder steps each.
 
     Exercises the slot-indexed state cache and ``intermediate_states``, which the
@@ -324,7 +331,7 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
     from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
-    B, S, M, H, K, V = 64, 4, 2, 8, 128, 128
+    B, S, H, K, V = 64, 4, 8, 128, 128
     T = S * M
     slots = B + 8
     q = torch.randn(B, T, H, K, device="cuda", dtype=torch.bfloat16)
@@ -351,6 +358,7 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
             state_indices=state_indices,
             intermediate_states=intermediate,
             steps_per_token=M,
+            compact_output=compact_output,
         )
         return o, final_state, intermediate
 
@@ -360,17 +368,66 @@ def test_fused_recurrent_gated_delta_rule_update_spec_decode_replays():
         replays=4,
         backward=False,
         contention=True,
-        what="fused_recurrent_gated_delta_rule_update (speculative decode)",
+        what=f"fused_recurrent_gated_delta_rule_update (speculative decode, compact={compact_output})",
     )
 
 
-@pytest.mark.parametrize("S", [1, 4])
-def test_gdp_decode_prepare_replays(S):
-    """``S`` is one plus the speculative draft length; ``S == 1`` is plain decode."""
-    from megatron.core.ssm.ops.gdp.decode_prepare import gdp_decode_prepare
+def test_fused_recurrent_gated_delta_rule_update_padding_replays():
+    """Single-token decode whose ``-1`` padding rows hold NaN/Inf inputs.
+
+    The kernel zeroes padding rows in its output store, so they must come out as ``+0.0``
+    bytes on every replay while real rows and the slot-indexed state cache replay exactly.
+    """
+    from megatron.core.ssm.ops.gdp.fused_recurrent import fused_recurrent_gated_delta_rule_update
 
     seeded()
-    n, M, H, G, P, N = 256, 2, 16, 4, 128, 128
+    B, H, K, V = 128, 16, 128, 128
+    slots = B + 8
+    q = torch.randn(B, 1, H, K, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(B, 1, H, K, device="cuda", dtype=torch.bfloat16)
+    v = torch.randn(B, 1, H, V, device="cuda", dtype=torch.bfloat16)
+    g = -torch.rand(B, 1, H, device="cuda") * 0.1
+    beta = torch.rand(B, 1, H, device="cuda", dtype=torch.bfloat16)
+    state = torch.randn(slots, H, K, V, device="cuda")
+    state_indices = torch.randperm(slots, device="cuda")[:B].to(torch.int32)
+    state_indices[::16] = -1
+    padding = state_indices < 0
+    q[padding] = float("nan")
+    v[padding] = float("inf")
+
+    def fn(q, k, v, g, beta, state, state_indices):
+        return fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            g=g,
+            beta=beta,
+            use_qk_l2norm_in_kernel=True,
+            state=state,
+            state_indices=state_indices,
+        )
+
+    ref_out, _ = assert_replays_bit_exact(
+        fn,
+        (q, k, v, g, beta, state, state_indices),
+        replays=4,
+        backward=False,
+        contention=True,
+        what="fused_recurrent_gated_delta_rule_update (padding rows)",
+    )
+    padded_out = ref_out["out[0]"][padding]
+    assert torch.equal(padded_out, torch.zeros_like(padded_out))
+    assert not torch.signbit(padded_out).any()
+
+
+@pytest.mark.parametrize("S", [1, 4])
+@pytest.mark.parametrize("M", [1, 2, 3])
+def test_gdp_decode_prepare_replays(S, M):
+    """Replay all copy-index paths in plain and speculative decode."""
+    from megatron.core.ssm.ops.gdp.prepare import gdp_decode_prepare
+
+    seeded()
+    n, H, G, P, N = 256, 16, 4, 128, 128
     x = torch.randn(n, S, M * H * P + M * G * N + G * N, device="cuda", dtype=torch.bfloat16)
     # `ba` reaches the kernel as a slice of the input projection, so only its last
     # dimension is contiguous and the token stride comes from the view, not the width.
@@ -382,7 +439,29 @@ def test_gdp_decode_prepare_replays(S):
         (x, ba, A_log, dt_bias),
         replays=4,
         backward=False,
-        what=f"gdp_decode_prepare (S={S})",
+        what=f"gdp_decode_prepare (S={S}, M={M})",
+    )
+
+
+@pytest.mark.parametrize("T", [1, 4096])
+def test_gdp_prefill_prepare_replays(T):
+    """``T`` is the packed token count of a prefill step."""
+    from megatron.core.ssm.ops.gdp.prepare import gdp_prefill_prepare
+
+    seeded()
+    M, H, G, P, N = 3, 12, 12, 64, 128
+    x = torch.randn(1, T, M * H * P + M * G * N + G * N, device="cuda", dtype=torch.bfloat16)
+    # `ba` reaches the kernel as a slice of the input projection, so only its last
+    # dimension is contiguous and the token stride comes from the view, not the width.
+    ba = torch.randn(1, T, 2 * (M * H + H), device="cuda", dtype=torch.bfloat16)[..., : M * H + H]
+    A_log = torch.randn(H, device="cuda")
+    dt_bias = torch.randn(H, device="cuda")
+    assert_replays_bit_exact(
+        lambda x, ba, A_log, dt_bias: gdp_prefill_prepare(x, ba, A_log, dt_bias, M, H, G, P, N),
+        (x, ba, A_log, dt_bias),
+        replays=4,
+        backward=False,
+        what=f"gdp_prefill_prepare (T={T})",
     )
 
 

@@ -211,7 +211,11 @@ class _FakeSSM(SSMDynamicInferenceMixin):
         intermediate_ssm_state=None,
     ):
         self.decode_inputs.append((zxBCdt.clone(), batch_indices.clone()))
-        return zxBCdt[..., :2]
+        output = zxBCdt[..., :2]
+        if zxBCdt.shape[1] > 1:
+            # Shared inference must also handle a noncontiguous mixer output.
+            output = output.transpose(0, 1).contiguous().transpose(0, 1)
+        return output
 
     def out_proj(self, y):
         return y, None
@@ -590,7 +594,76 @@ class TestGDPSpeculativeDecode:
     # ------------------------------------------------------------------
 
     @torch.inference_mode()
-    @pytest.mark.parametrize("num_speculative_tokens", [1, 2, 4])
+    @pytest.mark.parametrize("seq_len", [2, 3, 4])
+    def test_real_mixer_speculative_forward_matches_decode_oracle(self, seq_len):
+        """The complete dynamic mixer preserves token order and padded rows."""
+        indices = torch.tensor([4, -1, 2], device="cuda", dtype=torch.int32)
+        torch.manual_seed(20260929 + seq_len)
+        hidden = torch.randn(
+            self._BATCH * seq_len,
+            1,
+            self.mixer.config.hidden_size,
+            device="cuda",
+            dtype=self.mixer.config.params_dtype,
+        )
+        # Padding inputs are intentionally nonzero. The decode path must zero
+        # their recurrent output before the output projection sees them.
+        hidden[seq_len : 2 * seq_len] = 3.0
+        conv_cache, ssm_cache = self._caches(seed=seq_len)
+        actual_conv, actual_ssm = conv_cache.clone(), ssm_cache.clone()
+        actual_snapshots = self._snapshot_buffers(seq_len, fill=0.0)
+
+        class Context:
+            num_speculative_tokens = seq_len - 1
+            batch_invariant_mode = False
+            padded_batch_dimensions = InferenceBatchDimensions(
+                token_count=self._BATCH * seq_len, decode_req_count=self._BATCH, prefill_req_count=0
+            )
+            mamba_metadata = types.SimpleNamespace(batch_indices_decode=indices)
+            padding_slice = slice(self._BATCH * seq_len, self._BATCH * seq_len)
+
+            def is_dynamic_batching(self):
+                return True
+
+            def mamba_states_cache(self, layer, intermediate=False):
+                assert layer == self_mixer.layer_number - self_mixer.pp_layer_offset
+                return actual_snapshots if intermediate else (actual_conv, actual_ssm)
+
+        self_mixer = self.mixer
+        projected_for_output = []
+        hook = self.mixer.out_proj.register_forward_pre_hook(
+            lambda _module, args: projected_for_output.append(args[0].detach().clone())
+        )
+        try:
+            actual, actual_bias = self.mixer(hidden, inference_context=Context())
+        finally:
+            hook.remove()
+        assert len(projected_for_output) == 1
+        assert torch.count_nonzero(projected_for_output[0][seq_len : 2 * seq_len]) == 0
+
+        projected, _ = self.mixer.in_proj(hidden)
+        ref_conv, ref_ssm = conv_cache.clone(), ssm_cache.clone()
+        ref_snapshots = self._snapshot_buffers(seq_len, fill=0.0)
+        decoded = self.mixer.ssm_decode(
+            projected.reshape(self._BATCH, seq_len, -1),
+            ref_conv,
+            ref_ssm,
+            batch_indices=indices,
+            intermediate_conv_state=ref_snapshots[0],
+            intermediate_ssm_state=ref_snapshots[1],
+        )
+        assert torch.count_nonzero(decoded[1]) == 0
+        expected, expected_bias = self.mixer.out_proj(decoded.reshape(self._BATCH * seq_len, 1, -1))
+        assert torch.equal(actual, expected)
+        if actual_bias is None:
+            assert expected_bias is None
+        else:
+            assert torch.equal(actual_bias, expected_bias)
+        assert torch.equal(actual_conv, ref_conv)
+        assert torch.equal(actual_ssm, ref_ssm)
+
+    @torch.inference_mode()
+    @pytest.mark.parametrize("num_speculative_tokens", [1, 2, 3, 4])
     def test_snapshots_match_truncated_decode_steps(self, num_speculative_tokens):
         """Snapshot `i` is the state a step that stopped at draft token `i` leaves."""
         seq_len = 1 + num_speculative_tokens
@@ -601,7 +674,7 @@ class TestGDPSpeculativeDecode:
         conv_cache, ssm_cache = self._caches()
         int_conv, int_ssm = self._snapshot_buffers(seq_len)
 
-        self.mixer.ssm_decode(
+        full_out = self.mixer.ssm_decode(
             projected,
             conv_cache.clone(),
             ssm_cache.clone(),
@@ -613,9 +686,10 @@ class TestGDPSpeculativeDecode:
         slots = indices.long()
         for accepted in range(seq_len):
             ref_conv, ref_ssm = conv_cache.clone(), ssm_cache.clone()
-            self.mixer.ssm_decode(
+            truncated_out = self.mixer.ssm_decode(
                 projected[:, : accepted + 1].contiguous(), ref_conv, ref_ssm, batch_indices=indices
             )
+            assert torch.equal(full_out[:, accepted], truncated_out[:, -1])
             assert torch.equal(int_conv[slots, accepted], ref_conv[slots]), (
                 f"conv snapshot for draft token {accepted} does not match a decode step "
                 "that stopped there"
@@ -1267,6 +1341,106 @@ class TestFusedRecurrentGatedDeltaRuleUpdate:
         torch.testing.assert_close(out_padded[:real], out_real, atol=0, rtol=0, equal_nan=True)
         torch.testing.assert_close(state_padded, state_real, atol=0, rtol=0, equal_nan=True)
 
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+    @pytest.mark.parametrize("headwise_beta", [True, False])
+    def test_nonfinite_padding_rows_store_positive_zero(self, dtype, headwise_beta):
+        """Padding rows store +0.0 even when their stale inputs are NaN or inf."""
+        q, k, v, g, beta, state = _random_inputs(**self.SHAPE, dtype=dtype)
+        if not headwise_beta:
+            beta = torch.rand_like(v).sigmoid()
+        indices = torch.tensor([7, -1, 3, 10, -1, 5], device="cuda", dtype=torch.int32)
+        q[1] = float("nan")
+        v[4] = float("inf")
+        state_before = state.clone()
+
+        out, _ = fused_recurrent_gated_delta_rule_update(
+            q,
+            k,
+            v,
+            state=state,
+            g=g,
+            beta=beta,
+            state_indices=indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+
+        real = indices >= 0
+        assert torch.count_nonzero(out[~real].view(torch.uint8)) == 0
+        state_real = state_before.clone()
+        out_real, _ = fused_recurrent_gated_delta_rule_update(
+            q[real],
+            k[real],
+            v[real],
+            state=state_real,
+            g=g[real],
+            beta=beta[real],
+            state_indices=indices[real],
+            use_qk_l2norm_in_kernel=True,
+        )
+        assert torch.equal(out[real].view(torch.uint8), out_real.view(torch.uint8))
+        assert torch.equal(state.view(torch.uint8), state_real.view(torch.uint8))
+
+    def test_padding_follows_slots_across_graph_replays(self):
+        """The padding select reads the slots at replay time, not at capture time."""
+        q, k, v, g, beta, state = _random_inputs(**self.SHAPE)
+        q[1] = float("nan")
+        v[4] = float("inf")
+        initial_state = state.clone()
+        indices = torch.tensor([7, -1, 3, 10, -1, 5], device="cuda", dtype=torch.int32)
+
+        def step():
+            out, _ = fused_recurrent_gated_delta_rule_update(
+                q,
+                k,
+                v,
+                state=state,
+                g=g,
+                beta=beta,
+                state_indices=indices,
+                use_qk_l2norm_in_kernel=True,
+            )
+            return out
+
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            step()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=stream):
+                graph_out = step()
+        torch.cuda.current_stream().wait_stream(stream)
+
+        for slots in ([7, -1, 3, 10, -1, 5], [-1] * 6, [0, 1, 2, 3, 4, 6], [-1, 8, -1, 2, 9, -1]):
+            indices.copy_(torch.tensor(slots, device="cuda", dtype=torch.int32))
+            state.copy_(initial_state)
+            graph.replay()
+            replayed_out, replayed_state = graph_out.clone(), state.clone()
+            state.copy_(initial_state)
+            eager_out = step()
+
+            padded = indices < 0
+            assert torch.count_nonzero(replayed_out[padded].view(torch.uint8)) == 0
+            assert torch.equal(replayed_out.view(torch.uint8), eager_out.view(torch.uint8))
+            assert torch.equal(replayed_state.view(torch.uint8), state.view(torch.uint8))
+
+    def test_slot_indices_reject_varlen(self):
+        q, k, v, g, beta, state = _random_inputs(B=1, T=2, H=1, HV=1, K=16, V=8, num_slots=2)
+        state_before = state.clone()
+        with pytest.raises(AssertionError, match="cu_seqlens"):
+            fused_recurrent_gated_delta_rule_update(
+                q,
+                k,
+                v,
+                state=state,
+                g=g,
+                beta=beta,
+                state_indices=torch.tensor([0, 1], device="cuda", dtype=torch.int32),
+                cu_seqlens=torch.tensor([0, 1, 2], device="cuda", dtype=torch.int32),
+            )
+        # The rejection happens before the launch, so the shared cache is untouched.
+        torch.cuda.synchronize()
+        assert torch.equal(state.view(torch.uint8), state_before.view(torch.uint8))
+
     @pytest.mark.skipif(not HAVE_FLA, reason="parity check requires flash-linear-attention")
     def test_matches_upstream_fla(self):
         """Fork parity with the pip FLA kernel the training path still uses."""
@@ -1526,3 +1700,52 @@ class TestChunkGatedDeltaProductVarlen:
         torch.testing.assert_close(
             state_padded[untouched], state[untouched], atol=0, rtol=0, equal_nan=True
         )
+
+    @pytest.mark.parametrize("state_dtype", [torch.float32, torch.bfloat16])
+    def test_initial_state_from_cache_matches_gathered(self, state_dtype):
+        """Reading each request's incoming state from its cache slot inside the scan
+        is bitwise the old path of gathering `state[slots]` into `initial_state` first --
+        including continuation chunks (non-zero incoming state) and -1 padding requests.
+        `H=6` gives the in-place autotuner a key no other test uses, so its
+        `restore_value` trials run here on live data."""
+        seq_lens = [96, 33, 130, 0, 0]
+        q, k, v, g, beta, state, desc = _prefill_inputs(
+            seq_lens, H=6, K=128, V=64, num_householder=3, num_slots=8, padded_tokens=320
+        )
+        state = state.to(state_dtype)
+        slots = torch.tensor([5, 1, 3, -1, -1], device="cuda", dtype=torch.int32)
+
+        def run(from_cache):
+            cache = state.clone()
+            if from_cache:
+                kwargs = dict(initial_state_from_cache=True)
+            else:
+                kwargs = dict(initial_state=cache[slots.long()])
+            o, _, chunk_states = chunk_gated_delta_product_varlen(
+                q,
+                k,
+                v,
+                g=g,
+                beta=beta,
+                num_householder=3,
+                state=cache,
+                state_indices=slots,
+                use_qk_l2norm_in_kernel=True,
+                return_chunk_states=True,
+                **kwargs,
+                **desc,
+            )
+            return o, cache, chunk_states
+
+        # In-place first, so a fresh autotune benchmarks on this cache.
+        o_cache, cache_cache, states_cache = run(from_cache=True)
+        o_gather, cache_gather, states_gather = run(from_cache=False)
+
+        assert torch.equal(o_cache, o_gather)
+        assert torch.equal(cache_cache, cache_gather)
+        # Only the real requests' chunk rows are written; the rest of the padded buffer
+        # is uninitialized and never read.
+        real_rows = sum((n + 63) // 64 for n in seq_lens)
+        assert torch.equal(states_cache[:real_rows], states_gather[:real_rows])
+        untouched = [s for s in range(8) if s not in {5, 1, 3}]
+        assert torch.equal(cache_cache[untouched], state[untouched])
