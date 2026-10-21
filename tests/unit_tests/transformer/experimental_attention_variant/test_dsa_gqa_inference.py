@@ -226,6 +226,26 @@ def _reference_rows(query, index_query, keys, values, index_keys, table, request
     )
 
 
+def test_write_paged_rows_and_page_table():
+    """Token rows land at their (block, position) slots, padding tokens write nothing, and the
+    page table splits each block into 64-key pages."""
+    device = torch.device("cuda", torch.cuda.current_device())
+    cache = torch.zeros(6, 256, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    rows = torch.randn(5, INDEX_DIM, device=device, dtype=torch.bfloat16)
+    blocks = torch.tensor([3, 3, 0, -1, 5], device=device, dtype=torch.int64)
+    positions = torch.tensor([0, 255, 7, 9, 128], device=device, dtype=torch.int32)
+    dsa_gqa_flashinfer.write_paged_rows(rows, cache, blocks, positions)
+    expected = torch.zeros_like(cache)
+    for t in (0, 1, 2, 4):
+        expected[blocks[t], positions[t]] = rows[t]
+    assert torch.equal(cache, expected)
+    table = torch.tensor([[2, 0], [5, 1]], device=device, dtype=torch.int32)
+    pages = torch.full((3, 10), -7, device=device, dtype=torch.int32)
+    dsa_gqa_flashinfer.fill_page_table(table, 256, pages)
+    assert pages[:2, :8].tolist() == [[8, 9, 10, 11, 0, 1, 2, 3], [20, 21, 22, 23, 4, 5, 6, 7]]
+    assert (pages[:, 8:] == -7).all() and (pages[2] == -7).all()
+
+
 @pytest.mark.parametrize("decode_only", [True, False])
 def test_flashinfer_replays_in_cuda_graph(decode_only):
     """A captured layer, replayed for new batches of one padded size (new keys, queries, tables
@@ -262,8 +282,18 @@ def test_flashinfer_replays_in_cuda_graph(decode_only):
     buffers = {
         name: torch.zeros(len(v), device=device, dtype=torch.int32) for name, v in empty.items()
     }
+    page_table = torch.zeros(
+        padded_requests,
+        dsa_gqa_flashinfer.page_table_columns(max_pages, page_size, bound, TOPK),
+        device=device,
+        dtype=torch.int32,
+    )
     plan = dsa_gqa_flashinfer.StepPlan(
-        decode_rows=sizes["decode_rows"], num_tiles=sizes["tiles"], max_context=bound, **buffers
+        decode_rows=sizes["decode_rows"],
+        num_tiles=sizes["tiles"],
+        max_context=bound,
+        page_table=page_table,
+        **buffers,
     )
 
     def fill(query_lengths, kv_lengths):
@@ -285,6 +315,7 @@ def test_flashinfer_replays_in_cuda_graph(decode_only):
         keys.copy_(torch.randn_like(keys))
         index_keys.copy_(torch.randn_like(index_keys))
         table.copy_(torch.randperm(num_pages, device=device).view(padded_requests, max_pages))
+        dsa_gqa_flashinfer.fill_page_table(table, page_size, page_table)
         return real
 
     def attend():
@@ -294,7 +325,6 @@ def test_flashinfer_replays_in_cuda_graph(decode_only):
             value_cache=values,
             index_query=index_query,
             index_key_cache=index_keys,
-            block_table=table,
             plan=plan,
             index_topk=TOPK,
             softmax_scale=HEAD_DIM**-0.5,

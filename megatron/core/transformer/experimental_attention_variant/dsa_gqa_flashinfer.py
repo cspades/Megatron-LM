@@ -115,6 +115,7 @@ class StepPlan:
     sample_ends: torch.Tensor  # [prefill requests] sampled keys of each prefill request
     batch_starts: torch.Tensor  # [tiles * 128 / group + 1] first step row of each group
     max_context: int  # bound on every row length (the graph's bound under CUDA graphs)
+    page_table: torch.Tensor  # [requests, pages] FlashInfer's 64-key pages (fill_page_table)
 
 
 def plan_sizes(padded_rows: int, padded_requests: int, decode_only: bool) -> Dict[str, int]:
@@ -274,15 +275,77 @@ def _persistent(device_index: int, heads: int, max_tiles_hint: int):
     return core, counters, topk, arrivals, offsets
 
 
-def fi_block_table(block_table: torch.Tensor, page_size: int, min_pages: int) -> torch.Tensor:
-    """[requests, blocks] of page_size-key blocks -> FlashInfer's [requests, pages] of 64-key
-    pages, padded to cover at least min_pages (entries past a row's length are never read)."""
+def page_table_columns(max_kv_blocks: int, page_size: int, max_context: int, index_topk: int):
+    """Columns of the FlashInfer page table: the requests' 64-key pages, and at least the score
+    width and twice the key tiles (``nvfp4_paged_mqa_logits`` / ``sdsa_select`` require it;
+    entries past a row's length are never read)."""
+    width = -(-max(max_context, index_topk) // 4) * 4
+    key_tiles = -(-max_context // TILE_ROWS)
+    return max(max_kv_blocks * (page_size // FI_PAGE), -(-width // FI_PAGE), 2 * key_tiles)
+
+
+def fill_page_table(block_table: torch.Tensor, page_size: int, out: torch.Tensor) -> None:
+    """Write FlashInfer's 64-key pages of [requests, blocks] page_size-key blocks into the leading
+    columns of ``out`` (block b holds pages b * per .. b * per + per - 1), once per step."""
     per = page_size // FI_PAGE
-    table = (
-        block_table.to(torch.int32)[:, :, None] * per
-        + torch.arange(per, device=block_table.device, dtype=torch.int32)
-    ).reshape(block_table.size(0), -1)
-    return torch.nn.functional.pad(table, (0, max(0, min_pages - table.size(1))))
+    requests, blocks = block_table.shape
+    pages = out[:requests, : blocks * per].view(requests, blocks, per)
+    # One kernel: arange(per) + per * block.
+    offsets = torch.arange(per, device=out.device, dtype=out.dtype)
+    torch.add(offsets, block_table[:, :, None], alpha=per, out=pages)
+
+
+if HAVE_TRITON:
+
+    @triton.jit(do_not_specialize=["rows", "stride_cache_block", "stride_cache_pos"])
+    def _write_rows_kernel(
+        rows_in,
+        cache,
+        block_idx,
+        positions,
+        rows,
+        stride_cache_block,
+        stride_cache_pos,
+        DIM: tl.constexpr,
+        ROWS: tl.constexpr,
+    ):
+        """cache[block_idx[t], positions[t], :] = rows_in[t, :] for t < rows; padding tokens
+        (block < 0) write nothing."""
+        t = tl.program_id(0) * ROWS + tl.arange(0, ROWS)
+        valid = t < rows
+        block = tl.load(block_idx + t, mask=valid, other=-1)
+        position = tl.load(positions + t, mask=valid, other=0)
+        valid = valid & (block >= 0)
+        dims = tl.arange(0, DIM)
+        values = tl.load(
+            rows_in + t[:, None].to(tl.int64) * DIM + dims[None, :], mask=valid[:, None]
+        )
+        target = block.to(tl.int64) * stride_cache_block + position.to(tl.int64) * stride_cache_pos
+        tl.store(cache + target[:, None] + dims[None, :], values, mask=valid[:, None])
+
+
+def write_paged_rows(
+    rows_in: torch.Tensor, cache: torch.Tensor, block_idx: torch.Tensor, positions: torch.Tensor
+) -> None:
+    """Write token rows ``[tokens, dim]`` into a paged cache ``[blocks, block_size, dim]`` at
+    (``block_idx[t]``, ``positions[t]``) in one launch; tokens with a negative block are skipped."""
+    rows, dim = rows_in.shape
+    rows_in = rows_in.contiguous()
+    if rows == 0:
+        return
+    if cache.stride(-1) != 1 or dim & (dim - 1):
+        raise ValueError("write_paged_rows needs a power-of-two row width and dense cache rows")
+    _write_rows_kernel[(triton.cdiv(rows, 16),)](
+        rows_in,
+        cache,
+        block_idx,
+        positions,
+        rows,
+        cache.stride(0),
+        cache.stride(1),
+        DIM=dim,
+        ROWS=16,
+    )
 
 
 def _token_core(query, keys, requests, table, key_rows, value_rows, out, index_topk, scale, heads):
@@ -321,7 +384,6 @@ def flashinfer_sparse_attention(
     value_cache: torch.Tensor,
     index_query: torch.Tensor,
     index_key_cache: torch.Tensor,
-    block_table: torch.Tensor,
     plan: StepPlan,
     index_topk: int,
     softmax_scale: float,
@@ -334,26 +396,29 @@ def flashinfer_sparse_attention(
         key_cache, value_cache: Paged BF16 ``[blocks,block_size,1,D]``.
         index_query: BF16 indexer queries ``[rows,Di]``.
         index_key_cache: Paged BF16 indexer keys ``[blocks,block_size,Di]``.
-        block_table: Int32 ``[requests,max_blocks]``.
-        plan: The step's plan (``StepPlan``).
+        plan: The step's plan (``StepPlan``), whose page table maps the requests' KV blocks.
         index_topk: Keys each row selects.
         softmax_scale: Attention softmax scale.
     """
     device = query.device
     rows, heads, dim = query.shape
     value_dim = value_cache.size(-1)
-    page_size = key_cache.size(1)
     max_context = plan.max_context
     key_tiles = -(-max_context // TILE_ROWS)
     width = -(-max(max_context, index_topk) // 4) * 4
-    table = fi_block_table(block_table, page_size, max(-(-width // FI_PAGE), 2 * key_tiles))
+    table = plan.page_table
+    assert table.size(1) >= max(-(-width // FI_PAGE), 2 * key_tiles), "page table too narrow"
     pages = index_key_cache.view(-1, FI_PAGE, index_key_cache.size(-1))
     key_rows = key_cache.view(-1, 1, 1, dim)
     value_rows = value_cache.view(-1, 1, 1, value_dim)
     index_query = index_query.contiguous()
     query = query.contiguous()
     _, _, topk_ws, arrivals, offsets = _persistent(device.index, heads, 4096)
-    out = torch.zeros(rows, heads, value_dim, device=device, dtype=query.dtype)
+    out = (
+        torch.zeros(rows, heads, value_dim, device=device, dtype=query.dtype)
+        if plan.num_tiles
+        else None
+    )
 
     if plan.num_tiles:
         rank, capacity = SELECTOR[index_topk]
@@ -523,5 +588,9 @@ def flashinfer_sparse_attention(
             heads,
         )
         on_decode = (plan.decode_lengths > 0)[:, None, None]
-        out[:decode_rows] = torch.where(on_decode, decode_out, out[:decode_rows])
+        if plan.num_tiles:
+            out[:decode_rows] = torch.where(on_decode, decode_out, out[:decode_rows])
+        else:
+            # Decode-only: every row is a decode row or padding (no keys -> zeros).
+            out = decode_out.mul_(on_decode)
     return out

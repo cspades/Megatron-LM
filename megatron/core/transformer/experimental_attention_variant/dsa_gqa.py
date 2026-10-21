@@ -380,7 +380,7 @@ def dynamic_sparse_attention(
 
     Every token routes to the top-k of its causal prefix through FlashInfer's DSA kernels
     (``dsa_gqa_flashinfer``), with the step's plan from
-    ``DynamicInferenceContext.dsa_flashinfer_plan``; launch sizes follow the padded batch, so
+    ``DynamicInferenceContext.dsa_metadata`` (``DSAMetadata``); launch sizes follow the padded batch, so
     all step types can run as CUDA graphs. The caches already hold this step's keys, values,
     and indexer keys.
 
@@ -422,9 +422,7 @@ def dynamic_sparse_attention(
         value_cache=value_cache,
         index_query=index_query.reshape(num_tokens, -1),
         index_key_cache=index_key_cache,
-        block_table=block_table.to(torch.int32),
-        # The configured bound, eager or graphed: FlashInfer compiles per launch shape.
-        plan=inference_context.dsa_flashinfer_plan(inference_context.max_sequence_length),
+        plan=inference_context.dsa_metadata.plan(),
         index_topk=index_topk,
         softmax_scale=softmax_scale,
     )
