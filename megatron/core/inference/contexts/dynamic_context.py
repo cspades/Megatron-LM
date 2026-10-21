@@ -56,6 +56,7 @@ from megatron.core.utils import divide as core_divide
 from megatron.core.utils import get_pg_rank, get_pg_size, internal_api
 
 from .attention_context.mamba_metadata import MambaMetadata
+from .attention_context.dsa_metadata import DSAMetadata
 from .attention_context.mha_metadata import GraphedMHAMetadata, NonGraphedMHAMetadata
 from .base_context import BaseInferenceContext
 from .gpu_view import ContextGPUView
@@ -414,6 +415,20 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         self.cache_mla_latent = (
             isinstance(model_config, MLATransformerConfig) and model_config.cache_mla_latents
         )
+        # The simplified DSA indexer projects its own key, independent of the attention key,
+        # and pages it with the attention KV blocks.
+        self.cache_dsa_indexer_keys = (
+            model_config.experimental_attention_variant == "dsa"
+            and model_config.dsa_indexer_mode == "simplified"
+        )
+        self.dsa_indexer_head_dim = (
+            model_config.dsa_indexer_head_dim if self.cache_dsa_indexer_keys else 0
+        )
+        # FlashInfer's DSA kernels take a per-step plan (DSAMetadata).
+        self.dsa_index_topk = model_config.dsa_indexer_topk if self.cache_dsa_indexer_keys else 0
+        self.dsa_query_heads = (
+            model_config.num_attention_heads // model_config.tensor_model_parallel_size
+        )
         if self.cache_mla_latent:
             assert (
                 inference_config.block_size_tokens == 64
@@ -563,6 +578,13 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 * self.block_size_tokens
                 * self.num_attention_heads_per_partition
                 * self.hidden_size_per_attention_head
+            )
+        if self.cache_dsa_indexer_keys:
+            self.block_size_bytes += (
+                kv_dtype_size_bytes
+                * self.num_attention_layers
+                * self.block_size_tokens
+                * self.dsa_indexer_head_dim
             )
         assert self.block_size_bytes > 0
 
@@ -1044,6 +1066,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 dtype=self.params_dtype,
                 device=torch.cuda.current_device(),
             )
+        if self.cache_dsa_indexer_keys:
+            self.dsa_memory_buffer = torch.empty(
+                (
+                    self.num_attention_layers,
+                    self.kv_block_allocator.pool_size,
+                    self.block_size_tokens,
+                    self.dsa_indexer_head_dim,
+                ),
+                dtype=self.params_dtype,
+                device=torch.cuda.current_device(),
+            )
         if (
             self.kv_cache_management_mode == KVCacheManagementMode.OFFLOAD
             and not self._uses_torch_memory_saver
@@ -1053,6 +1086,11 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             self._offloadable_cpu_backups["memory_buffer"] = torch.empty_like(
                 self.memory_buffer, device="cpu"
             ).pin_memory()
+            if self.cache_dsa_indexer_keys:
+                self._offloadable_tensor_names.add("dsa_memory_buffer")
+                self._offloadable_cpu_backups["dsa_memory_buffer"] = torch.empty_like(
+                    self.dsa_memory_buffer, device="cpu"
+                ).pin_memory()
 
     def _allocate_mamba_states(self):
         """Allocate Mamba states for hybrid models."""
@@ -1554,6 +1592,17 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         )
         self._bookkeeping_h2d_done_event = torch.cuda.Event()
 
+        if self.cache_dsa_indexer_keys:
+            self.dsa_metadata = DSAMetadata(
+                max_requests=self.max_requests,
+                max_tokens=self.max_tokens,
+                max_kv_blocks=self.max_kv_block_count,
+                block_size_tokens=self.block_size_tokens,
+                max_sequence_length=self.max_sequence_length,
+                query_heads=self.dsa_query_heads,
+                index_topk=self.dsa_index_topk,
+            )
+
         # Cache of (input_ids_view, pos_ids_view) keyed by num_tokens. Instead of slicing and
         # unsqueezing on every new inference step (constructing new TensorImpls at 30-60 us),
         # we fix the underlying storage so views are reusable across steps. The number of entries
@@ -1938,6 +1987,45 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
                 self.memory_buffer[1, attention_layer_number],
                 self.active_attn_metadata["mha_metadata"].state_data["block_table"],
             )
+
+    def append_dsa_key_cache(self, layer_number: int, key: Tensor) -> None:
+        """Append learned simplified-indexer keys to their paged cache (one Triton launch)."""
+        from megatron.core.transformer.experimental_attention_variant import dsa_gqa_flashinfer
+
+        assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
+        if self.mtp_metadata.forward_active:
+            raise NotImplementedError("The DSA indexer key cache does not support MTP drafts.")
+        attention_layer_number = self.layer_map[layer_number - 1]
+        block_idx = self.gpu_view.token_to_block_idx[: self.padded_active_token_count]
+        local_kv_seq_idx = self.gpu_view.token_to_local_position_within_kv_block[
+            : self.padded_active_token_count
+        ]
+
+        if key.dim() == 4:
+            assert key.size(1) == 1 and key.size(2) == 1
+            key = key.squeeze(1).squeeze(1)
+        elif key.dim() == 3:
+            assert key.size(1) == 1
+            key = key.squeeze(1)
+
+        dsa_gqa_flashinfer.write_paged_rows(
+            key[: self.padded_active_token_count],
+            self.dsa_memory_buffer[attention_layer_number],
+            block_idx,
+            local_kv_seq_idx,
+        )
+
+    def dsa_key_cache(self, layer_number: int) -> Tuple[Tensor, Tensor]:
+        """Return a layer's learned indexer-key cache and active block table."""
+        assert self.cache_dsa_indexer_keys, "DSA indexer key cache is not enabled."
+        if self.mtp_metadata.forward_active:
+            raise NotImplementedError("The DSA indexer key cache does not support MTP drafts.")
+        attention_layer_number = self.layer_map[layer_number - 1]
+        assert self.active_attn_metadata is not None
+        return (
+            self.dsa_memory_buffer[attention_layer_number],
+            self.active_attn_metadata["mha_metadata"].state_data["block_table"],
+        )
 
     def mamba_states_cache(
         self, layer_number: int, intermediate: bool = False
@@ -2709,6 +2797,15 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
             max_seqlen_k=max_seqlen_k,
         )
 
+        if self.cache_dsa_indexer_keys:
+            self.dsa_metadata.update(
+                self._cpu_mha_query_lengths[:real_bs].tolist(),
+                self._cpu_mha_kv_seq_lengths[:real_bs].tolist(),
+                padded_tokens=self.padded_active_token_count,
+                padded_requests=padded_bs,
+                decode_only=self.is_decode_only(),
+            )
+
         if self.is_hybrid_model:
             # Mamba metadata update is deferred to transfer_bookkeeping_to_gpu()
             # because it writes to GPU buffers. Store the parameters here.
@@ -2875,6 +2972,12 @@ class DynamicInferenceContext(MTPContextMixin, BaseInferenceContext):
         # MHA metadata GPU views were already bound to state_data in
         # initialize_attention_state(); the H2D above populates the underlying
         # bytes. Nothing else to do here for MHA.
+
+        if self.cache_dsa_indexer_keys:
+            self.dsa_metadata.transfer(
+                self.active_attn_metadata["mha_metadata"].state_data["block_table"],
+                non_blocking=record_done_event,
+            )
 
         # Mamba metadata: copy pre-computed CPU tensors to GPU buffers.
         if hasattr(self, '_pending_mamba_transfer') and self._pending_mamba_transfer is not None:

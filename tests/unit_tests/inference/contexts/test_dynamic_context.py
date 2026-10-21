@@ -4391,6 +4391,29 @@ def test_flashinfer_no_op_filter_rows_get_exact_log_softmax(top_k, top_p, finite
             assert int(torch.isfinite(log_probs[row]).sum()) == finite_count
 
 
+def test_flashinfer_sample_kernel_greedy_batch_takes_argmax(monkeypatch):
+    """A batch whose requests are all top-k 1 takes argmax and launches no sampling kernel."""
+    fake = mock.MagicMock()
+    monkeypatch.setattr("megatron.core.inference.sampling.flashinfer_sampling.flashinfer", fake)
+    n, vocab_size = 3, 16
+    context = SimpleNamespace(
+        gpu_view=SimpleNamespace(
+            temperature=torch.ones(n), top_k=torch.ones(n, dtype=torch.int32), top_p=torch.zeros(n)
+        ),
+        active_request_metadata={"top_k": torch.ones(n, dtype=torch.int32)},
+    )
+    backend = FlashInferSampling(vocab_size, torch.Generator())
+    logits = torch.randn(n + 2, vocab_size, dtype=torch.float32)
+    gather = torch.tensor([4, 0, 2])
+    output = torch.empty(n, dtype=torch.int64)
+    sampled = backend.sample_kernel(
+        logits, n, context, no_top_k=False, no_top_p=True, gather_indices=gather, output=output
+    )
+    assert sampled is output
+    assert torch.equal(sampled, logits[gather].argmax(dim=-1))
+    assert not fake.sampling.method_calls
+
+
 @pytest.mark.parametrize(
     "no_top_k,no_top_p,top_k,top_p,expected_kernel",
     [
@@ -4427,7 +4450,8 @@ def test_flashinfer_sample_kernel_dispatch(
             temperature=torch.ones(n),
             top_k=torch.tensor(top_k, dtype=torch.int32),
             top_p=torch.tensor(top_p),
-        )
+        ),
+        active_request_metadata={"top_k": torch.tensor(top_k, dtype=torch.int32)},
     )
     rng = torch.Generator()
     backend = FlashInferSampling(vocab_size, rng)
