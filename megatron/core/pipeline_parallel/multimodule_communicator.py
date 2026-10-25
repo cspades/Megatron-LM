@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -120,6 +121,7 @@ class MultiModulePipelineCommunicator:
         bridge_recv_shape_fns: Optional[Dict[str, Callable[[Dict], Tuple[int, ...]]]] = None,
         bridge_requires_backward: Optional[Dict[str, bool]] = None,
         bridge_comm_dtypes: Optional[Dict[str, torch.dtype]] = None,
+        timeout: Optional[timedelta] = None,
     ):
         """
         Initialize the MultiModulePipelineCommunicator.
@@ -160,6 +162,8 @@ class MultiModulePipelineCommunicator:
             bridge_requires_backward: Per-source backward policy. Missing sources default to True.
             bridge_comm_dtypes: Optional communication dtype overrides keyed by bridge source
                 module. Missing sources use ``config.pipeline_dtype``.
+            timeout: Process-group timeout for cross-module bridge communication. Defaults to
+                the PyTorch process-group timeout if None.
         """
         self.module_to_grid_map = module_to_grid_map
         self.topology = topology
@@ -169,6 +173,7 @@ class MultiModulePipelineCommunicator:
         self.bridge_recv_shape_fns = bridge_recv_shape_fns or {}
         self.bridge_requires_backward = dict(bridge_requires_backward or {})
         self.bridge_comm_dtypes = dict(bridge_comm_dtypes or {})
+        self.timeout = timeout
         unknown_modules = self.bridge_comm_dtypes.keys() - self.module_to_grid_map.keys()
         if unknown_modules:
             raise ValueError(
@@ -214,6 +219,7 @@ class MultiModulePipelineCommunicator:
                     tensor_ndim=self.module_output_ndim.get(src_module_name, 3),
                     skip_shape_exchange=src_module_name in self.bridge_recv_shape_fns,
                     requires_backward=self.bridge_requires_backward.get(src_module_name, True),
+                    timeout=self.timeout,
                 )
                 self.bridge_comms.append(bridge_comm)
 
@@ -389,7 +395,8 @@ class MultiModulePipelineCommunicator:
                 # from incoming modules.
                 for bridge_comm in rank_module_info.bridge_comms_as_dest_module:
                     received_tensor = bridge_comm.recv_forward(
-                        recv_shape=self._next_bridge_recv_shapes.pop(bridge_comm, None)
+                        recv_shape=self._next_bridge_recv_shapes.pop(bridge_comm, None),
+                        expect_backward=not self._schedule_forward_only,
                     )
                     input_dict[bridge_comm.src_module_name] = received_tensor
             else:

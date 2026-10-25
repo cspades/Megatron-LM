@@ -1,6 +1,7 @@
 # Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import Dict, Optional
 
 from megatron.core._rank_utils import warn_single_rank
@@ -33,6 +34,8 @@ class MimoModelConfig:
         kv_format (str):
             Key-value format for attention: "sbhd" (seq-batch-head-dim) or "thd" (total-head-dim).
             Default is "sbhd".
+        timeout (Optional[timedelta]):
+            Timeout used when constructing colocated bridge process groups.
     """
 
     warn_single_rank(
@@ -46,6 +49,7 @@ class MimoModelConfig:
     special_token_ids: Dict[str, int] = field(default_factory=dict)
     module_to_grid_map: Optional[Dict[str, HyperCommGrid]] = None
     kv_format: str = "sbhd"
+    timeout: Optional[timedelta] = None
 
     def __post_init__(self):
         unknown_projections = set(self.language_model_input_projections_spec) - set(

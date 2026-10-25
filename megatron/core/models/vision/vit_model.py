@@ -213,6 +213,7 @@ class ViTModel(MegatronModule):
             "transformer-engine."
         )
 
+        self.pg_collection = pg_collection
         self.patch_dim = patch_dim
         self.img_h = img_h
         self.img_w = img_w
@@ -585,6 +586,7 @@ class QwenVLViTModel(MegatronModule):
             "(TENorm is used throughout). Install megatron-core with "
             "transformer-engine."
         )
+        self.pg_collection = pg_collection
         self.patch_dim = patch_dim
         self.temporal_patch_size = temporal_patch_size
         self.spatial_merge_size = spatial_merge_size
@@ -887,6 +889,7 @@ class KimiViTModel(MegatronModule):
             "(TENorm is used throughout). Install megatron-core with "
             "transformer-engine."
         )
+        self.pg_collection = pg_collection
         self.patch_dim = patch_dim
         hidden_size = transformer_config.hidden_size
         self.class_token_len = 0  # no CLS token

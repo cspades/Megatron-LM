@@ -2,6 +2,7 @@
 
 import logging
 from dataclasses import dataclass
+from datetime import timedelta
 from enum import Enum
 from typing import Dict, List, Optional, Tuple
 
@@ -60,6 +61,7 @@ class ColocatedBridgeCommunicator:
         src_module_name: str = "src",
         dest_module_name: str = "dest",
         dim_mapping: Optional[Dict[str, int]] = None,
+        timeout: Optional[timedelta] = None,
     ):
         self.src_grid = src_grid
         self.dest_grid = dest_grid
@@ -90,7 +92,7 @@ class ColocatedBridgeCommunicator:
                 rank_to_pos=self.rank_to_src_pos,
             )
             self.gather_pg, _ = dist.new_subgroups_by_enumeration(
-                self.gather_group_ranks, backend='nccl'
+                self.gather_group_ranks, backend='nccl', timeout=timeout
             )
         elif self.dest_dp_size > self.src_dp_size:
             self.direction = BridgeDirection.FAN_OUT
@@ -102,7 +104,7 @@ class ColocatedBridgeCommunicator:
                 rank_to_pos=self.rank_to_dest_pos,
             )
             self.gather_pg, _ = dist.new_subgroups_by_enumeration(
-                self.gather_group_ranks, backend='nccl'
+                self.gather_group_ranks, backend='nccl', timeout=timeout
             )
         else:
             self.direction = BridgeDirection.EQUAL

@@ -3,6 +3,7 @@
 import logging
 from collections import deque
 from dataclasses import dataclass, field
+from datetime import timedelta
 from enum import Enum
 from typing import Deque, Dict, List, Optional, Tuple
 
@@ -81,6 +82,7 @@ class BridgeCommunicator:
         tensor_ndim: int = 3,
         skip_shape_exchange: bool = False,
         requires_backward: bool = True,
+        timeout: Optional[timedelta] = None,
     ):
         """Initialize the bridge communicator between source and destination grids.
 
@@ -101,6 +103,8 @@ class BridgeCommunicator:
             skip_shape_exchange: Use receiver-provided forward shapes and locally
                         remembered forward shapes instead of exchanging shapes.
             requires_backward: Whether to send gradients back to the source.
+            timeout: Process-group timeout for bridge and boundary-broadcast groups. Defaults to
+                     the PyTorch process-group timeout if None.
         """
         self.src_grid = src_grid
         self.dest_grid = dest_grid
@@ -108,10 +112,12 @@ class BridgeCommunicator:
         self.dest_module_name = dest_module_name
         self.comm_dtype = comm_dtype
         self.skip_shape_exchange = skip_shape_exchange
+        self.timeout = timeout
         if not isinstance(requires_backward, bool):
             raise TypeError("requires_backward must be a bool")
         self.requires_backward = requires_backward
         self._sent_forward_shapes: Deque[List[Tuple[int, ...]]] = deque()
+        self._received_forward_shapes: Deque[List[Tuple[int, ...]]] = deque()
 
         assert tensor_ndim in (2, 3), f"tensor_ndim must be 2 or 3, got {tensor_ndim}"
         self.tensor_ndim = tensor_ndim
@@ -160,7 +166,7 @@ class BridgeCommunicator:
         self.src_grid_broadcast_ranks = []
         if src_grid_broadcast_ranks_list:
             self.src_grid_broadcast_pg = self._get_or_create_broadcast_pg(
-                src_grid_broadcast_ranks_list
+                src_grid_broadcast_ranks_list, timeout=self.timeout
             )
             self.src_grid_broadcast_ranks = next(
                 (ranks for ranks in src_grid_broadcast_ranks_list if self.current_rank in ranks), []
@@ -169,7 +175,7 @@ class BridgeCommunicator:
         self.dest_grid_broadcast_ranks = []
         if dest_grid_broadcast_ranks_list:
             self.dest_grid_broadcast_pg = self._get_or_create_broadcast_pg(
-                dest_grid_broadcast_ranks_list
+                dest_grid_broadcast_ranks_list, timeout=self.timeout
             )
             self.dest_grid_broadcast_ranks = next(
                 (ranks for ranks in dest_grid_broadcast_ranks_list if self.current_rank in ranks),
@@ -197,7 +203,7 @@ class BridgeCommunicator:
                 self.dest_cp_reduce_pg = dest_cp_pg
 
         bridge_ranks = sorted(set(self.src_tp_leaders) | set(self.dest_tp_leaders))
-        self.bridge_pg = self._get_or_create_bridge_pg(bridge_ranks)
+        self.bridge_pg = self._get_or_create_bridge_pg(bridge_ranks, timeout=self.timeout)
 
         logger.info(
             "[Rank %s] srcLeader=%s destLeader=%s "
@@ -234,21 +240,23 @@ class BridgeCommunicator:
         return self.dim_mapping['b']
 
     @classmethod
-    def _get_or_create_broadcast_pg(cls, ranks_list: List[List[int]]):
+    def _get_or_create_broadcast_pg(
+        cls, ranks_list: List[List[int]], timeout: Optional[timedelta] = None
+    ):
         """Get or create a broadcast PG, caching to avoid duplicate NCCL communicators."""
-        cache_key = str(sorted([tuple(r) for r in ranks_list]))
+        cache_key = f"{sorted([tuple(r) for r in ranks_list])}|timeout={timeout}"
         if cache_key not in cls._broadcast_pg_cache:
-            pg, _ = dist.new_subgroups_by_enumeration(ranks_list, backend='nccl')
+            pg, _ = dist.new_subgroups_by_enumeration(ranks_list, backend='nccl', timeout=timeout)
             cls._broadcast_pg_cache[cache_key] = pg
         return cls._broadcast_pg_cache[cache_key]
 
     @classmethod
-    def _get_or_create_bridge_pg(cls, ranks: List[int]):
+    def _get_or_create_bridge_pg(cls, ranks: List[int], timeout: Optional[timedelta] = None):
         """Get or create a bridge PG, caching to avoid duplicate NCCL communicators."""
         ranks = sorted(ranks)
-        cache_key = str(ranks)
+        cache_key = f"{ranks}|timeout={timeout}"
         if cache_key not in cls._bridge_pg_cache:
-            cls._bridge_pg_cache[cache_key] = dist.new_group(ranks, backend='nccl')
+            cls._bridge_pg_cache[cache_key] = dist.new_group(ranks, backend='nccl', timeout=timeout)
         return cls._bridge_pg_cache[cache_key]
 
     def get_leader_rank(self, grid: HyperCommGrid, is_src: bool) -> List[int]:
@@ -483,11 +491,14 @@ class BridgeCommunicator:
         dist.broadcast(tensor, src=self.dest_local_leader_rank, group=self.dest_grid_broadcast_pg)
         return tensor
 
-    def recv_forward(self, recv_shape: Optional[Tuple[int, ...]] = None) -> torch.Tensor:
+    def recv_forward(
+        self, recv_shape: Optional[Tuple[int, ...]] = None, *, expect_backward: bool = True
+    ) -> torch.Tensor:
         """Receive forward activation tensor.
 
         Args:
             recv_shape: Expected tensor shape when shape exchange is skipped.
+            expect_backward: Remember fan-in shard sizes for the corresponding backward send.
 
         Returns:
             torch.Tensor: The received activation tensor
@@ -547,6 +558,8 @@ class BridgeCommunicator:
                         tensor_to_recv.sum(),
                     )
             aggregated_tensor = torch.cat(received_tensors_list, dim=self._batch_dim)
+            if expect_backward and self.requires_backward and len(recv_forward_shapes) > 1:
+                self._received_forward_shapes.append(recv_forward_shapes)
             if logger.isEnabledFor(logging.DEBUG):
                 logger.debug(
                     "[Bridge Communicator] [receive_forward] Rank %s "
@@ -617,7 +630,7 @@ class BridgeCommunicator:
             self._validate_send_dtype(grad_tensor, "send_backward")
             # Send gradients back to source ranks
             num_receives = len(rank_info.recv_from_ranks)
-            tensor_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
+            tensor_splits = self._split_backward_gradient(grad_tensor, num_receives)
             if not self.skip_shape_exchange:
                 self._communicate_shapes(tensor_to_send_prev=tensor_splits)
             if num_receives > 0:
@@ -926,7 +939,7 @@ class BridgeCommunicator:
             self._validate_send_dtype(grad_tensor, "send_backward_recv_forward")
 
             num_receives = len(rank_info.recv_from_ranks)
-            gradient_splits = self._split_tensor_at_batch_dim(grad_tensor, num_receives)
+            gradient_splits = self._split_backward_gradient(grad_tensor, num_receives)
             if self.skip_shape_exchange:
                 recv_forward_shapes = [self._validate_receiver_provided_shape(forward_shape)]
             else:
@@ -986,6 +999,8 @@ class BridgeCommunicator:
 
                 # Concatenate received activations
                 aggregated_activation = torch.cat(received_activations_list, dim=self._batch_dim)
+                if len(recv_forward_shapes) > 1:
+                    self._received_forward_shapes.append(recv_forward_shapes)
                 if logger.isEnabledFor(logging.DEBUG):
                     logger.debug(
                         "[Bridge Communicator] [send_backward_recv_forward] Rank %s "
@@ -1166,6 +1181,20 @@ class BridgeCommunicator:
                 f"expected {expected_count} tensors for shape communication, got {len(tensors)}"
             )
         return list(tensors)
+
+    def _split_backward_gradient(
+        self, grad_tensor: torch.Tensor, num_splits: int
+    ) -> List[torch.Tensor]:
+        """Return each fan-in source its original, possibly empty, feature-gradient slice."""
+        if num_splits == 1 or not self._received_forward_shapes:
+            return self._split_tensor_at_batch_dim(grad_tensor, num_splits)
+        shapes = self._received_forward_shapes.popleft()
+        if len(shapes) != num_splits:
+            raise ValueError("fan-in backward peer count differs from its forward receive")
+        sizes = [shape[self._batch_dim] for shape in shapes]
+        if sum(sizes) != grad_tensor.size(self._batch_dim):
+            raise ValueError("fan-in backward size differs from its forward receive")
+        return [part.contiguous() for part in torch.split(grad_tensor, sizes, dim=self._batch_dim)]
 
     def _split_tensor_at_batch_dim(
         self, aggregated_tensor: torch.Tensor, num_splits: int

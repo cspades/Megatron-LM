@@ -2,6 +2,7 @@
 import logging
 import os
 import sys
+from collections import deque
 
 import pytest
 import torch
@@ -203,7 +204,42 @@ class TestBridgeCommunicatorSplitMetadata:
         bridge = BridgeCommunicator.__new__(BridgeCommunicator)
         bridge.tensor_ndim = 2
         bridge.dim_mapping = {'b': 0}
+        bridge._received_forward_shapes = deque()
         return bridge
+
+    def test_eight_uneven_image_shards_preserve_projector_gradient_and_fifo(self):
+        bridge = self._bridge()
+        torch.manual_seed(41)
+        weight = torch.randn(3, 4, dtype=torch.float64)
+        reference_weight = weight.clone().requires_grad_()
+        global_tokens = 73
+        all_sizes = [[0, 1, 0, 3, 2, 0, 4, 1], [2, 0, 1, 0, 3, 1, 0, 2], [0] * 8]
+        batches = []
+        reference_loss = reference_weight.sum() * 0
+        for sizes in all_sizes:
+            features = torch.randn(sum(sizes), 4, dtype=torch.float64)
+            upstream = torch.randn(sum(sizes), 3, dtype=torch.float64)
+            reference_loss = reference_loss + ((features @ reference_weight.T) * upstream).sum()
+            bridge._received_forward_shapes.append([(size, 3) for size in sizes])
+            batches.append((sizes, features, upstream))
+        (reference_loss / global_tokens).backward()
+        # Encoder DDP performs SUM for per-token loss, then divides once by the
+        # language global token count. Image shards are not independent samples.
+        shard_gradient_sum = torch.zeros_like(weight)
+        for sizes, features, upstream in batches:
+            returned_gradients = bridge._split_backward_gradient(upstream, 8)
+            for local_features, returned_gradient, size in zip(
+                torch.split(features, sizes), returned_gradients, sizes, strict=True
+            ):
+                assert returned_gradient.shape == (size, 3)
+                if size == 0:
+                    continue
+                local_weight = weight.clone().requires_grad_()
+                output = local_features @ local_weight.T
+                output.backward(returned_gradient)
+                shard_gradient_sum += local_weight.grad
+        torch.testing.assert_close(shard_gradient_sum / global_tokens, reference_weight.grad)
+        assert not bridge._received_forward_shapes
 
     def test_send_dtype_validation_accepts_bridge_dtype(self):
         bridge = self._bridge()
@@ -773,6 +809,61 @@ class TestBridgeCommunicator:
             grad = torch.randn(577 * 4, 128, device='cuda')
             activation = bridge.send_backward_recv_forward(grad)
             assert activation.shape == (577 * 4, 128)
+
+    def test_uneven_image_fan_in_with_empty_shards_and_cp_gradient_reduction(self):
+        """Four image shards -> one CP4 language lane, with two changing batches."""
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
+        dest_grid = create_hypercomm_grid(offset=4, tp=1, cp=4, pp=1, dp=1)
+        bridge = BridgeCommunicator(src_grid, dest_grid, comm_dtype=torch.float32, tensor_ndim=2)
+        rank = dist.get_rank()
+        first_sizes, second_sizes = [0, 2, 5, 1], [3, 0, 1, 6]
+        first = torch.arange(sum(first_sizes) * 3, dtype=torch.float32, device="cuda").view(-1, 3)
+        second = (
+            torch.arange(sum(second_sizes) * 3, dtype=torch.float32, device="cuda").view(-1, 3)
+            + 100
+        )
+        if rank < 4:
+            first_local = torch.split(first, first_sizes)[rank].contiguous()
+            second_local = torch.split(second, second_sizes)[rank].contiguous()
+            bridge.send_forward(first_local)
+            first_gradient = bridge.send_forward_recv_backward(second_local)
+            second_gradient = bridge.recv_backward()
+            torch.testing.assert_close(first_gradient, torch.full_like(first_local, 10))
+            torch.testing.assert_close(second_gradient, torch.full_like(second_local, 20))
+        else:
+            torch.testing.assert_close(bridge.recv_forward(), first)
+            cp_contribution = rank - 3
+            torch.testing.assert_close(
+                bridge.send_backward_recv_forward(torch.full_like(first, cp_contribution)), second
+            )
+            bridge.send_backward(torch.full_like(second, 2 * cp_contribution))
+            assert not bridge._received_forward_shapes
+
+    def test_forward_only_fan_in_does_not_poison_training_shape_fifo(self):
+        """A forward-only batch must not provide split sizes to the next training batch."""
+        src_grid = create_hypercomm_grid(offset=0, tp=1, cp=1, pp=1, dp=4)
+        dest_grid = create_hypercomm_grid(offset=4, tp=1, cp=4, pp=1, dp=1)
+        bridge = BridgeCommunicator(src_grid, dest_grid, comm_dtype=torch.float32, tensor_ndim=2)
+        rank = dist.get_rank()
+        eval_sizes, train_sizes = [1, 0, 3, 2], [0, 4, 1, 2]
+        eval_features = torch.arange(sum(eval_sizes) * 3, device="cuda", dtype=torch.float32).view(
+            -1, 3
+        )
+        train_features = 100 + torch.arange(
+            sum(train_sizes) * 3, device="cuda", dtype=torch.float32
+        ).view(-1, 3)
+
+        if rank < 4:
+            bridge.send_forward(torch.split(eval_features, eval_sizes)[rank], expect_backward=False)
+            bridge.send_forward(torch.split(train_features, train_sizes)[rank])
+            gradient = bridge.recv_backward()
+            torch.testing.assert_close(gradient, torch.full_like(gradient, 10))
+        else:
+            torch.testing.assert_close(bridge.recv_forward(expect_backward=False), eval_features)
+            assert not bridge._received_forward_shapes
+            torch.testing.assert_close(bridge.recv_forward(), train_features)
+            bridge.send_backward(torch.full_like(train_features, rank - 3))
+            assert not bridge._received_forward_shapes
 
     def test_2d_fan_out_fwd_bwd(self):
         """Fan-out with 2D tensors: 1 src DP group → 4 dest DP ranks, forward + backward."""

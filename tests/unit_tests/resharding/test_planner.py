@@ -783,6 +783,14 @@ class TestBuildPlanFromRosters:
         assert {(s, d) for _, s, d in sends} == {(0, 1), (0, 2)}
         assert len({tid for tid, _, _ in sends}) == 2
 
+    def test_send_ops_carry_destination_dtype(self):
+        """A source kept in FP32 is sent in the destination's BF16."""
+        dst = _meta(owner_rank=1, tp_ranks=[1], dp_ranks=[1])
+        dst.dtype, dst.element_size = torch.bfloat16, 2
+        plans = _build_all([([_meta(owner_rank=0, tp_ranks=[0], dp_ranks=[0])], []), ([], [dst])])
+
+        assert [op.dst_dtype for op in plans[0].send_ops] == [torch.bfloat16]
+
     def test_execution_batches_match_across_ranks(self):
         """Large complete parameters are split without separating their slices."""
         num_elements = 40_000_000  # 160 MB at float32
