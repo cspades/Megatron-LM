@@ -129,15 +129,14 @@ class InferenceClient:
         self.block_size_tokens = block_size_tokens
         self.prefix_caching_coordinator_policy = prefix_caching_coordinator_policy
 
-    def _block_hashes(self, prompt, media_meta):
+    def _block_hashes(self, prompt):
         """Hash the prompt into per-block routing hashes for the coordinator.
 
         Hashed here rather than at the coordinator because clients are many
-        against its one serial loop, and because this is the only place holding
-        both inputs at once: the tokens, and -- for multimodal -- the media key
-        that must salt them, which serialize_multimodal_data has just derived.
-        Salting is what stops two requests whose media placeholders tokenize
-        identically from sharing KV computed for different images.
+        against its one serial loop. These compact-prompt hashes represent text
+        affinity only; media affinity is scored independently by the coordinator.
+        The engine computes authoritative KV hashes after media expansion and
+        salts them at each media item's first embedding position.
 
         Returns None to mean "this client did not hash", which tells the
         coordinator to hash the prompt itself. Deliberately distinct from an
@@ -160,9 +159,8 @@ class InferenceClient:
             # Hashing needs token ids and there is no tokenizer here.
             return None
         tokens = prompt.tolist() if isinstance(prompt, torch.Tensor) else list(prompt)
-        cache_salt = media_meta.get("media_cache_key") if isinstance(media_meta, dict) else None
         return compute_block_hashes_batched(
-            torch.tensor(tokens, dtype=torch.int64), self.block_size_tokens, cache_salt=cache_salt
+            torch.tensor(tokens, dtype=torch.int64), self.block_size_tokens
         )
 
     def add_request(
@@ -257,7 +255,7 @@ class InferenceClient:
         0 metadata
             Decoded and repacked by the coordinator on every request, so
             everything in it must be bounded. Carries the sampling params and
-            the media descriptor, whose ``media_cache_key`` the coordinator
+            the media descriptor, whose ``media_cache_keychain`` the coordinator
             reads for media affinity and, when nobody hashed upstream, as the
             salt for hashing there.
         1 prompt
@@ -302,7 +300,7 @@ class InferenceClient:
             # not, and the coordinator hashes the prompt itself -- deliberately
             # distinct from an empty list, which means the caller hashed and the
             # prompt was shorter than one block.
-            msgpack.packb(self._block_hashes(prompt, media_meta), use_bin_type=True),
+            msgpack.packb(self._block_hashes(prompt), use_bin_type=True),
             msgpack.packb(media_payload, use_bin_type=True),
             msgpack.packb(offload_params, use_bin_type=True),
         ]

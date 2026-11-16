@@ -410,10 +410,6 @@ class MediaPromptSpec:
     suffix: str = ""
     """Text tokenized after the media token, e.g. ``</img>``."""
 
-    input_marker: Optional[str] = None
-    """Placeholder text removed from user text when this media type is present, e.g. a
-    literal ``<video>`` in ``"<video> What happens?"``."""
-
     content_part_separator: str = ""
     """Joins a media message's content parts, e.g. ``"\\n"`` renders [image, text] as
     ``<img><image></img>\\nWhat is this?``."""
@@ -742,12 +738,11 @@ class InferenceConfig:
     """
 
     prefix_cache_ttl_seconds: float = 300.0
-    """How long the coordinator assumes an engine still holds a block it routed there.
+    """How long the coordinator assumes an engine still holds routed prefix blocks or media.
 
-    The coordinator sees blocks being routed but never blocks being evicted, so its view of
-    each engine's cache only gets staler. Entries untouched for this long are dropped. Too long
-    and it claims hits on blocks already evicted, routing for affinity and paying a cold prefill
-    anyway; too short and it forgets blocks the engine still holds.
+    The coordinator sees cacheable work being routed but never sees evictions, so its view only
+    gets staler. It prunes stale prefix-block entries on prefix updates and stale media-engine
+    assignments on media updates.
     """
 
     media_cache_coordinator_policy: MediaCacheCoordinatorPolicy = (

@@ -244,13 +244,16 @@ def test_dynamic_image_rows(break_id, end_id, expanded, mask):
         _conv_merging=True,
         _drop_vision_class_token=True,
     )
+    wrapper._cache_model_attributes()
     image_config = SimpleNamespace(image_break_token_id=break_id, image_end_token_id=end_id)
     wrapper.inference_context = SimpleNamespace(
         config=SimpleNamespace(image_preprocessing_config=image_config)
     )
     # 56x84 pixels -> 4x6 patches -> 2 rows of 3 merged tokens.
+    imgs_sizes = torch.tensor([[56, 84]])
+    media_item_embedding_counts = wrapper.get_embedding_tokens_per_media_item(imgs_sizes=imgs_sizes)
     assert wrapper.expand_image_tokens(
-        [[5, 18, 7]], imgs_sizes=torch.tensor([[56, 84]]), image_token_id=18
+        [[5, 18, 7]], media_item_embedding_counts, imgs_sizes=imgs_sizes, image_token_id=18
     ) == ([expanded], [mask])
 
 

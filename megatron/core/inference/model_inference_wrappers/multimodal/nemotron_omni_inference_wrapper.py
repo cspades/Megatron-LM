@@ -19,12 +19,15 @@ import torch
 
 from megatron.core import tensor_parallel
 from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
+from megatron.core.inference.media_preprocessing import (
+    dynamic_media_embedding_count_groups,
+    dynamic_media_embedding_counts,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
-    dynamic_media_embedding_counts,
-    dynamic_media_replacement_counts,
+from megatron.core.inference.model_inference_wrappers.multimodal.multimodal_inference_wrapper import (
+    MultimodalInferenceWrapperMixin,
 )
 from megatron.core.utils import get_attr_wrapped_model
 
@@ -32,7 +35,15 @@ from megatron.core.utils import get_attr_wrapped_model
 def _render_nemotron_vl_video_prompt(
     prompt_spec: MediaPromptSpec, frame_indices: list[int], fps: float, temporal_patch_size: int
 ) -> str:
-    """Render the canonical Nemotron-VL text and compact media slot per tubelet."""
+    """Render the canonical Nemotron-VL text and compact media slot per tubelet.
+
+    Example: with ``prefix="<img>"``, ``model_token="<image>"``,
+    ``suffix="</img>"``, timestamps enabled, ``frame_indices=[0, 10, 20, 30]``,
+    ``fps=10``, and ``temporal_patch_size=2``, this returns::
+
+        Frame 1 sampled at 0.00 seconds and frame 2 sampled at 1.00 seconds: <img><image></img>
+        Frame 3 sampled at 2.00 seconds and frame 4 sampled at 3.00 seconds: <img><image></img>
+    """
     if any(type(index) is not int or index < 0 for index in frame_indices):
         raise ValueError("Video frame indices must be non-negative integers.")
     if (
@@ -71,7 +82,14 @@ def _replace_compact_video_slots(
     compact_suffix_tokens: list[int],
     per_video_tokens: list[list[int]],
 ) -> list[list[int]]:
-    """Replace each compact video slot with its per-tubelet compact token sequence."""
+    """Replace each compact video slot with its per-tubelet compact token sequence.
+    Each compact placeholder <prefix> <media> <suffix> block is replaced with the
+    chained temporal expansion compact tokens for a single video:
+    <temporal_desc_1> <media> <temporal_desc_2> <media> ...
+
+    Each tubelet media placeholder is expanded into the number of embeddings per
+    tublet later, i.e. the number of spatial (optionally merged) patches.
+    """
     rewritten_tokens = []
     video_index = 0
     for sample_tokens in tokens:
@@ -118,7 +136,82 @@ def _replace_compact_video_slots(
     return rewritten_tokens
 
 
-class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
+def _expand_temporal_video_prompt_tokens(
+    tokens: list[list[int]],
+    *,
+    tokenizer,
+    prompt_spec: MediaPromptSpec,
+    image_token_index: int,
+    frame_groups: list[int],
+    video_frame_indices,
+    video_fps,
+    temporal_patch_size: int,
+    media_item_embedding_counts: list[list[int]],
+) -> list[list[int]]:
+    """Replace compact video slots with timestamped, per-tubelet media tokens."""
+    if tokenizer is None:
+        raise ValueError("Temporal video prompt expansion requires a tokenizer.")
+    if (
+        video_frame_indices is None
+        or video_fps is None
+        or len(video_frame_indices) != len(frame_groups)
+        or len(video_fps) != len(frame_groups)
+    ):
+        raise ValueError(
+            "Temporal video prompt expansion requires frame indices and FPS "
+            "for every compact video placeholder."
+        )
+    compact_prefix_tokens = tokenizer.tokenize(prompt_spec.prefix)
+    compact_suffix_tokens = tokenizer.tokenize(prompt_spec.suffix)
+
+    if len(media_item_embedding_counts) != len(frame_groups):
+        raise ValueError("Media embedding-count groups must align with videos.")
+
+    per_video_tokens = []
+    for video_index, (frame_count, video_counts) in enumerate(
+        zip(frame_groups, media_item_embedding_counts)
+    ):
+        indices = video_frame_indices[video_index]
+        fps = video_fps[video_index]
+        if len(indices) != frame_count:
+            raise ValueError(
+                "Video frame-index metadata must match num_frames: "
+                f"{len(indices)} != {frame_count}."
+            )
+        tubelet_count = (frame_count + temporal_patch_size - 1) // temporal_patch_size
+        if len(video_counts) != tubelet_count:
+            raise ValueError("Media embedding counts must align with video tubelets.")
+        rendered_video = _render_nemotron_vl_video_prompt(
+            prompt_spec, indices, fps, temporal_patch_size
+        )
+        video_tokens = tokenizer.tokenize(rendered_video)
+        if sum(token == image_token_index for token in video_tokens) != len(video_counts):
+            raise ValueError(
+                "Tokenizer did not preserve exactly one media token per "
+                "temporal video prompt group."
+            )
+        per_video_tokens.append(list(video_tokens))
+    tokens = _replace_compact_video_slots(
+        tokens,
+        image_token_id=image_token_index,
+        compact_prefix_tokens=compact_prefix_tokens,
+        compact_suffix_tokens=compact_suffix_tokens,
+        per_video_tokens=per_video_tokens,
+    )
+    expanded_placeholder_count = sum(
+        token == image_token_index for sample_tokens in tokens for token in sample_tokens
+    )
+    media_embedding_run_count = sum(len(counts) for counts in media_item_embedding_counts)
+    if expanded_placeholder_count != media_embedding_run_count:
+        raise ValueError(
+            "Temporal video prompt expansion produced "
+            f"{expanded_placeholder_count} media markers for "
+            f"{media_embedding_run_count} tubelet replacement counts."
+        )
+    return tokens
+
+
+class NemotronOmniInferenceWrapper(MultimodalInferenceWrapperMixin, GPTInferenceWrapper):
     """Dynamic-inference adapter for canonical, expanded-sequence Nemotron Omni."""
 
     supports_text = True
@@ -141,11 +234,28 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
         content_part_order="media_first",
     )
 
+    def __init__(self, model, inference_context=None):
+        super().__init__(model, inference_context)
+        self._cache_model_attributes()
+
+    def _cache_model_attributes(self):
+        self._model_module = get_attr_wrapped_model(
+            self.model, "image_token_index", return_model_obj=True
+        )
+        model_attributes = vars(self._model_module)
+        if "patch_dim" in model_attributes:
+            self._patch_dim = model_attributes["patch_dim"]
+        vision_model = model_attributes.get("vision_model")
+        self._temporal_patch_size = (
+            vars(vision_model).get("temporal_patch_dim", 1) if vision_model is not None else 1
+        )
+        self._video_prompt_spec = self.multimodal_prompt_config.video_spec
+        self._video_temporal_expansion = self._video_prompt_spec.expansion_mode == "temporal_patch"
+
     def get_preexpanded_media_token_id(self, modality: str) -> int:
         """Return the model's internal sentinel for already-expanded visual prompts."""
         del modality
-        model = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
-        return int(model.image_token_index)
+        return int(self._model_module.image_token_index)
 
     def run_one_forward_step(
         self, inference_input: Dict[str, Any], recv_buffer_seq_len: Optional[int] = None
@@ -157,9 +267,31 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             )
         return super().run_one_forward_step(inference_input, recv_buffer_seq_len)
 
+    def get_embedding_tokens_per_media_item(
+        self, num_tiles=None, imgs_sizes=None, num_frames=None
+    ) -> list[list[int]]:
+        """Return the embedding count for each image, video, or temporal tubelet."""
+        del num_tiles
+        frame_embedding_counts = dynamic_media_embedding_counts(
+            imgs_sizes,
+            patch_dim=self._patch_dim,
+            pixel_shuffle=True,
+            pixel_shuffle_size=2,
+            spatial_merge_size=1,
+        )
+        media_embedding_count_groups = dynamic_media_embedding_count_groups(
+            frame_embedding_counts,
+            num_frames=num_frames,
+            temporal_patch_size=self._temporal_patch_size,
+        )
+        if num_frames is not None and self._video_temporal_expansion:
+            return media_embedding_count_groups
+        return [[sum(counts)] for counts in media_embedding_count_groups]
+
     def expand_image_tokens(
         self,
         tokens,
+        media_item_embedding_counts,
         num_tiles=None,
         imgs_sizes=None,
         num_frames=None,
@@ -176,32 +308,21 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             )
         if num_tiles is not None:
             raise ValueError("num_tiles must be omitted for dynamic-resolution Omni inference.")
-        model = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
-        image_token_index = (
-            model.image_token_index if image_token_id is None else int(image_token_id)
-        )
+        model = self._model_module
         if not getattr(model, "dynamic_resolution", False):
             raise ValueError("NemotronOmniModel must have dynamic_resolution enabled.")
-
-        frame_embedding_counts = dynamic_media_embedding_counts(
-            imgs_sizes, patch_dim=model.patch_dim, pixel_shuffle=True
+        image_token_index = (
+            model.image_token_index if image_token_id is None else int(image_token_id)
         )
         placeholder_count = sum(
             token == image_token_index for sample_tokens in tokens for token in sample_tokens
         )
 
-        prompt_spec = self.multimodal_prompt_config.get_spec(
-            "video" if num_frames is not None else "image"
-        )
-        temporal_expansion = (
-            num_frames is not None and prompt_spec.expansion_mode == "temporal_patch"
-        )
-        replacement_counts = dynamic_media_replacement_counts(
-            frame_embedding_counts,
-            num_frames=num_frames,
-            temporal_patch_size=int(getattr(model.vision_model, "temporal_patch_dim", 1)),
-            aggregate_videos=not temporal_expansion,
-        )
+        temporal_expansion = num_frames is not None and self._video_temporal_expansion
+        media_embedding_run_counts = [
+            count for counts in media_item_embedding_counts for count in counts
+        ]
+        # Validate placeholder counts against the number of images or videos.
         media_kind = "video" if num_frames is not None else "image"
         if temporal_expansion:
             if hasattr(num_frames, "tolist"):
@@ -214,75 +335,28 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
             expected_placeholders = len(frame_groups)
         else:
             frame_groups = []
-            expected_placeholders = len(replacement_counts)
+            expected_placeholders = len(media_item_embedding_counts)
         if placeholder_count != expected_placeholders:
             raise ValueError(
                 f"Expected one compact placeholder per {media_kind}: "
                 f"expected {expected_placeholders}, got {placeholder_count}."
             )
 
+        # Temporal Expansion Mode: Tubelets are re-formatted with timestamp descriptors.
         if temporal_expansion:
-            if tokenizer is None:
-                raise ValueError("Temporal video prompt expansion requires a tokenizer.")
-            if (
-                video_frame_indices is None
-                or video_fps is None
-                or len(video_frame_indices) != len(frame_groups)
-                or len(video_fps) != len(frame_groups)
-            ):
-                raise ValueError(
-                    "Temporal video prompt expansion requires frame indices and FPS "
-                    "for every compact video placeholder."
-                )
-            temporal_patch_size = int(getattr(model.vision_model, "temporal_patch_dim", 1))
-            compact_prefix_tokens = tokenizer.tokenize(prompt_spec.prefix)
-            compact_suffix_tokens = tokenizer.tokenize(prompt_spec.suffix)
-
-            per_video_tokens = []
-            replacement_offset = 0
-            for video_index, frame_count in enumerate(frame_groups):
-                indices = video_frame_indices[video_index]
-                fps = video_fps[video_index]
-                if len(indices) != frame_count:
-                    raise ValueError(
-                        "Video frame-index metadata must match num_frames: "
-                        f"{len(indices)} != {frame_count}."
-                    )
-                tubelet_count = (frame_count + temporal_patch_size - 1) // temporal_patch_size
-                video_counts = replacement_counts[
-                    replacement_offset : replacement_offset + tubelet_count
-                ]
-                replacement_offset += tubelet_count
-                rendered_video = _render_nemotron_vl_video_prompt(
-                    prompt_spec, indices, fps, temporal_patch_size
-                )
-                video_tokens = tokenizer.tokenize(rendered_video)
-                if sum(token == image_token_index for token in video_tokens) != len(video_counts):
-                    raise ValueError(
-                        "Tokenizer did not preserve exactly one media token per "
-                        "temporal video prompt group."
-                    )
-                per_video_tokens.append(list(video_tokens))
-            if replacement_offset != len(replacement_counts):
-                raise ValueError("Temporal replacement counts did not partition videos.")
-
-            tokens = _replace_compact_video_slots(
+            tokens = _expand_temporal_video_prompt_tokens(
                 tokens,
-                image_token_id=image_token_index,
-                compact_prefix_tokens=compact_prefix_tokens,
-                compact_suffix_tokens=compact_suffix_tokens,
-                per_video_tokens=per_video_tokens,
+                tokenizer=tokenizer,
+                prompt_spec=self._video_prompt_spec,
+                image_token_index=image_token_index,
+                frame_groups=frame_groups,
+                video_frame_indices=video_frame_indices,
+                video_fps=video_fps,
+                temporal_patch_size=self._temporal_patch_size,
+                media_item_embedding_counts=media_item_embedding_counts,
             )
-            expanded_placeholder_count = sum(
-                token == image_token_index for sample_tokens in tokens for token in sample_tokens
-            )
-            if expanded_placeholder_count != len(replacement_counts):
-                raise ValueError(
-                    "Temporal video prompt expansion produced "
-                    f"{expanded_placeholder_count} media markers for "
-                    f"{len(replacement_counts)} tubelet replacement counts."
-                )
 
+        # Expand the token sequence to allocate placeholder tokens for each multimodal embedding.
         expanded_tokens = []
         image_masks = []
         image_index = 0
@@ -295,8 +369,9 @@ class NemotronOmniInferenceWrapper(GPTInferenceWrapper):
                     expanded_sample.append(token)
                     mask_sample.append(None)
                     continue
-
-                replacement_count = int(replacement_counts[image_index])
+                # Expand a single media placeholder token to match the number of
+                # embeddings associated with the media.
+                replacement_count = int(media_embedding_run_counts[image_index])
                 expanded_sample.extend([-1] * replacement_count)
                 mask_sample.extend(range(embedding_offset, embedding_offset + replacement_count))
                 image_index += 1

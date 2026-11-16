@@ -15,13 +15,13 @@ import torch
 from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.contexts import StaticInferenceContext
 from megatron.core.inference.inference_request import InferenceRequest, Status, VLMInferenceRequest
+from megatron.core.inference.media_preprocessing import (
+    dynamic_media_embedding_count_groups,
+    dynamic_media_embedding_counts,
+)
 from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper import (
     NemotronOmniInferenceWrapper,
     _render_nemotron_vl_video_prompt,
-)
-from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
-    dynamic_media_embedding_counts,
-    dynamic_media_replacement_counts,
 )
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
@@ -46,6 +46,7 @@ from tests.unit_tests.test_utilities import Utils
 def test_vlm_wrapper_builds_preexpanded_media_token_mask():
     wrapper = object.__new__(VLMInferenceWrapper)
     wrapper.model = SimpleNamespace(image_token_index=-200)
+    wrapper._cache_model_attributes()
 
     mask = wrapper.build_preexpanded_media_token_mask(torch.tensor([10, -200, -200, 20]), "image")
 
@@ -56,6 +57,7 @@ def test_vlm_wrapper_builds_preexpanded_media_token_mask():
 def test_vlm_wrapper_resolves_media_id_from_tokenizer_not_model_sentinel():
     wrapper = object.__new__(VLMInferenceWrapper)
     wrapper.model = SimpleNamespace(image_token_index=-200)
+    wrapper._cache_model_attributes()
     tokenizer = SimpleNamespace(
         convert_tokens_to_ids=lambda token: 99 if token == "<image>" else 0, unk_token_id=0
     )
@@ -68,6 +70,7 @@ def test_vlm_wrapper_resolves_media_id_from_tokenizer_not_model_sentinel():
 def test_vlm_wrapper_resolves_media_id_with_encode_fallback():
     wrapper = object.__new__(VLMInferenceWrapper)
     wrapper.model = SimpleNamespace(image_token_index=-200)
+    wrapper._cache_model_attributes()
     tokenizer = SimpleNamespace(encode=lambda token, add_special_tokens: [99])
 
     assert wrapper.resolve_media_token_id(tokenizer, "image") == 99
@@ -83,6 +86,7 @@ def test_vlm_dynamic_forward_sanitizes_preexpanded_media_sentinel():
     )
     wrapper = object.__new__(VLMInferenceWrapper)
     wrapper.model = model
+    wrapper._cache_model_attributes()
     wrapper.pp_group = mock.Mock()
     wrapper._recv_only_vision_embeds = False
     wrapper.inference_context = None
@@ -127,6 +131,7 @@ def test_vlm_vision_forward_casts_images_and_passes_tensor_input_ids(is_video):
     model = WrappedVisionModel()
     wrapper = object.__new__(VLMInferenceWrapper)
     wrapper.model = model
+    wrapper._cache_model_attributes()
     wrapper.inference_context = None
 
     output = wrapper._forward_vision_encoder(
@@ -145,18 +150,18 @@ def test_vlm_vision_forward_casts_images_and_passes_tensor_input_ids(is_video):
 
 
 @pytest.mark.internal
-def test_dynamic_video_embedding_counts_group_one_placeholder_per_video():
+def test_dynamic_video_embedding_counts_group_by_video():
     frame_counts = dynamic_media_embedding_counts(
         torch.tensor([[448, 576]] * 4), patch_dim=16, pixel_shuffle=True
     )
     assert frame_counts == [252] * 4
 
-    assert dynamic_media_replacement_counts(
+    assert dynamic_media_embedding_count_groups(
         frame_counts, num_frames=torch.tensor(4), temporal_patch_size=2
-    ) == [504]
-    assert dynamic_media_replacement_counts(
-        frame_counts, num_frames=torch.tensor(4), temporal_patch_size=2, aggregate_videos=False
-    ) == [252, 252]
+    ) == [[252, 252]]
+    assert dynamic_media_embedding_count_groups(
+        [8] * 6, num_frames=torch.tensor([2, 4]), temporal_patch_size=2
+    ) == [[8], [8, 8]]
 
 
 @pytest.mark.internal
@@ -177,6 +182,7 @@ def test_nemotron_video_expansion_adds_timestamped_tubelet_wrappers():
         patch_dim=16,
         vision_model=SimpleNamespace(temporal_patch_dim=2),
     )
+    wrapper._cache_model_attributes()
 
     class _Tokenizer:
         def __init__(self):
@@ -191,10 +197,16 @@ def test_nemotron_video_expansion_adds_timestamped_tubelet_wrappers():
             return [7, 77, 99, 78, 7, 77, 99, 78]
 
     tokenizer = _Tokenizer()
+    imgs_sizes = torch.tensor([[32, 32]] * 4)
+    num_frames = torch.tensor([4])
+    media_item_embedding_counts = wrapper.get_embedding_tokens_per_media_item(
+        imgs_sizes=imgs_sizes, num_frames=num_frames
+    )
     expanded, masks = wrapper.expand_image_tokens(
         [[11, 77, 99, 78, 12]],
-        imgs_sizes=torch.tensor([[32, 32]] * 4),
-        num_frames=torch.tensor([4]),
+        media_item_embedding_counts,
+        imgs_sizes=imgs_sizes,
+        num_frames=num_frames,
         image_token_id=99,
         tokenizer=tokenizer,
         video_frame_indices=[[0, 30, 60, 90]],
@@ -250,16 +262,17 @@ def test_nemotron_temporal_prompt_can_omit_timestamps():
 @pytest.mark.internal
 def test_dynamic_video_embedding_counts_reject_misaligned_frames():
     with pytest.raises(ValueError, match="must partition"):
-        dynamic_media_replacement_counts(
+        dynamic_media_embedding_count_groups(
             [252] * 4, num_frames=torch.tensor([3]), temporal_patch_size=2
         )
 
 
 @pytest.mark.internal
 def test_super_video_geometry_has_32_tubelets_and_8192_embeddings():
-    counts = dynamic_media_replacement_counts(
-        [256] * 64, num_frames=torch.tensor([64]), temporal_patch_size=2, aggregate_videos=False
+    count_groups = dynamic_media_embedding_count_groups(
+        [256] * 64, num_frames=torch.tensor([64]), temporal_patch_size=2
     )
+    counts = count_groups[0]
 
     assert len(counts) == 32
     assert sum(counts) == 8192
@@ -278,11 +291,18 @@ def test_vlm_wrapper_expands_one_video_marker_to_all_tubelet_embeddings():
         _drop_vision_class_token=True,
         temporal_patch_dim=2,
     )
+    wrapper._cache_model_attributes()
 
+    imgs_sizes = torch.tensor([[448, 576]] * 4)
+    num_frames = torch.tensor([4])
+    media_item_embedding_counts = wrapper.get_embedding_tokens_per_media_item(
+        imgs_sizes=imgs_sizes, num_frames=num_frames
+    )
     expanded, masks = wrapper.expand_image_tokens(
         [[11, 99, 12]],
-        imgs_sizes=torch.tensor([[448, 576]] * 4),
-        num_frames=torch.tensor([4]),
+        media_item_embedding_counts,
+        imgs_sizes=imgs_sizes,
+        num_frames=num_frames,
         image_token_id=99,
     )
 
@@ -305,12 +325,19 @@ def test_vlm_wrapper_rejects_multiple_compact_markers_for_one_video():
         _drop_vision_class_token=True,
         temporal_patch_dim=2,
     )
+    wrapper._cache_model_attributes()
 
+    imgs_sizes = torch.tensor([[448, 576]] * 4)
+    num_frames = torch.tensor([4])
+    media_item_embedding_counts = wrapper.get_embedding_tokens_per_media_item(
+        imgs_sizes=imgs_sizes, num_frames=num_frames
+    )
     with pytest.raises(ValueError, match="one compact placeholder per video"):
         wrapper.expand_image_tokens(
             [[11, 99, 99, 12]],
-            imgs_sizes=torch.tensor([[448, 576]] * 4),
-            num_frames=torch.tensor([4]),
+            media_item_embedding_counts,
+            imgs_sizes=imgs_sizes,
+            num_frames=num_frames,
             image_token_id=99,
         )
 
@@ -329,6 +356,7 @@ def test_omni_text_forward_does_not_treat_generated_image_token_as_media():
     )
     wrapper = object.__new__(NemotronOmniInferenceWrapper)
     wrapper.model = model
+    wrapper._cache_model_attributes()
     wrapper.inference_context = mock.sentinel.inference_context
 
     result = wrapper._forward(
@@ -350,6 +378,7 @@ def test_omni_raw_image_forward_calls_full_model():
     output = torch.empty((1, 3, 16))
     wrapper = object.__new__(NemotronOmniInferenceWrapper)
     wrapper.model = mock.Mock(return_value=(output, None))
+    wrapper._cache_model_attributes()
     wrapper.inference_context = mock.sentinel.inference_context
 
     result = wrapper._forward(
@@ -379,6 +408,7 @@ def test_image_token_mask_takes_precedence_over_raw_images(wrapper_cls):
     output = torch.empty((1, 3, 16))
     wrapper = object.__new__(wrapper_cls)
     wrapper.model = mock.Mock()
+    wrapper._cache_model_attributes()
     wrapper.inference_context = mock.sentinel.inference_context
     wrapper._forward_dynamic = mock.Mock(return_value=output)
 
@@ -413,6 +443,7 @@ def test_llava_text_forward_embeds_generated_image_token_as_text():
     )
     wrapper = object.__new__(VLMInferenceWrapper)
     wrapper.model = model
+    wrapper._cache_model_attributes()
     wrapper.inference_context = mock.sentinel.inference_context
     wrapper.pp_group = None
     wrapper._recv_only_vision_embeds = False

@@ -244,7 +244,9 @@ class DynamicInferenceEngine(
         )
         if self.vision_embedding_cache_max_bytes < 0:
             raise ValueError("vision_embedding_cache_max_bytes must be non-negative.")
-        self._vision_embedding_cache: OrderedDict[str, _VisionCacheEntry] = OrderedDict()
+        self._vision_embedding_cache: OrderedDict[tuple[str, ...], _VisionCacheEntry] = (
+            OrderedDict()
+        )
         self._vision_embedding_cache_bytes = 0
         self.cuda_graph_impl = model_config.cuda_graph_impl
         self.inference_cuda_graph_scope = model_config.inference_cuda_graph_scope
@@ -1097,12 +1099,14 @@ class DynamicInferenceEngine(
                 or request.request_id == self.context.chunked_prefill_request_id
             ):
                 continue
-            # Same scoping as add_request: VLM requests are image-bearing, so
-            # they are salted by their media identity as well.
-            media_cache_key = (
-                request.media_cache_key if isinstance(request, DynamicVLMInferenceRequest) else None
+            media_block_salt_keychain = (
+                request.media_block_salt_keychain
+                if isinstance(request, DynamicVLMInferenceRequest)
+                else None
             )
-            request.resalt_block_hashes(_weight_scoped_salt(self._weight_epoch, media_cache_key))
+            request.resalt_block_hashes(
+                _weight_scoped_salt(self._weight_epoch, media_block_salt_keychain)
+            )
 
     def _validate_async_sched_support_for_config(self) -> None:
         """Validate config-level restrictions for async scheduling.

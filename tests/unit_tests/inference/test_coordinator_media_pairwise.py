@@ -15,14 +15,12 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.engines.dynamic_engine import DynamicInferenceEngine, EngineState
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.media_preprocessing import preprocess_image
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
 )
 from megatron.core.inference.text_generation_controllers.text_generation_controller import (
     TextGenerationController,
-)
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (
-    preprocess_image,
 )
 from megatron.core.models.gpt.gpt_layer_specs import (
     get_gpt_layer_with_transformer_engine_submodules,

@@ -1,11 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 
-"""Image preprocessing for multimodal inference servers.
-
-Shared between vlm_server.py and the coordinator/engine image dispatch in
-run_dynamic_text_generation_server.py. Lives in core/inference so the engine
-can import it without circular dependencies.
-"""
+"""Image and video preprocessing for multimodal inference."""
 
 import io
 import json
@@ -23,6 +18,92 @@ from megatron.core.inference.config import ImageProcessingConfig, VideoProcessin
 from megatron.core.models.vision.encoder_registry import REGISTRY as _ENCODER_REGISTRY
 
 logger = logging.getLogger(__name__)
+
+
+def dynamic_media_embedding_counts(
+    imgs_sizes: torch.Tensor,
+    patch_dim: int,
+    *,
+    pixel_shuffle: bool,
+    pixel_shuffle_size: int = 2,
+    spatial_merge_size: int = 1,
+) -> list[int]:
+    """Return projected token counts for dynamic-resolution media frames.
+
+    Example: two ``448x576`` frames with ``patch_dim=16`` and 2x2 pixel shuffle
+    produce ``[252, 252]`` embeddings.
+    """
+    if patch_dim <= 0:
+        raise ValueError("patch_dim must be greater than 0.")
+    if imgs_sizes.ndim != 2 or imgs_sizes.shape[1] != 2:
+        raise ValueError(f"imgs_sizes must have shape [N, 2], got {tuple(imgs_sizes.shape)}.")
+    if pixel_shuffle and pixel_shuffle_size <= 0:
+        raise ValueError("pixel_shuffle_size must be greater than 0.")
+    if spatial_merge_size <= 0:
+        raise ValueError("spatial_merge_size must be greater than 0.")
+
+    counts = []
+    for height, width in imgs_sizes.tolist():
+        if height % patch_dim or width % patch_dim:
+            raise ValueError("Media dimensions must be divisible by patch_dim.")
+        patch_height = height // patch_dim
+        patch_width = width // patch_dim
+        if pixel_shuffle and (
+            patch_height % pixel_shuffle_size or patch_width % pixel_shuffle_size
+        ):
+            raise ValueError("Media patch grids must be divisible by pixel_shuffle_size.")
+        count = patch_height * patch_width
+        if pixel_shuffle:
+            count //= pixel_shuffle_size**2
+        merge_factor = spatial_merge_size**2
+        if count % merge_factor:
+            raise ValueError("Media token count must be divisible by the spatial merge factor.")
+        counts.append(count // merge_factor)
+
+    # Return number of embeddings for each image or video frame.
+    return counts
+
+
+def dynamic_media_embedding_count_groups(
+    frame_embedding_counts: list[int], *, num_frames, temporal_patch_size: int
+) -> list[list[int]]:
+    """Group embedding counts by logical image or video.
+
+    Example: ``[8, 8, 8, 8, 8, 8]`` with ``num_frames=[2, 4]`` and
+    ``temporal_patch_size=2`` produces ``[[8], [8, 8]]``: one tubelet for the
+    first video and two for the second.
+    """
+    if num_frames is None:
+        return [[count] for count in frame_embedding_counts]
+
+    if isinstance(num_frames, int):
+        frame_groups = [num_frames]
+    elif hasattr(num_frames, "tolist"):
+        values = num_frames.tolist()
+        frame_groups = (
+            [int(values)] if not isinstance(values, list) else [int(value) for value in values]
+        )
+    else:
+        frame_groups = [int(value) for value in num_frames]
+    if any(value <= 0 for value in frame_groups):
+        raise ValueError("num_frames entries must be positive.")
+    if sum(frame_groups) != len(frame_embedding_counts):
+        raise ValueError(
+            "num_frames must partition imgs_sizes exactly: "
+            f"sum(num_frames)={sum(frame_groups)}, "
+            f"imgs_sizes={len(frame_embedding_counts)}."
+        )
+    if temporal_patch_size <= 0:
+        raise ValueError("temporal_patch_size must be positive.")
+
+    media_embedding_count_groups = []
+    frame_offset = 0
+    for frame_count in frame_groups:
+        video_frame_counts = frame_embedding_counts[frame_offset : frame_offset + frame_count]
+        media_embedding_count_groups.append(video_frame_counts[::temporal_patch_size])
+        frame_offset += frame_count
+
+    return media_embedding_count_groups
 
 
 @lru_cache(maxsize=1)
@@ -535,3 +616,12 @@ def preprocess_video_bytes_list(
         "video_frame_indices": video_frame_indices,
         "video_fps": video_fps,
     }
+
+
+def compute_media_block_salt_indices():
+    """
+    Given an expanded sequence of tokens and per-image, per-frame, per-tubelet,
+    or per-video embedding counts, compute a mapping from token position to
+    media hash string for salting multimodal prefix block hashes.
+    """
+    pass

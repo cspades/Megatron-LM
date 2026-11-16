@@ -12,7 +12,7 @@ import itertools
 import time
 from collections import deque
 from typing import Dict, Optional
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import msgpack
 import numpy as np
@@ -405,7 +405,7 @@ class TestSubmitDoesNotDecodePrompt:
             Headers.SUBMIT_REQUEST.value,
             7,
             {"temperature": 1.0},
-            {"media_cache_key": "img-1"},
+            {"media_cache_keychain": ["img-1"]},
         ]
         prompt = msgpack.packb([1, 2, 3], use_bin_type=True)
         handle_submit_request(
@@ -420,8 +420,8 @@ class TestSubmitDoesNotDecodePrompt:
             ],
         )
 
-        # Decoded here, and salted with whatever media key the metadata carried.
-        coordinator.compute_request_hashes.assert_called_once_with([1, 2, 3], cache_salt="img-1")
+        # Text-prefix and media affinity are computed independently.
+        coordinator.compute_request_hashes.assert_called_once_with([1, 2, 3])
 
     def test_empty_hash_list_is_not_a_fallback(self):
         """An empty list means "hashed, no complete blocks" -- do not re-hash.
@@ -453,7 +453,7 @@ class TestSubmitDoesNotDecodePrompt:
             PrefixCachingCoordinatorPolicy.LONGEST_PREFIX
         )
         _identity, _metadata, _prompt, media_frame, _offload = self._submit(
-            coordinator, block_hashes=[11, 22], media_meta={"media_cache_key": "img-1"}
+            coordinator, block_hashes=[11, 22], media_meta={"media_cache_keychain": ["img-1"]}
         )
         assert media_frame is self.UNDECODABLE_MEDIA
 
@@ -476,9 +476,9 @@ class TestSubmitDoesNotDecodePrompt:
         coordinator = make_coordinator_direct(data_parallel_size=2)
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
         identity, _m, _p, _md, _o = self._submit(
-            coordinator, block_hashes=[], media_meta={"media_cache_key": "img-1"}
+            coordinator, block_hashes=[], media_meta={"media_cache_keychain": ["img-1"]}
         )
-        assert coordinator._media_cache_affinity["img-1"] == identity
+        assert set(coordinator._media_cache_affinity[("img-1",)]) == {identity}
 
     def test_metadata_frame_is_rewritten_with_server_request_id(self):
         """The client's request id is swapped for the coordinator's own."""
@@ -583,32 +583,83 @@ class TestCoordinatorPrefixRouting:
 class TestMultimodalAffinityRouting:
     """Media and prompt-prefix reuse participate in one routing score."""
 
-    def test_media_salt_partitions_prompt_affinity(self):
-        coordinator = make_coordinator_direct()
-        tokens = [1, 2, 3, 4, 5, 6, 7, 8]
-        image_a = coordinator.compute_request_hashes(tokens, cache_salt="image-a")
-        image_b = coordinator.compute_request_hashes(tokens, cache_salt="image-b")
-        assert image_a != image_b
-        assert image_a == coordinator.compute_request_hashes(tokens, cache_salt="image-a")
-
     def test_media_affinity_works_without_prefix_caching(self):
         coordinator = make_coordinator_direct(
             enable_prefix_caching=False, prefix_caching_routing_alpha=1.0
         )
         media_rank = coordinator._identities_list[1]
-        coordinator._update_media_affinity("image-a", media_rank)
-        assert coordinator.get_best_data_parallel_rank([], media_cache_key="image-a") == media_rank
+        coordinator._update_media_affinity(("image-a",), media_rank)
+        assert (
+            coordinator.get_best_data_parallel_rank([], media_cache_keychain=("image-a",))
+            == media_rank
+        )
+
+    def test_media_affinity_requires_the_complete_keychain(self):
+        coordinator = make_coordinator_direct(enable_prefix_caching=False)
+        media_rank = coordinator._identities_list[1]
+        coordinator._update_media_affinity(("image-a", "image-b"), media_rank)
+
+        assert coordinator.get_routing_affinity(
+            coordinator._identities_list,
+            coordinator._pending_counts,
+            [],
+            media_cache_keychain=("image-a", "image-b"),
+        ).tolist() == [0.0, 1.0]
+        assert (
+            coordinator.get_routing_affinity(
+                coordinator._identities_list,
+                coordinator._pending_counts,
+                [],
+                media_cache_keychain=("image-a", "image-c"),
+            )
+            is None
+        )
 
     def test_removing_engine_prunes_its_media_affinity(self):
         coordinator = make_coordinator_direct()
         removed_rank, retained_rank = coordinator._identities_list
-        coordinator._update_media_affinity("removed-image", removed_rank)
-        coordinator._update_media_affinity("retained-image", retained_rank)
+        coordinator._update_media_affinity(("removed-image",), removed_rank)
+        coordinator._update_media_affinity(("retained-image",), retained_rank)
 
         coordinator._remove_engine(removed_rank)
 
-        assert "removed-image" not in coordinator._media_cache_affinity
-        assert coordinator._media_cache_affinity["retained-image"] == retained_rank
+        assert ("removed-image",) not in coordinator._media_cache_affinity
+        assert set(coordinator._media_cache_affinity[("retained-image",)]) == {retained_rank}
+
+    def test_media_affinity_tracks_every_assigned_rank(self):
+        coordinator = make_coordinator_direct(enable_prefix_caching=False)
+        first_rank, second_rank = coordinator._identities_list
+        coordinator._update_media_affinity(("shared-image",), first_rank)
+        coordinator._update_media_affinity(("shared-image",), second_rank)
+
+        assert set(coordinator._media_cache_affinity[("shared-image",)]) == {
+            first_rank,
+            second_rank,
+        }
+        assert coordinator.get_routing_affinity(
+            coordinator._identities_list,
+            coordinator._pending_counts,
+            [],
+            media_cache_keychain=("shared-image",),
+        ).tolist() == [1.0, 1.0]
+
+    def test_expired_media_affinity_is_pruned_on_update(self):
+        coordinator = make_coordinator_direct(
+            enable_prefix_caching=False, prefix_cache_ttl_seconds=300.0
+        )
+        refreshed_rank, expired_rank = coordinator._identities_list
+        monotonic = (
+            "megatron.core.inference.data_parallel_inference_coordinator.coordinator."
+            "time.monotonic"
+        )
+        with patch(monotonic, side_effect=[100.0, 100.0, 100.0, 401.0]):
+            coordinator._update_media_affinity(("expired-image",), expired_rank)
+            coordinator._update_media_affinity(("shared-image",), refreshed_rank)
+            coordinator._update_media_affinity(("shared-image",), expired_rank)
+            coordinator._update_media_affinity(("shared-image",), refreshed_rank)
+
+        assert ("expired-image",) not in coordinator._media_cache_affinity
+        assert coordinator._media_cache_affinity[("shared-image",)] == {refreshed_rank: 401.0}
 
     def test_cold_media_falls_back_to_least_loaded_rank(self):
         coordinator = make_coordinator_direct(
@@ -618,7 +669,8 @@ class TestMultimodalAffinityRouting:
         coordinator._pending_counts[coordinator.identity_to_rank_index[busy_rank]] = 5
         coordinator._pending_counts[coordinator.identity_to_rank_index[free_rank]] = 1
         assert (
-            coordinator.get_best_data_parallel_rank([], media_cache_key="unseen-image") == free_rank
+            coordinator.get_best_data_parallel_rank([], media_cache_keychain=("unseen-image",))
+            == free_rank
         )
 
     def test_media_affinity_is_ignored_when_vision_cache_is_disabled(self):
@@ -629,16 +681,22 @@ class TestMultimodalAffinityRouting:
         )
         load_rank, media_rank = coordinator._identities_list
         coordinator._pending_counts[coordinator.identity_to_rank_index[media_rank]] = 1
-        coordinator._update_media_affinity("image-a", media_rank)
-        assert coordinator.get_best_data_parallel_rank([], media_cache_key="image-a") == load_rank
+        coordinator._update_media_affinity(("image-a",), media_rank)
+        assert (
+            coordinator.get_best_data_parallel_rank([], media_cache_keychain=("image-a",))
+            == load_rank
+        )
 
     def test_prefix_load_balanced_policy_still_uses_media_affinity(self):
         coordinator = make_coordinator_direct(enable_prefix_caching=False)
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
         _, media_rank = coordinator._identities_list
         coordinator._pending_counts[coordinator.identity_to_rank_index[media_rank]] = 1
-        coordinator._update_media_affinity("image-a", media_rank)
-        assert coordinator.get_best_data_parallel_rank([], media_cache_key="image-a") == media_rank
+        coordinator._update_media_affinity(("image-a",), media_rank)
+        assert (
+            coordinator.get_best_data_parallel_rank([], media_cache_keychain=("image-a",))
+            == media_rank
+        )
 
     def test_both_load_balanced_policies_ignore_media_affinity(self):
         coordinator = make_coordinator_direct(
@@ -647,34 +705,38 @@ class TestMultimodalAffinityRouting:
         coordinator.prefix_caching_coordinator_policy = PrefixCachingCoordinatorPolicy.LOAD_BALANCED
         load_rank, media_rank = coordinator._identities_list
         coordinator._pending_counts[coordinator.identity_to_rank_index[media_rank]] = 1
-        coordinator._update_media_affinity("image-a", media_rank)
-        assert coordinator.get_best_data_parallel_rank([], media_cache_key="image-a") == load_rank
+        coordinator._update_media_affinity(("image-a",), media_rank)
+        assert (
+            coordinator.get_best_data_parallel_rank([], media_cache_keychain=("image-a",))
+            == load_rank
+        )
 
     def test_long_prefix_can_outweigh_media_hit(self):
         coordinator = make_coordinator_direct(prefix_caching_routing_alpha=1.0)
         coordinator.media_cache_routing_weight = 1.0
-        hashes = coordinator.compute_request_hashes([1, 2, 3, 4, 5, 6, 7, 8], cache_salt="image-a")
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4, 5, 6, 7, 8])
         media_rank, prefix_rank = coordinator._identities_list
-        coordinator._update_media_affinity("image-a", media_rank)
+        coordinator._update_media_affinity(("image-a",), media_rank)
         for block_hash in hashes:
             _set_hash_rank(coordinator, block_hash, prefix_rank, 1)
 
         assert (
-            coordinator.get_best_data_parallel_rank(hashes, media_cache_key="image-a")
+            coordinator.get_best_data_parallel_rank(hashes, media_cache_keychain=("image-a",))
             == prefix_rank
         )
 
     def test_expensive_media_can_outweigh_long_prefix(self):
         coordinator = make_coordinator_direct(prefix_caching_routing_alpha=1.0)
         coordinator.media_cache_routing_weight = 3.0
-        hashes = coordinator.compute_request_hashes([1, 2, 3, 4, 5, 6, 7, 8], cache_salt="image-a")
+        hashes = coordinator.compute_request_hashes([1, 2, 3, 4, 5, 6, 7, 8])
         media_rank, prefix_rank = coordinator._identities_list
-        coordinator._update_media_affinity("image-a", media_rank)
+        coordinator._update_media_affinity(("image-a",), media_rank)
         for block_hash in hashes:
             _set_hash_rank(coordinator, block_hash, prefix_rank, 1)
 
         assert (
-            coordinator.get_best_data_parallel_rank(hashes, media_cache_key="image-a") == media_rank
+            coordinator.get_best_data_parallel_rank(hashes, media_cache_keychain=("image-a",))
+            == media_rank
         )
 
 

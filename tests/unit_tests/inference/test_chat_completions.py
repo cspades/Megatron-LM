@@ -237,7 +237,7 @@ def test_extract_multimodal_forwards_fetch_limit_to_media_urls(block):
         chat_completions_module, "_extract_media_url_bytes", return_value=b"media"
     ) as extract:
         _, image_bytes_list, video_bytes_list, _ = _extract_multimodal_from_messages(
-            messages, MultimodalPromptConfig(), max_fetch_bytes=123
+            messages, max_fetch_bytes=123
         )
 
     assert image_bytes_list + video_bytes_list == [b"media"]
@@ -254,7 +254,7 @@ async def test_chat_endpoint_bounds_remote_media_by_max_content_length():
         response = await app.test_client().post(CHAT_PATH, json=CHAT_BODY)
 
     assert response.status_code == 400
-    assert extract.call_args.args[2] == 2**30
+    assert extract.call_args.args[1] == 2**30
 
 
 # --- multimodal message extraction --------------------------------------------
@@ -276,70 +276,47 @@ def _user(content):
 
 
 @pytest.mark.parametrize(
-    ("messages", "prompt_config", "expected", "error"),
+    ("messages", "expected", "error"),
     [
-        pytest.param(
-            "hi", MultimodalPromptConfig(), ("hi", [], [], []), None, id="non-list-pass-through"
-        ),
+        pytest.param("hi", ("hi", [], [], []), None, id="non-list-pass-through"),
         pytest.param(
             [_user(_IMAGE_WITHOUT_URL)],
-            MultimodalPromptConfig(),
             ([_user(_IMAGE_WITHOUT_URL)], [], [], []),
             None,
             id="image-block-without-url-is-skipped",
         ),
         pytest.param(
             [_user([_INPUT_VIDEO])],
-            MultimodalPromptConfig(),
             ([_user([{"type": "text", "text": _SLOT_0}])], [], [b"v"], [(_SLOT_0, "video", 0)]),
             None,
             id="input-video-bare-data-url",
         ),
         pytest.param(
-            [_user([{"type": "text", "text": "look <image> here"}, _media_block("image", 0)])],
-            MultimodalPromptConfig(image_spec=MediaPromptSpec(input_marker="<image>")),
-            (
-                [
-                    _user(
-                        [{"type": "text", "text": "look  here"}, {"type": "text", "text": _SLOT_0}]
-                    )
-                ],
-                [b"image-0"],
-                [],
-                [(_SLOT_0, "image", 0)],
-            ),
-            None,
-            id="input-marker-is-stripped",
-        ),
-        pytest.param(
             [_user([_media_block("image", 0)]), _user([_media_block("video", 0)])],
-            MultimodalPromptConfig(),
             None,
             "Mixing image and video",
             id="mixed-image-and-video",
         ),
         pytest.param(
             [_user([{"type": "video_url", "video_url": {"url": "https://example.com/a.mp4"}}])],
-            MultimodalPromptConfig(),
             None,
             "must be base64 data URLs",
             id="remote-video",
         ),
         pytest.param(
             [_user([{"type": "input_video", "video": None}])],
-            MultimodalPromptConfig(),
             None,
             "must be base64 data URLs",
             id="no-video",
         ),
     ],
 )
-def test_extract_multimodal_from_messages(messages, prompt_config, expected, error):
+def test_extract_multimodal_from_messages(messages, expected, error):
     original = copy.deepcopy(messages)
     expectation = pytest.raises(ValueError, match=error) if error else contextlib.nullcontext()
 
     with expectation:
-        assert _extract_multimodal_from_messages(messages, prompt_config) == expected
+        assert _extract_multimodal_from_messages(messages) == expected
 
     assert messages == original
 
@@ -535,7 +512,7 @@ _SLOT_TEXT = [{"type": "text", "text": "__S0__"}]
 
 
 @pytest.mark.parametrize(
-    ("content", "media_slots", "prompt_config", "expected", "error"),
+    ("content", "media_slots", "multimodal_prompt_config", "expected", "error"),
     [
         pytest.param({"type": "text", "text": "hi"}, [], None, "hi", None, id="dict"),
         pytest.param(None, [], None, "", None, id="none"),
@@ -579,7 +556,7 @@ _SLOT_TEXT = [{"type": "text", "text": "__S0__"}]
             [("__S0__", "image", 0)],
             None,
             None,
-            "requires a prompt config",
+            "requires a multimodal prompt config",
             id="media-without-a-prompt-config",
         ),
         pytest.param(
@@ -596,13 +573,15 @@ _SLOT_TEXT = [{"type": "text", "text": "__S0__"}]
     ],
 )
 def test_sanitize_messages_flattens_content_to_a_string(
-    content, media_slots, prompt_config, expected, error
+    content, media_slots, multimodal_prompt_config, expected, error
 ):
     expectation = pytest.raises(ValueError, match=error) if error else contextlib.nullcontext()
 
     with expectation:
         (sanitized,) = _sanitize_messages_for_template(
-            [_user(content)], media_slots=media_slots, prompt_config=prompt_config
+            [_user(content)],
+            media_slots=media_slots,
+            multimodal_prompt_config=multimodal_prompt_config,
         )
         assert sanitized["content"] == expected
 
@@ -679,7 +658,7 @@ _TEMPORAL_VIDEO_CONFIG = MultimodalPromptConfig(
 
 
 @pytest.mark.parametrize(
-    ("prompt_config", "modality", "tokenizer", "expected_tokens", "error"),
+    ("multimodal_prompt_config", "modality", "tokenizer", "expected_tokens", "error"),
     [
         # Without a configured model token id the slot takes the tokenizer's id for the token.
         pytest.param(
@@ -733,7 +712,7 @@ _TEMPORAL_VIDEO_CONFIG = MultimodalPromptConfig(
     ],
 )
 def test_tokenize_with_media_slots_lowers_slots_to_model_tokens(
-    prompt_config, modality, tokenizer, expected_tokens, error
+    multimodal_prompt_config, modality, tokenizer, expected_tokens, error
 ):
     expectation = (
         pytest.raises((TypeError, ValueError), match=error) if error else contextlib.nullcontext()
@@ -744,7 +723,7 @@ def test_tokenize_with_media_slots_lowers_slots_to_model_tokens(
             tokenizer,
             messages=[],
             media_slots=[("__S0__", modality, 0)],
-            prompt_config=prompt_config,
+            multimodal_prompt_config=multimodal_prompt_config,
             tools=None,
             chat_template_kwargs={},
         )
@@ -777,7 +756,7 @@ class _SegmentTokenizer:
         return self.tokenize(text)
 
 
-def _omni_prompt_config(content_part_order, frame_timestamps):
+def _omni_multimodal_prompt_config(content_part_order, frame_timestamps):
     defaults = NemotronOmniInferenceWrapper.multimodal_prompt_config
     return replace(
         defaults,
@@ -788,14 +767,17 @@ def _omni_prompt_config(content_part_order, frame_timestamps):
     )
 
 
-def _endpoint_prompt_tokens(messages, prompt_config):
-    messages, _images, _videos, media_slots = _extract_multimodal_from_messages(
-        messages, prompt_config
+def _endpoint_prompt_tokens(messages, multimodal_prompt_config):
+    messages, _images, _videos, media_slots = _extract_multimodal_from_messages(messages)
+    template_messages = _sanitize_messages_for_template(
+        messages, media_slots, multimodal_prompt_config
     )
-    template_messages = _sanitize_messages_for_template(messages, media_slots, prompt_config)
     tokenizer = _SegmentTokenizer()
     return _tokenize_with_media_slots(
-        tokenizer.apply_chat_template(template_messages), media_slots, tokenizer, prompt_config
+        tokenizer.apply_chat_template(template_messages),
+        media_slots,
+        tokenizer,
+        multimodal_prompt_config,
     )
 
 
@@ -850,7 +832,7 @@ def test_endpoint_places_media_by_content_part_order(
     ]
 
     tokens = _endpoint_prompt_tokens(
-        messages, _omni_prompt_config(content_part_order, frame_timestamps)
+        messages, _omni_multimodal_prompt_config(content_part_order, frame_timestamps)
     )
 
     assert tokens == expected_tokens
@@ -878,7 +860,7 @@ def test_omni_expands_media_first_video_prompt_ahead_of_text(
     assert NemotronOmniInferenceWrapper.multimodal_prompt_config.content_part_order == (
         "media_first"
     )
-    prompt_config = _omni_prompt_config("media_first", frame_timestamps)
+    multimodal_prompt_config = _omni_multimodal_prompt_config("media_first", frame_timestamps)
     messages = [
         {
             "role": "user",
@@ -886,23 +868,30 @@ def test_omni_expands_media_first_video_prompt_ahead_of_text(
         }
     ]
 
-    tokens = _endpoint_prompt_tokens(messages, prompt_config)
+    tokens = _endpoint_prompt_tokens(messages, multimodal_prompt_config)
     assert tokens == ["<user>", "<img>", 99, "</img>", "\nDescribe it."]
 
     wrapper = object.__new__(NemotronOmniInferenceWrapper)
-    wrapper.multimodal_prompt_config = prompt_config
+    wrapper.multimodal_prompt_config = multimodal_prompt_config
     wrapper.model = SimpleNamespace(
         image_token_index=-200,
         dynamic_resolution=True,
         patch_dim=16,
         vision_model=SimpleNamespace(temporal_patch_dim=2),
     )
+    wrapper._cache_model_attributes()
     # 32x32 frames give one embedding per frame after pixel shuffle, so each
     # two-frame tubelet expands to a single -1 placeholder.
+    imgs_sizes = torch.tensor([[32, 32]] * 4)
+    num_frames = torch.tensor([4])
+    media_item_embedding_counts = wrapper.get_embedding_tokens_per_media_item(
+        imgs_sizes=imgs_sizes, num_frames=num_frames
+    )
     expanded, _masks = wrapper.expand_image_tokens(
         [tokens],
-        imgs_sizes=torch.tensor([[32, 32]] * 4),
-        num_frames=torch.tensor([4]),
+        media_item_embedding_counts,
+        imgs_sizes=imgs_sizes,
+        num_frames=num_frames,
         image_token_id=99,
         tokenizer=_SegmentTokenizer(),
         video_frame_indices=[[0, 10, 20, 30]],

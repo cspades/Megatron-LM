@@ -23,6 +23,7 @@ from megatron.core.inference.inference_request import (
     compute_media_cache_key,
     deserialize_ndarray,
     deserialize_tensor,
+    normalize_media_cache_keychain,
     prepare_multimodal_data,
     resolve_multimodal_data_for_engine,
     serialize_multimodal_data,
@@ -129,12 +130,12 @@ def test_serialization_helpers_round_trip():
 def test_prepared_multimodal_data_protects_computed_identity():
     prepared = prepare_multimodal_data({"image": [b"image"]})
     wire = serialize_multimodal_data(prepared)
-    expected_key = wire["media_cache_key"]
-    wire["media_cache_key"] = "forged"
+    expected_key = wire["media_cache_keychain"]
+    wire["media_cache_keychain"] = "forged"
     wire["image"].append(b"different-image")
 
     fresh_wire = serialize_multimodal_data(prepared)
-    assert fresh_wire["media_cache_key"] == expected_key
+    assert fresh_wire["media_cache_keychain"] == expected_key
     assert fresh_wire["image"] == [b"image"]
 
 
@@ -149,7 +150,7 @@ def test_preexpanded_multimodal_request_round_trip():
 
     resolved = resolve_multimodal_data_for_engine(wire)
     assert resolved["media_tokens_preexpanded"] is True
-    assert resolved["media_cache_key"] == wire["media_cache_key"]
+    assert resolved["media_cache_keychain"] == wire["media_cache_keychain"]
     assert torch.equal(resolved["imgs"], media["image"]["imgs"])
     assert torch.equal(resolved["imgs_sizes"], media["image"]["imgs_sizes"])
 
@@ -172,6 +173,76 @@ def test_preprocessed_video_timing_metadata_round_trip():
     assert resolved["video_fps"] == [29.97]
 
 
+def test_nested_multimodal_values_round_trip_through_msgpack():
+    media = {
+        "image": {
+            "imgs": torch.ones(1, 2, 4),
+            "imgs_sizes": torch.tensor([[2, 2]]),
+            "metadata": {
+                "array": np.array([1, 2], dtype=np.int32),
+                "parts": (torch.tensor([3]), bytearray(b"raw"), None),
+            },
+        }
+    }
+
+    wire = serialize_multimodal_data(media)
+    unpacked = msgpack.unpackb(msgpack.packb(wire, use_bin_type=True), raw=False)
+    resolved = resolve_multimodal_data_for_engine(unpacked)
+
+    assert np.array_equal(resolved["metadata"]["array"], np.array([1, 2], dtype=np.int32))
+    assert isinstance(resolved["metadata"]["parts"], tuple)
+    assert torch.equal(resolved["metadata"]["parts"][0], torch.tensor([3]))
+    assert resolved["metadata"]["parts"][1:] == (b"raw", None)
+
+
+def test_tag_shaped_lists_round_trip_as_lists():
+    media = {
+        "image": {
+            "imgs": torch.ones(1, 2, 4),
+            "imgs_sizes": torch.tensor([[2, 2]]),
+            "metadata": [["tuple", [1, 2]], ["tensor", {"user": "data"}]],
+        }
+    }
+
+    wire = serialize_multimodal_data(media)
+    unpacked = msgpack.unpackb(msgpack.packb(wire, use_bin_type=True), raw=False)
+    resolved = resolve_multimodal_data_for_engine(unpacked)
+
+    assert resolved["metadata"] == [["tuple", [1, 2]], ["tensor", {"user": "data"}]]
+
+
+def test_normalize_media_cache_keychain_rejects_nested_values():
+    assert normalize_media_cache_keychain(["image", "video"]) == ("image", "video")
+    with pytest.raises(ValueError, match="list or tuple of strings"):
+        normalize_media_cache_keychain([["image"]])
+
+
+def test_multimodal_serialization_rejects_unsupported_nested_values():
+    with pytest.raises(TypeError, match=r"Cannot hash inference value: <object object at"):
+        serialize_multimodal_data(
+            {
+                "image": {
+                    "imgs": torch.ones(1, 2, 4),
+                    "imgs_sizes": torch.tensor([[2, 2]]),
+                    "metadata": [object()],
+                }
+            }
+        )
+
+
+def test_multimodal_serialization_rejects_non_string_nested_keys():
+    with pytest.raises(TypeError, match="non-string keys"):
+        serialize_multimodal_data(
+            {
+                "image": {
+                    "imgs": torch.ones(1, 2, 4),
+                    "imgs_sizes": torch.tensor([[2, 2]]),
+                    "metadata": {1: "unsupported"},
+                }
+            }
+        )
+
+
 def test_gym_style_compact_multimodal_request_omits_preexpanded_flag():
     wire = serialize_multimodal_data(
         {"image": {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])}}
@@ -184,8 +255,8 @@ def test_multimodal_serialization_generates_stable_content_keys():
     raw_a = serialize_multimodal_data({"image": [b"same-image"]})
     raw_b = serialize_multimodal_data({"image": [b"same-image"]})
     raw_c = serialize_multimodal_data({"image": [b"different-image"]})
-    assert raw_a["media_cache_key"] == raw_b["media_cache_key"]
-    assert raw_a["media_cache_key"] != raw_c["media_cache_key"]
+    assert raw_a["media_cache_keychain"] == raw_b["media_cache_keychain"]
+    assert raw_a["media_cache_keychain"] != raw_c["media_cache_keychain"]
 
     tensor_a = serialize_multimodal_data(
         {
@@ -211,9 +282,9 @@ def test_multimodal_serialization_generates_stable_content_keys():
             }
         }
     )
-    assert tensor_a["media_cache_key"] == tensor_b["media_cache_key"]
+    assert tensor_a["media_cache_keychain"] == tensor_b["media_cache_keychain"]
     # Shape participates in identity even when the flattened bytes are equal.
-    assert tensor_a["media_cache_key"] != tensor_c["media_cache_key"]
+    assert tensor_a["media_cache_keychain"] != tensor_c["media_cache_keychain"]
 
 
 def test_prepared_multimodal_data_reuses_computed_content_key():
@@ -232,7 +303,7 @@ def test_prepared_multimodal_data_reuses_computed_content_key():
 
 def test_multimodal_serialization_rejects_user_media_cache_key():
     with pytest.raises(ValueError, match="computed automatically"):
-        serialize_multimodal_data({"image": [b"image"], "media_cache_key": "user-provided"})
+        serialize_multimodal_data({"image": [b"image"], "media_cache_keychain": ["user-provided"]})
 
 
 def test_compute_block_hashes_batched():
@@ -253,10 +324,17 @@ def test_compute_block_hashes_batched():
         compute_block_hashes_batched(torch.arange(8, dtype=torch.int64), block_size=4)[1] != h_b[1]
     )
     tokens = torch.arange(8, dtype=torch.int64)
-    media_a = compute_block_hashes_batched(tokens, block_size=4, cache_salt="media-a")
-    media_b = compute_block_hashes_batched(tokens, block_size=4, cache_salt="media-b")
+    media_a = compute_block_hashes_batched(tokens, block_size=4, cache_salt={0: "media-a"})
+    media_b = compute_block_hashes_batched(tokens, block_size=4, cache_salt={0: "media-b"})
     assert media_a != media_b
-    assert media_a == compute_block_hashes_batched(tokens, block_size=4, cache_salt="media-a")
+    assert media_a == compute_block_hashes_batched(tokens, block_size=4, cache_salt={0: "media-a"})
+
+    # Salt payloads are length-framed, so embedded position bytes cannot make
+    # one salt entry encode identically to two entries in the same block.
+    combined_salt = "a" + (1).to_bytes(8, "big").decode() + "b"
+    assert compute_block_hashes_batched(
+        tokens, block_size=4, cache_salt={0: "a", 1: "b"}
+    ) != compute_block_hashes_batched(tokens, block_size=4, cache_salt={0: combined_salt})
 
 
 def test_inference_parameters_alias_warns_and_copies():
@@ -608,6 +686,26 @@ def test_dynamic_inference_request_serialize_strips_event_add_engine():
     assert out.events[0].type == DynamicInferenceEventType.FINISH
 
 
+def test_dynamic_vlm_request_serialize_omits_integer_keyed_engine_salts():
+    request = DynamicVLMInferenceRequest(
+        request_id=1,
+        prompt_tokens=torch.tensor([1, 2, 3, 4]),
+        sampling_params=SamplingParams(),
+        block_hash_salt={1: "media"},
+        media_block_salt_keychain={1: "media"},
+        num_img_embeddings_per_tile=0,
+        imgs=None,
+        num_tiles=None,
+        decoder_seq_length=0,
+    )
+
+    serialized = request.serialize()
+
+    assert "block_hash_salt" not in serialized
+    assert "media_block_salt_keychain" not in serialized
+    msgpack.unpackb(msgpack.packb(serialized, use_bin_type=True), raw=False)
+
+
 @pytest.mark.parametrize(
     (
         "return_prompt_tokens",
@@ -794,7 +892,7 @@ def test_weight_scoped_salt_is_inert_before_the_first_resume():
     from megatron.core.inference.engines.dynamic.requests import _weight_scoped_salt
 
     assert _weight_scoped_salt(0, None) is None
-    assert _weight_scoped_salt(0, "img-1") == "img-1"
+    assert _weight_scoped_salt(0, {0: "img-1"}) == {0: "img-1"}
 
     tokens = torch.arange(8, dtype=torch.int64)
     assert compute_block_hashes_batched(
@@ -808,10 +906,10 @@ def test_weight_scoped_salt_keeps_media_identity_distinct():
 
     tokens = torch.arange(8, dtype=torch.int64)
     a = compute_block_hashes_batched(
-        tokens, block_size=4, cache_salt=_weight_scoped_salt(3, "img-a")
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(3, {0: "img-a"})
     )
     b = compute_block_hashes_batched(
-        tokens, block_size=4, cache_salt=_weight_scoped_salt(3, "img-b")
+        tokens, block_size=4, cache_salt=_weight_scoped_salt(3, {0: "img-b"})
     )
     text = compute_block_hashes_batched(
         tokens, block_size=4, cache_salt=_weight_scoped_salt(3, None)
@@ -862,7 +960,7 @@ def test_supplied_block_hashes_are_not_re_salted():
         block_size_tokens=4,
         enable_prefix_caching=True,
         precomputed_block_hashes=[11, 22],
-        block_hash_salt="w9",
+        block_hash_salt={0: "w9"},
     )
     assert request.precomputed_block_hashes == [11, 22]
 

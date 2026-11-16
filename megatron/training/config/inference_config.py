@@ -228,8 +228,9 @@ class InferenceSetupConfig:
     more readily as the fleet becomes lopsided. Dimensionless and not capped at 1."""
 
     inference_dynamic_batching_prefix_cache_ttl_seconds: float = 300.0
-    """How long the coordinator assumes an engine still holds a block it routed there. It never
-    observes evictions, so entries untouched for this long are dropped rather than kept forever."""
+    """How long the coordinator assumes an engine still holds routed prefix blocks or media items.
+    It never observes evictions, so stale prefix entries are pruned on prefix updates and stale
+    media-engine assignments on media updates."""
 
     inference_dynamic_batching_media_cache_coordinator_policy: Literal[
         "affinity", "load_balanced"

@@ -3,9 +3,11 @@
 import copy
 import hashlib
 import math
+import struct
 import time
 import uuid
 import warnings
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
@@ -13,6 +15,7 @@ from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 import numpy as np
 import torch
 
+from megatron.core.inference import media_preprocessing
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.inference.utils import detokenize_tokens
@@ -81,8 +84,87 @@ def deserialize_tensor(tensor_data: Any) -> torch.Tensor:
     return torch.frombuffer(bytearray(raw_data), dtype=dtype).reshape(shape).clone()
 
 
+def serialize_ndarray(arr: np.ndarray) -> dict:
+    """Serialize numpy array to a JSON-compatible dict."""
+    return {"data": arr.tolist(), "dtype": str(arr.dtype)}
+
+
+def deserialize_ndarray(obj: dict) -> np.ndarray:
+    """Deserialize numpy array from dict."""
+    return np.array(obj["data"], dtype=np.dtype(obj["dtype"]))
+
+
+def _serialize_inference_value(value: Any) -> Any:
+    """Recursively convert supported inference values to msgpack-safe values."""
+    if isinstance(value, torch.Tensor):
+        return ("tensor", serialize_tensor(value))
+    if isinstance(value, np.ndarray):
+        return ("ndarray", serialize_ndarray(value))
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError(
+                f"Cannot serialize inference dictionary with non-string keys: {value!r}"
+            )
+        return {key: _serialize_inference_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return ("list", [_serialize_inference_value(item) for item in value])
+    if isinstance(value, tuple):
+        return ("tuple", [_serialize_inference_value(item) for item in value])
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if value is None or isinstance(value, (bool, float, str, bytes)):
+        return value
+    if isinstance(value, int):
+        if -(1 << 63) <= value < (1 << 64):
+            return value
+        raise OverflowError(
+            f"Cannot serialize integer outside MessagePack's 64-bit range: {value!r}"
+        )
+    raise TypeError(f"Cannot serialize inference value: {value!r}")
+
+
+def _deserialize_inference_value(value: Any) -> Any:
+    """Reverse :func:`_serialize_inference_value` recursively."""
+    if isinstance(value, (torch.Tensor, np.ndarray)):
+        return value
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        value_type, payload = value
+        if value_type == "tensor":
+            return deserialize_tensor(payload)
+        if value_type == "ndarray":
+            return deserialize_ndarray(payload)
+        if value_type == "list":
+            return [_deserialize_inference_value(item) for item in payload]
+        if value_type == "tuple":
+            return tuple(_deserialize_inference_value(item) for item in payload)
+    if isinstance(value, dict):
+        if any(not isinstance(key, str) for key in value):
+            raise TypeError(
+                f"Cannot deserialize inference dictionary with non-string keys: {value!r}"
+            )
+        return {key: _deserialize_inference_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_deserialize_inference_value(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_deserialize_inference_value(item) for item in value)
+    if isinstance(value, bytearray):
+        return bytes(value)
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return value
+    raise TypeError(f"Cannot deserialize inference value: {value!r}")
+
+
+def normalize_media_cache_keychain(value: Any) -> Optional[Tuple[str, ...]]:
+    """Validate and normalize a media cache keychain received over the wire."""
+    if value is None:
+        return None
+    if not isinstance(value, (list, tuple)) or any(not isinstance(item, str) for item in value):
+        raise ValueError("media_cache_keychain must be a list or tuple of strings")
+    return tuple(value)
+
+
 def _normalize_raw_media_items(modality_data: Any) -> Optional[List[bytes]]:
-    """Normalize supported raw-media inputs, or return None for preprocessed data."""
+    """Normalize supported raw-media input formats into list[bytes]."""
     if isinstance(modality_data, (bytes, bytearray)):
         return [bytes(modality_data)]
     if isinstance(modality_data, list):
@@ -92,63 +174,112 @@ def _normalize_raw_media_items(modality_data: Any) -> Optional[List[bytes]]:
     return None
 
 
-def _media_tensor_keys(modality: str) -> Tuple[str, ...]:
-    """Return the tensor fields that define a preprocessed media input."""
-    if modality == "video":
-        return ("imgs", "imgs_sizes", "num_frames")
-    if modality == "image":
-        return ("imgs", "imgs_sizes", "num_tiles")
-    raise ValueError(f"Unsupported media modality: {modality!r}.")
+def _update_hash_payload(hash_obj, tag: bytes, payload: Any) -> None:
+    """Write one type-tagged, length-delimited payload."""
+    hash_obj.update(tag)
+    hash_obj.update(len(payload).to_bytes(8, "big"))
+    hash_obj.update(payload)
+
+
+def update_hash_with_bytes(hash_obj, byte_data: bytes | bytearray):
+    """
+    Update the hash for data in the form of raw bytes.
+    """
+    byte_data = bytes(byte_data)
+    _update_hash_payload(hash_obj, b"B", byte_data)
+    return hash_obj
+
+
+def update_hash_with_tensor(hash_obj, tensor_data: torch.Tensor):
+    """
+    Update the hash for data in the form of a Tensor.
+    """
+    tensor = tensor_data.detach().contiguous().cpu()
+    hash_obj.update(b"T")
+    _update_hash_payload(hash_obj, b"D", str(tensor.dtype).encode())
+    _update_hash_payload(hash_obj, b"H", repr(tuple(tensor.shape)).encode())
+    # Viewing a flattened tensor as uint8 works for dtypes such as
+    # bfloat16 that NumPy cannot represent directly.
+    tensor_bytes = tensor.reshape(-1).view(torch.uint8).numpy()
+    _update_hash_payload(hash_obj, b"V", tensor_bytes)
+    return hash_obj
+
+
+def update_hash_with_ndarray(hash_obj, array_data: np.ndarray):
+    """Update the hash from a contiguous NumPy array."""
+    array = np.ascontiguousarray(array_data)
+    hash_obj.update(b"A")
+    _update_hash_payload(hash_obj, b"D", str(array.dtype).encode())
+    _update_hash_payload(hash_obj, b"H", repr(tuple(array.shape)).encode())
+    _update_hash_payload(hash_obj, b"V", array.view(np.uint8).reshape(-1))
+    return hash_obj
+
+
+def update_inference_hash(hash_obj, data: Any):
+    """Update a hash from canonical, type-tagged inference data.
+
+    Supported values are ``None``, booleans, integers, floats, strings, bytes,
+    tensors, lists, tuples, and dictionaries with string keys. Unsupported
+    values raise ``TypeError`` rather than relying on a potentially unstable
+    string representation.
+    """
+    if isinstance(data, dict):
+        if any(not isinstance(key, str) for key in data):
+            raise TypeError(f"Cannot hash inference dictionary with non-string keys: {data!r}")
+        hash_obj.update(b"M")
+        hash_obj.update(len(data).to_bytes(8, "big"))
+        for key, val in sorted(data.items()):
+            update_inference_hash(hash_obj, key)
+            update_inference_hash(hash_obj, val)
+    elif isinstance(data, list):
+        hash_obj.update(b"L")
+        hash_obj.update(len(data).to_bytes(8, "big"))
+        for item in data:
+            update_inference_hash(hash_obj, item)
+    elif isinstance(data, tuple):
+        hash_obj.update(b"U")
+        hash_obj.update(len(data).to_bytes(8, "big"))
+        for item in data:
+            update_inference_hash(hash_obj, item)
+    elif data is None:
+        hash_obj.update(b"N")
+    elif isinstance(data, bool):
+        hash_obj.update(b"B\x01" if data else b"B\x00")
+    elif isinstance(data, int):
+        _update_hash_payload(hash_obj, b"I", str(data).encode())
+    elif isinstance(data, float):
+        _update_hash_payload(hash_obj, b"F", struct.pack(">d", data))
+    elif isinstance(data, str):
+        _update_hash_payload(hash_obj, b"S", data.encode())
+    elif isinstance(data, torch.Tensor):
+        update_hash_with_tensor(hash_obj, data)
+    elif isinstance(data, np.ndarray):
+        update_hash_with_ndarray(hash_obj, data)
+    elif isinstance(data, (bytes, bytearray)):
+        update_hash_with_bytes(hash_obj, data)
+    else:
+        raise TypeError(f"Cannot hash inference value: {data!r}")
+
+    return hash_obj
 
 
 def compute_media_cache_key(modality: str, modality_data: Any) -> str:
-    """Return a stable content key for raw or preprocessed media.
+    """Compute a media content key for one modality payload."""
+    if not isinstance(modality, str) or not modality:
+        raise ValueError("modality must be a non-empty string.")
+    # Compute a cumulative hash.
+    media_hash = hashlib.sha256()
+    media_hash.update(b"megatron-inference-multimodal-hash")
+    media_hash.update(modality.encode())
+    update_inference_hash(media_hash, modality_data)
+    return media_hash.hexdigest()
 
-    The key is generated inside the inference stack so callers do not need to
-    understand vision-embedding cache identity. Tensor metadata is included to
-    prevent equal byte streams with different shapes or dtypes from colliding.
-    """
-    digest = hashlib.sha256()
-    digest.update(b"megatron-media-v2\0")
-    digest.update(modality.encode())
-    digest.update(b"\0")
 
-    raw_items = _normalize_raw_media_items(modality_data)
-    if raw_items is not None:
-        digest.update(b"raw\0")
-        for item in raw_items:
-            digest.update(len(item).to_bytes(8, "big"))
-            digest.update(item)
-        return digest.hexdigest()
-
-    if isinstance(modality_data, dict):
-        digest.update(b"preprocessed\0")
-        cache_fields = set(_media_tensor_keys(modality)) | {"num_img_embeddings_per_tile"}
-        for name in sorted(set(modality_data) & cache_fields):
-            value = modality_data[name]
-            digest.update(name.encode())
-            digest.update(b"\0")
-            if isinstance(value, torch.Tensor):
-                tensor = value.detach().contiguous().cpu()
-                digest.update(str(tensor.dtype).encode())
-                digest.update(b"\0")
-                digest.update(repr(tuple(tensor.shape)).encode())
-                digest.update(b"\0")
-                # Viewing a flattened tensor as uint8 works for dtypes such as
-                # bfloat16 that NumPy cannot represent directly.
-                tensor_bytes = tensor.reshape(-1).view(torch.uint8).numpy().tobytes()
-                digest.update(tensor_bytes)
-            elif name == "num_img_embeddings_per_tile":
-                digest.update(str(int(value)).encode())
-            else:
-                raise TypeError(
-                    f"Cannot compute a media cache key from field {name!r} "
-                    f"of type {type(value).__name__}."
-                )
-            digest.update(b"\0")
-        return digest.hexdigest()
-
-    raise TypeError(f"Cannot compute a media cache key for {type(modality_data).__name__}.")
+def compute_media_cache_keychain(
+    modality: str, modality_data_batch: Sequence[Any]
+) -> tuple[str, ...]:
+    """Compute a tuple of media content keys for entries in a multimodal batch."""
+    return tuple(compute_media_cache_key(modality, entry) for entry in modality_data_batch)
 
 
 @dataclass(frozen=True)
@@ -193,9 +324,9 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
         raise TypeError(f"multi_modal_data must be a dict or None, got {type(multi_modal_data)}.")
 
     unsupported = set(multi_modal_data) - {"image", "video", "media_tokens_preexpanded"}
-    if "media_cache_key" in unsupported:
+    if "media_cache_keychain" in unsupported:
         raise ValueError(
-            "multi_modal_data['media_cache_key'] is internal and must not be "
+            "multi_modal_data['media_cache_keychain'] is internal and must not be "
             "provided; media identity is computed automatically."
         )
     if unsupported:
@@ -203,6 +334,7 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
             f"Unsupported multimodal modalities: {sorted(unsupported)}; "
             "supported modalities are 'image' and 'video'."
         )
+    # TODO(@cspades): Allow multiple modalities in a single model input request.
     if multi_modal_data.get("image") is not None and multi_modal_data.get("video") is not None:
         raise NotImplementedError(
             "Mixing image and video inputs in one inference request is not supported."
@@ -218,30 +350,18 @@ def serialize_multimodal_data(multi_modal_data: Any) -> Optional[Dict[str, Any]]
             f"got {type(media_tokens_preexpanded)}."
         )
     metadata = {"media_tokens_preexpanded": True} if media_tokens_preexpanded else {}
+
+    # Serialize.
     raw_items = _normalize_raw_media_items(modality_data)
-    if raw_items is not None:
-        media_cache_key = compute_media_cache_key(modality, raw_items)
-        return {modality: raw_items, "media_cache_key": media_cache_key, **metadata}
+    if raw_items is not None:  # list[bytes]
+        media_cache_keychain = compute_media_cache_keychain(modality, raw_items)
+        return {modality: raw_items, "media_cache_keychain": media_cache_keychain, **metadata}
     elif isinstance(modality_data, dict):
-        media_cache_key = compute_media_cache_key(modality, modality_data)
-        wire: Dict[str, Any] = {}
-        for key in _media_tensor_keys(modality):
-            value = modality_data.get(key)
-            if value is None:
-                continue
-            if not isinstance(value, torch.Tensor):
-                raise TypeError(
-                    f"multi_modal_data[{modality!r}][{key!r}] must be a Tensor, "
-                    f"got {type(value)}."
-                )
-            wire[key] = serialize_tensor(value)
-        if "num_img_embeddings_per_tile" in modality_data:
-            wire["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
-        if modality == "video":
-            for key in ("video_frame_indices", "video_fps"):
-                if key in modality_data:
-                    wire[key] = copy.deepcopy(modality_data[key])
-        return {modality: wire, "media_cache_key": media_cache_key, **metadata} if wire else None
+        if not modality_data:
+            return None
+        media_cache_keychain = compute_media_cache_keychain(modality, [modality_data])
+        wire = _serialize_inference_value(modality_data)
+        return {modality: wire, "media_cache_keychain": media_cache_keychain, **metadata}
     else:
         raise TypeError(
             f"multi_modal_data[{modality!r}] must be bytes, list[bytes], or a "
@@ -329,7 +449,7 @@ def resolve_multimodal_data_for_engine(
     unsupported = set(multi_modal_data) - {
         "image",
         "video",
-        "media_cache_key",
+        "media_cache_keychain",
         "media_tokens_preexpanded",
     }
     if unsupported:
@@ -352,16 +472,16 @@ def resolve_multimodal_data_for_engine(
             f"got {type(media_tokens_preexpanded)}."
         )
     metadata = {"media_tokens_preexpanded": True} if media_tokens_preexpanded else {}
-    media_cache_key = multi_modal_data.get("media_cache_key")
-    if media_cache_key is not None:
-        if not isinstance(media_cache_key, str) or not media_cache_key:
-            raise ValueError("Internal media_cache_key must be a non-empty string.")
-        metadata["media_cache_key"] = media_cache_key
-    if isinstance(modality_data, list):
-        from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-            image_preprocessing,
-        )
-
+    media_cache_keychain = multi_modal_data.get("media_cache_keychain")
+    if media_cache_keychain is not None:
+        if (
+            not isinstance(media_cache_keychain, (list, tuple))
+            or not media_cache_keychain
+            or any(not isinstance(key, str) or not key for key in media_cache_keychain)
+        ):
+            raise ValueError("Internal media_cache_keychain must contain non-empty strings.")
+        metadata["media_cache_keychain"] = tuple(media_cache_keychain)
+    if isinstance(modality_data, list) and all(isinstance(item, bytes) for item in modality_data):
         if modality == "video":
             if video_preprocessing_config is None:
                 raise RuntimeError(
@@ -373,7 +493,7 @@ def resolve_multimodal_data_for_engine(
                 else None
             )
             return {
-                **image_preprocessing.preprocess_video_bytes_list(
+                **media_preprocessing.preprocess_video_bytes_list(
                     modality_data, video_preprocessing_config, device=device
                 ),
                 **metadata,
@@ -385,65 +505,47 @@ def resolve_multimodal_data_for_engine(
             torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else None
         )
         return {
-            **image_preprocessing.preprocess_image_bytes_list(
+            **media_preprocessing.preprocess_image_bytes_list(
                 modality_data, image_preprocessing_config, device=device
             ),
             **metadata,
         }
-    if not isinstance(modality_data, dict):
+
+    elif isinstance(modality_data, dict):
+        kwargs = _deserialize_inference_value(modality_data)
+        if not isinstance(kwargs, dict):
+            raise TypeError(
+                f"Wire multi_modal_data[{modality!r}] must deserialize to a dictionary, "
+                f"got {type(kwargs).__name__}."
+            )
+
+        if modality == "image":
+            # Reject incomplete static-tiling payloads. Static tiling (imgs +
+            # num_tiles, no imgs_sizes) needs num_img_embeddings_per_tile to size
+            # image-token expansion. Without it, the request would silently run as
+            # text-only.
+            has_num_tiles = "num_tiles" in kwargs
+            has_imgs_sizes = "imgs_sizes" in kwargs
+            has_per_tile = kwargs.get("num_img_embeddings_per_tile", 0) > 0
+            if has_num_tiles and not has_imgs_sizes and not has_per_tile:
+                raise ValueError(
+                    "Static-tiling image payload requires num_img_embeddings_per_tile > 0 "
+                    "when num_tiles is provided without imgs_sizes."
+                )
+        else:
+            missing = {"imgs", "imgs_sizes", "num_frames"} - set(kwargs)
+            if missing:
+                raise ValueError(
+                    "Preprocessed video payload requires imgs, imgs_sizes, and num_frames; "
+                    f"missing {sorted(missing)}."
+                )
+        return {**kwargs, **metadata}
+
+    else:
         raise TypeError(
             f"Wire multi_modal_data[{modality!r}] must be list[bytes] or a "
             f"serialized tensor dict; got {type(modality_data)}."
         )
-
-    kwargs: Dict[str, Any] = {}
-    tensor_keys = (
-        ("imgs", "imgs_sizes", "num_frames")
-        if modality == "video"
-        else ("imgs", "imgs_sizes", "num_tiles")
-    )
-    for key in tensor_keys:
-        if key in modality_data:
-            value = modality_data[key]
-            kwargs[key] = value if isinstance(value, torch.Tensor) else deserialize_tensor(value)
-    if "num_img_embeddings_per_tile" in modality_data:
-        kwargs["num_img_embeddings_per_tile"] = int(modality_data["num_img_embeddings_per_tile"])
-    if modality == "video":
-        for key in ("video_frame_indices", "video_fps"):
-            if key in modality_data:
-                kwargs[key] = copy.deepcopy(modality_data[key])
-
-    if modality == "image":
-        # Reject incomplete static-tiling payloads. Static tiling (imgs +
-        # num_tiles, no imgs_sizes) needs num_img_embeddings_per_tile to size
-        # image-token expansion. Without it, the request would silently run as
-        # text-only.
-        has_num_tiles = "num_tiles" in kwargs
-        has_imgs_sizes = "imgs_sizes" in kwargs
-        has_per_tile = kwargs.get("num_img_embeddings_per_tile", 0) > 0
-        if has_num_tiles and not has_imgs_sizes and not has_per_tile:
-            raise ValueError(
-                "Static-tiling image payload requires num_img_embeddings_per_tile > 0 "
-                "when num_tiles is provided without imgs_sizes."
-            )
-    else:
-        missing = {"imgs", "imgs_sizes", "num_frames"} - set(kwargs)
-        if missing:
-            raise ValueError(
-                "Preprocessed video payload requires imgs, imgs_sizes, and num_frames; "
-                f"missing {sorted(missing)}."
-            )
-    return {**kwargs, **metadata}
-
-
-def serialize_ndarray(arr: np.ndarray) -> dict:
-    """Serialize numpy array to a JSON-compatible dict."""
-    return {"data": arr.tolist(), "dtype": str(arr.dtype)}
-
-
-def deserialize_ndarray(obj: dict) -> np.ndarray:
-    """Deserialize numpy array from dict."""
-    return np.array(obj["data"], dtype=np.dtype(obj["dtype"]))
 
 
 def _merge_routing(parts: List[np.ndarray], total_rows: int) -> Optional[np.ndarray]:
@@ -496,12 +598,12 @@ class Status(Enum):
 
 
 def compute_block_hashes_batched(
-    prompt_tokens: torch.Tensor, block_size: int, cache_salt: Optional[str] = None
+    prompt_tokens: torch.Tensor, block_size: int, cache_salt: Optional[dict[int, str]] = None
 ) -> List[int]:
     """Compute SHA-256 based hashes for all complete blocks in a prompt.
 
     Each block hash is computed as SHA-256(parent_digest || block_bytes), where
-    parent_digest chains from the previous block (starting from a zero digest).
+    parent_digest chains from the previous block (starting from an empty bytestring).
     This provides cryptographic collision resistance with no exploitable algebraic
     structure.
 
@@ -509,8 +611,7 @@ def compute_block_hashes_batched(
         prompt_tokens: All prompt token IDs, shape [seq_len].
         block_size: Number of tokens per block.
         cache_salt: Optional request-input identity mixed into every chained
-            block hash. Multimodal requests use their generated media key so
-            equal token placeholders backed by different media cannot share KV.
+            block hash at token positions specified by integer keys in the dict.
 
     Returns:
         List of positive integer hash values in [1, 2^63-1], one per complete block.
@@ -524,17 +625,33 @@ def compute_block_hashes_batched(
     tokens_bytes = tokens_cpu.numpy().tobytes()
     block_byte_size = block_size * tokens_cpu.element_size()  # 8 bytes per int64
 
-    hashes = []
-    if cache_salt is None:
-        parent_digest = b'\x00' * 32  # Preserve text-only hash compatibility.
-    else:
-        parent_digest = hashlib.sha256(
-            b"megatron-prefix-cache-salt-v1\0" + cache_salt.encode()
-        ).digest()
+    # Compute block salts.
+    block_salt = {}
+    if cache_salt:
+        for token_idx, salt_str in sorted(cache_salt.items(), key=lambda x: x[0]):
+            # Convert token positions to block positions.
+            block_salt_idx = token_idx // block_size
+            block_salt.setdefault(block_salt_idx, []).append((token_idx, salt_str))
 
+    hashes = []
+    parent_digest = b""
     for i in range(num_complete_blocks):
+        # Get block token bytes.
         block_bytes = tokens_bytes[i * block_byte_size : (i + 1) * block_byte_size]
-        digest = hashlib.sha256(parent_digest + block_bytes).digest()
+        # Construct a prefix block hash digest.
+        if i in block_salt:
+            # Merge salts that land in the same block.
+            hash_obj = hashlib.sha256(parent_digest)
+            hash_obj.update(b"inference-block-salt")
+            for token_idx, salt in block_salt[i]:
+                hash_obj.update(token_idx.to_bytes(8, "big"))
+                _update_hash_payload(hash_obj, b"S", salt.encode())
+            # Compute salted token block digest.
+            hash_obj.update(block_bytes)
+            digest = hash_obj.digest()
+        else:
+            # Token block hash only. No salt.
+            digest = hashlib.sha256(parent_digest + block_bytes).digest()
 
         # Map to positive int64 range [1, 2^63-1], avoiding sentinels -1 and 0
         raw = int.from_bytes(digest[:8], byteorder='little', signed=False)
@@ -825,7 +942,11 @@ class DynamicInferenceRequest(InferenceRequest):
     # its descendants may be registered or inherited by a later chunk: the request does
     # not own the canonical ancestor. Persists across prefill chunks.
     mtp_private_suffix_start: Optional[int] = None
-    block_hash_salt: Optional[str] = None  # Media identity for multimodal KV safety.
+    # Mapping from token position to media hash for salting block hashes when caching
+    # KV and SSM values. By aligning each media item to the first prefix block in which
+    # their media embeddings appear, we can accurately retrieve prefix blocks that are
+    # not affected by subsequent changes in media embeddings.
+    block_hash_salt: Optional[Dict[int, str]] = None
 
     # Computed field - not passed by caller
     precomputed_block_hashes: List[int] = field(default_factory=list)
@@ -870,7 +991,7 @@ class DynamicInferenceRequest(InferenceRequest):
             self.prompt_tokens, self.block_size_tokens, cache_salt=self.block_hash_salt
         )
 
-    def resalt_block_hashes(self, block_hash_salt: Optional[str]) -> None:
+    def resalt_block_hashes(self, block_hash_salt: Optional[Dict[int, str]]) -> None:
         """Replace the block-hash salt and recompute the prompt's block hashes.
 
         Only valid for a request that holds no KV yet (nothing prefilled, matched,
@@ -1008,6 +1129,10 @@ class DynamicInferenceRequest(InferenceRequest):
         # crosses back to the REST endpoint.
         obj.pop("offload_params", None)
         obj.pop("media_tensors", None)
+        # Engine-only prefix-cache salt maps use integer token positions as keys.
+        # Remove them because reply decoding requires string/bytes MessagePack map keys.
+        obj.pop("block_hash_salt", None)
+        obj.pop("media_block_salt_keychain", None)
         obj["prompt_length"] = prompt_len
         obj["payload_offloaded"] = payload_offloaded
         obj["payload_stage_metadata"] = dict(payload_stage_metadata or {})
@@ -1343,7 +1468,7 @@ class DynamicInferenceRequestRecord:
                 video_frame_indices=old_request.video_frame_indices,
                 video_fps=old_request.video_fps,
                 media_tokens_preexpanded=old_request.media_tokens_preexpanded,
-                media_cache_key=old_request.media_cache_key,
+                media_block_salt_keychain=old_request.media_block_salt_keychain,
                 decoder_seq_length=old_request.decoder_seq_length,
                 image_embeddings=old_request.image_embeddings,
                 image_token_mask=old_request.image_token_mask,
@@ -1869,7 +1994,14 @@ class DynamicVLMInferenceRequest(DynamicInferenceRequest, VLMInferenceRequest):
     video_frame_indices: Optional[List[List[int]]] = None
     video_fps: Optional[List[float]] = None
     media_tokens_preexpanded: bool = False
-    media_cache_key: Optional[str] = None
+    media_block_salt_keychain: Optional[Dict[int, str]] = None
     deferred_image_embedding_count: Optional[int] = None
     """Embedding count of an image request admitted without encoding; the engine encodes it
     together with the other waiting requests right before prefill and clears this afterwards."""
+
+    @property
+    def media_cache_identity(self) -> Optional[Tuple[str, ...]]:
+        """Media cache keychain for storing and retrieving pre-computed multimodal embeddings."""
+        if not self.media_block_salt_keychain:
+            return None
+        return tuple(media_hash for _, media_hash in sorted(self.media_block_salt_keychain.items()))

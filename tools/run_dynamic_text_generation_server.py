@@ -391,8 +391,10 @@ async def run_text_generation_server(
                 num_replicas=num_replicas,
                 hostname=hostname,
                 chat_template=chat_template,
-                multimodal_prompt_config=(
-                    engine.controller.inference_wrapped_model.multimodal_prompt_config
+                multimodal_prompt_config=getattr(
+                    engine.controller.inference_wrapped_model,
+                    "multimodal_prompt_config",
+                    None,
                 ),
                 default_temperature=default_temperature,
                 default_top_p=default_top_p,

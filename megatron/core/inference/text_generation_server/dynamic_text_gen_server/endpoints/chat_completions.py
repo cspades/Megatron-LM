@@ -330,9 +330,7 @@ def _extract_media_url_bytes(url: str, *, max_fetch_bytes: int | None = None) ->
     raise ValueError(f"Unsupported media URL scheme: {url[:40]!r}")
 
 
-def _extract_multimodal_from_messages(
-    messages, prompt_config: MultimodalPromptConfig, max_fetch_bytes: int | None = None
-):
+def _extract_multimodal_from_messages(messages, max_fetch_bytes: int | None = None):
     """Extract media bytes and replace structured blocks with internal slots.
 
     Remote image fetching is blocking, so callers must run this function off
@@ -402,15 +400,6 @@ def _extract_multimodal_from_messages(
                 new_chunks.append(chunk)
 
         if found_modalities:
-            input_markers = {
-                prompt_config.get_spec(modality).input_marker for modality in found_modalities
-            } - {None}
-            for index, chunk in enumerate(new_chunks):
-                if isinstance(chunk, dict) and chunk.get("type") == "text":
-                    chunk = dict(chunk)
-                    for marker in input_markers:
-                        chunk["text"] = str(chunk.get("text", "")).replace(marker, "")
-                    new_chunks[index] = chunk
             msg_copy = dict(message)
             msg_copy["content"] = new_chunks
             rewritten.append(msg_copy)
@@ -422,21 +411,32 @@ def _extract_multimodal_from_messages(
     return rewritten, image_bytes_list, video_bytes_list, media_slots
 
 
-def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None):
-    """Prepare messages so tokenizer chat templates can safely consume them.
+def _sanitize_messages_for_template(
+    messages, media_slots=(), multimodal_prompt_config: Optional[MultimodalPromptConfig] = None
+):
+    """Normalize message content and tool calls for HF/Jinja chat templates.
 
-    This lowers structured media content according to the model prompt contract
-    and normalizes tool-call argument payloads inside each message:
-    - messages[*].tool_calls[*].function.arguments is coerced to a dict.
+    Content-part lists are flattened, unsupported parts are dropped, and registered
+    media slot markers are retained and joined with the configured separator::
 
-    Example transformation:
-    Input:
-      [{"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": "{\"x\": 1}"}}]}]
-    Output:
-      [{"role": "assistant", "tool_calls": [{"function": {"name": "f", "arguments": {"x": 1}}}]}]
+        [{"role": "user", "content": [
+          {"type": "text", "text": "Compare"},
+          {"type": "text", "text": "__MCORE_MEDIA_SLOT_0__"},
+          {"type": "text", "text": "with"},
+          {"type": "text", "text": "__MCORE_MEDIA_SLOT_1__"}]}]
+        -> [{"role": "user",
+             "content": "Compare\\n__MCORE_MEDIA_SLOT_0__\\nwith\\n__MCORE_MEDIA_SLOT_1__"}]
 
-    Another example:
-    - arguments: "[1,2,3]" -> arguments: {}
+    Tool-call JSON-object strings are decoded to mappings::
+
+        [{"role": "assistant", "tool_calls": [
+          {"function": {"name": "f", "arguments": "{\"x\": 1}"}}]}]
+        -> [{"role": "assistant", "tool_calls": [
+             {"function": {"name": "f", "arguments": {"x": 1}}}]}]
+
+    Dictionary content uses its ``text`` field; ``null`` becomes ``""``; other
+    scalar content is stringified. Invalid tool arguments become ``{}``. Non-dict
+    entries are preserved, and non-list ``messages`` is returned unchanged.
     """
     if not isinstance(messages, list):
         return messages
@@ -465,7 +465,10 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
                         text_chunks.append(str(chunk.get("text", "")))
                 elif isinstance(chunk, str):
                     text_chunks.append(chunk)
-            if prompt_config is not None and prompt_config.content_part_order == "media_first":
+            if (
+                multimodal_prompt_config is not None
+                and multimodal_prompt_config.content_part_order == "media_first"
+            ):
                 media_sentinels = media_sentinels_by_message.get(message_index, set())
                 media_chunks = [chunk for chunk in text_chunks if chunk in media_sentinels]
                 non_media_chunks = [chunk for chunk in text_chunks if chunk not in media_sentinels]
@@ -473,10 +476,12 @@ def _sanitize_messages_for_template(messages, media_slots=(), prompt_config=None
             separator = ""
             message_modalities = media_modalities_by_message.get(message_index, set())
             if message_modalities:
-                if prompt_config is None:
-                    raise ValueError("Media content normalization requires a prompt config.")
+                if multimodal_prompt_config is None:
+                    raise ValueError(
+                        "Media content normalization requires a multimodal prompt config."
+                    )
                 separators = {
-                    prompt_config.get_spec(modality).content_part_separator
+                    multimodal_prompt_config.get_spec(modality).content_part_separator
                     for modality in message_modalities
                 }
                 if len(separators) != 1:
@@ -687,14 +692,16 @@ def _suffix_tokens_after_prefix(eos_token_ids, template_prefix_token_ids, curren
     )
 
 
-def _contains_model_media_token(token_ids, tokenizer, prompt_config):
+def _contains_model_media_token(
+    token_ids, tokenizer, multimodal_prompt_config: MultimodalPromptConfig
+):
     """Whether exact prior model tokens still reference image/video embeddings."""
     if not isinstance(token_ids, list) or not hasattr(tokenizer, "convert_tokens_to_ids"):
         return False
 
     media_token_ids = set()
     for modality in ("image", "video"):
-        spec = prompt_config.get_spec(modality)
+        spec = multimodal_prompt_config.get_spec(modality)
         token_id = tokenizer.convert_tokens_to_ids(spec.model_token)
         if token_id is not None and token_id != getattr(tokenizer, "unk_token_id", None):
             media_token_ids.add(int(token_id))
@@ -730,14 +737,20 @@ def _coerce_to_token_id_list(result):
     return list(result)
 
 
-def _tokenize_with_media_slots(media_message_str: str, media_slots, chat_tok, prompt_config):
+def _tokenize_with_media_slots(
+    media_message_str: str, media_slots, chat_tok, multimodal_prompt_config: MultimodalPromptConfig
+):
     """Tokenize and convert media text placeholders into model media token IDs."""
+    # Identify the positions of all media slot markers in the rendered content message.
     positioned_slots = []
     for sentinel, modality, _message_index in media_slots:
         if media_message_str.count(sentinel) != 1:
             raise ValueError(f"Chat template did not preserve media slot {sentinel}.")
         positioned_slots.append((media_message_str.index(sentinel), sentinel, modality))
 
+    # Trace through the rendered prompt string and replace media slot markers with
+    # media token ID's defined by the model. Track positions for prefix block hashing.
+    # "__MCORE_MEDIA_SLOT_<INDEX>__" -> f"{spec.model_token}"
     prompt_tokens = []
     cursor = 0
     for position, sentinel, modality in sorted(positioned_slots):
@@ -746,7 +759,8 @@ def _tokenize_with_media_slots(media_message_str: str, media_slots, chat_tok, pr
                 chat_tok(media_message_str[cursor:position], add_special_tokens=False)
             )
         )
-        spec = prompt_config.get_spec(modality)
+        # Get the model media token ID.
+        spec = multimodal_prompt_config.get_spec(modality)
         resolved_id = (
             chat_tok.convert_tokens_to_ids(spec.model_token)
             if hasattr(chat_tok, "convert_tokens_to_ids")
@@ -756,13 +770,17 @@ def _tokenize_with_media_slots(media_message_str: str, media_slots, chat_tok, pr
             resolved_id = None
         if resolved_id is None:
             raise ValueError(f"Tokenizer does not define media token {spec.model_token!r}.")
+        # Add the media prefix, e.g. <img>.
         prompt_tokens.extend(
             _coerce_to_token_id_list(chat_tok(spec.prefix, add_special_tokens=False))
         )
+        # Add the media token ID, e.g. <image>.
         prompt_tokens.append(int(resolved_id))
+        # Add the media suffix, e.g. </img>.
         prompt_tokens.extend(
             _coerce_to_token_id_list(chat_tok(spec.suffix, add_special_tokens=False))
         )
+        # Increment past the media slot marker in the rendered prompt.
         cursor = position + len(sentinel)
 
     prompt_tokens.extend(
@@ -775,7 +793,7 @@ def _tokenize_chat_template_sync(
     chat_tok,
     messages,
     media_slots,
-    prompt_config,
+    multimodal_prompt_config: MultimodalPromptConfig,
     tools,
     chat_template_kwargs,
     add_generation_prompt=True,
@@ -808,7 +826,9 @@ def _tokenize_chat_template_sync(
     if media_slots:
         if not isinstance(rendered, str):
             raise TypeError("Multimodal chat template rendering must return a string.")
-        prompt_tokens = _tokenize_with_media_slots(rendered, media_slots, chat_tok, prompt_config)
+        prompt_tokens = _tokenize_with_media_slots(
+            rendered, media_slots, chat_tok, multimodal_prompt_config
+        )
     else:
         # Standardize to list[int].
         prompt_tokens = _coerce_to_token_id_list(rendered)
@@ -881,10 +901,17 @@ def _has_chat_template(tokenizer, chat_template_kwargs):
 class _TemplateRenderer:
     """Renders chat messages to token ids on the tokenize executor for one request."""
 
-    def __init__(self, executor, tokenizer, prompt_config, tools, chat_template_kwargs) -> None:
+    def __init__(
+        self,
+        executor,
+        tokenizer,
+        multimodal_prompt_config: MultimodalPromptConfig,
+        tools,
+        chat_template_kwargs,
+    ) -> None:
         self.executor = executor
         self.tokenizer = tokenizer
-        self.prompt_config = prompt_config
+        self.multimodal_prompt_config = multimodal_prompt_config
         self.tools = tools
         self.chat_template_kwargs = chat_template_kwargs
 
@@ -895,7 +922,7 @@ class _TemplateRenderer:
             self.tokenizer,
             messages,
             media_slots,
-            self.prompt_config,
+            self.multimodal_prompt_config,
             tools=self.tools,
             chat_template_kwargs=self.chat_template_kwargs,
             add_generation_prompt=add_generation_prompt,
@@ -969,7 +996,7 @@ async def _stitch_previous_turn(
         prefix_source.mode is _PrefixMode.EXACT
         and not previous_media_slots
         and _contains_model_media_token(
-            last_message["prompt_token_ids"], renderer.tokenizer, renderer.prompt_config
+            last_message["prompt_token_ids"], renderer.tokenizer, renderer.multimodal_prompt_config
         )
     ):
         raise ValueError(
@@ -986,7 +1013,7 @@ async def _stitch_previous_turn(
         "are altered between generations."
     )
     # The templated tokenization of just the previous generation.
-    retokenized_prefix = await renderer.tokenize(
+    retokenized_prefix, _ = await renderer.tokenize(
         messages_to_last_assistant, previous_media_slots, add_generation_prompt=False
     )
 
@@ -996,10 +1023,15 @@ async def _stitch_previous_turn(
         )
         if previous_media_slots:
             # Post-expansion stitching needs the media count to know how many subsequent
-            # media tokens to expand.
+            # media tokens to expand. Note that for the offloaded stitching case, the
+            # prompt preparer is responsible for replacing / splicing the prefix with a
+            # media-expanded prompt, i.e. one media token per embedding. The engine will
+            # only pre-process and expand the newly added suffix tokens from this turn.
             offload_params[PREFIX_MEDIA_COUNT_FIELD] = len(previous_media_slots)
         return prompt_tokens, offload_params
 
+    # Stitch previously-tokenized (media-expanded) prefix with newly-tokenized suffix
+    # based on the EOS boundaries of the re-tokenized prefix.
     previous_turn_token_ids = (
         last_message["prompt_token_ids"] + last_message["generation_token_ids"]
     )
@@ -1339,7 +1371,12 @@ try:
         client = current_app.config['client']
         tokenizer = current_app.config['tokenizer']
         parsers = current_app.config['parsers']
-        prompt_config = current_app.config['multimodal_prompt_config']
+        # TODO(@cspades): Right now, the server multimodal prompt config is
+        # completely decoupled from the same field in InferenceConfig, with
+        # the source-of-truth being the model inference wrapper def. We need
+        # to unify them, this is not clean and requires the user to correctly
+        # pass the same config to both engine and server init.
+        multimodal_prompt_config = current_app.config['multimodal_prompt_config']
 
         req = await request.get_json()
         offload_params = req.get("offload_params")
@@ -1364,7 +1401,6 @@ try:
             messages, image_bytes_list, video_bytes_list, media_slots = await asyncio.to_thread(
                 _extract_multimodal_from_messages,
                 messages,
-                prompt_config,
                 current_app.config.get("MAX_CONTENT_LENGTH"),
             )
         except ValueError as error:
@@ -1374,7 +1410,9 @@ try:
             multi_modal_data = {"image": image_bytes_list}
         elif video_bytes_list:
             multi_modal_data = {"video": video_bytes_list}
-        template_messages = _sanitize_messages_for_template(messages, media_slots, prompt_config)
+        template_messages = _sanitize_messages_for_template(
+            messages, media_slots, multimodal_prompt_config
+        )
         template_tools = _sanitize_tools_for_template(options.tools)
 
         try:
@@ -1391,7 +1429,7 @@ try:
         renderer = _TemplateRenderer(
             current_app.config.get('tokenize_executor'),
             _chat_tokenizer(current_app.config.get('tokenizer_copy', tokenizer)),
-            prompt_config,
+            multimodal_prompt_config,
             template_tools,
             options.chat_template_kwargs,
         )

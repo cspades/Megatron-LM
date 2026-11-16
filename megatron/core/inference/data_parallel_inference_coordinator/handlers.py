@@ -32,6 +32,7 @@ from megatron.core.inference.config import (
 )
 from megatron.core.inference.disaggregation.handoff_ownership import HandoffClaimStatus
 from megatron.core.inference.headers import Headers
+from megatron.core.inference.inference_request import normalize_media_cache_keychain
 
 from .state import CONTROL_TRANSITIONS, CoordinatorState
 
@@ -169,10 +170,28 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     media_frame = bodies[2]
     offload_frame = bodies[3]
 
+    try:
+        media_cache_keychain = normalize_media_cache_keychain(
+            media_meta.get("media_cache_keychain") if isinstance(media_meta, dict) else None
+        )
+    except ValueError as error:
+        logging.warning("Coordinator: rejecting malformed media cache keychain: %s", error)
+        coordinator._send_to_client(
+            [
+                sender_identity,
+                msgpack.packb(
+                    [Headers.REQUEST_ERROR.value, client_request_id, str(error), True],
+                    use_bin_type=True,
+                ),
+            ]
+        )
+        return
+
     if coordinator.is_disaggregated_inference():
         if media_meta or media_frame != b"\xc0":
             # Native handoffs do not support VLM/media state yet. Reject only
             # this request, before allocating an ID or reserving engine capacity.
+            # TODO(@cspades): Support multimodal disaggregation.
             coordinator._send_to_client(
                 [
                     sender_identity,
@@ -204,11 +223,6 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
         [Headers.SUBMIT_REQUEST.value, request_id, sampling_params, media_meta], use_bin_type=True
     )
 
-    # Media identity is read straight from the metadata frame; it salts the
-    # routing hashes and is passed to rank selection for media affinity. The
-    # media itself rides in its own body frame, forwarded without being decoded.
-    media_cache_key = media_meta.get("media_cache_key") if isinstance(media_meta, dict) else None
-
     # Only prefix-affinity routing consults the block hashes. When nothing will
     # look at them, skip hashing *and* the prompt decode it needs -- avoiding
     # that decode is the reason the prompt travels in its own frame.
@@ -226,16 +240,12 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
             # decode. Two cases reach this: a client built directly rather than by
             # the frontend, which is told neither the block size nor the policy,
             # and a string prompt, which needs a tokenizer the client may not have.
-            # Either can carry media, which is why the media key is still passed as
-            # the salt: a client always derives that key while serializing, even
-            # when it cannot hash. A client that *is* configured salts its own
-            # hashes and never lands here.
             #
             # Distinct from an empty list, which means the caller did hash and the
             # prompt was shorter than one block. Re-hashing that would pay the
             # decode for every short request.
             request_hashes = coordinator.compute_request_hashes(
-                msgpack.unpackb(prompt_frame, raw=False), cache_salt=media_cache_key
+                msgpack.unpackb(prompt_frame, raw=False)
             )
     else:
         request_hashes = []
@@ -255,7 +265,7 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     # Account for the fact that some engines may have died.
     for _ in range(len(coordinator.identities_of_data_parallel_ranks)):
         next_identity = coordinator.get_best_data_parallel_rank(
-            request_hashes, media_cache_key=media_cache_key
+            request_hashes, media_cache_keychain=media_cache_keychain
         )
         if coordinator._send_to_engine(
             next_identity, [engine_metadata, prompt_frame, media_frame, offload_frame]
@@ -271,11 +281,12 @@ def handle_submit_request(coordinator, sender_identity, metadata, bodies):
     coordinator.request_id_to_rank[request_id] = next_identity
     coordinator._pending_counts[coordinator.identity_to_rank_index[next_identity]] += 1
     if (
-        isinstance(media_cache_key, str)
+        isinstance(media_cache_keychain, tuple)
+        and media_cache_keychain
         and coordinator.vision_embedding_cache_enabled
         and coordinator.media_cache_coordinator_policy == MediaCacheCoordinatorPolicy.AFFINITY
     ):
-        coordinator._update_media_affinity(media_cache_key, next_identity)
+        coordinator._update_media_affinity(media_cache_keychain, next_identity)
     if request_hashes:
         coordinator._update_rank_hashes(next_identity, request_hashes)
     if coordinator.schedule_records is not None:

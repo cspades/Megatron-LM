@@ -8,8 +8,9 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from megatron.core.inference import media_preprocessing
 from megatron.core.inference.config import ImageProcessingConfig, VideoProcessingConfig
-from megatron.core.inference.text_generation_server.dynamic_text_gen_server.image_preprocessing import (
+from megatron.core.inference.media_preprocessing import (
     _decode_sampled_video_frames,
     _load_frame_sequence_manifest,
     _video_sample_indices,
@@ -236,12 +237,8 @@ def test_image_list_applies_model_length_budget_per_request(monkeypatch, caplog)
         observed_budgets.append(config.dynamic_resolution_max_patches)
         return torch.zeros(1, 1, 3), torch.ones(1, 2, dtype=torch.int32)
 
-    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-        image_preprocessing,
-    )
-
-    image_preprocessing._warn_multi_image_patch_budget.cache_clear()
-    monkeypatch.setattr(image_preprocessing, "preprocess_image_bytes", fake_preprocess)
+    media_preprocessing._warn_multi_image_patch_budget.cache_clear()
+    monkeypatch.setattr(media_preprocessing, "preprocess_image_bytes", fake_preprocess)
     config = ImageProcessingConfig(
         patch_dim=2,
         dynamic_resolution=True,
@@ -258,7 +255,7 @@ def test_image_list_applies_model_length_budget_per_request(monkeypatch, caplog)
 
     assert observed_budgets == [6, 6, 6, 6, 6, 6]
     assert caplog.text.count("may use more patches per image when given more images") == 1
-    image_preprocessing._warn_multi_image_patch_budget.cache_clear()
+    media_preprocessing._warn_multi_image_patch_budget.cache_clear()
 
 
 def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):
@@ -269,17 +266,13 @@ def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):
     ]
     target_shapes = []
 
-    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-        image_preprocessing,
-    )
-
     monkeypatch.setattr(
-        image_preprocessing,
+        media_preprocessing,
         "_load_frame_sequence_manifest",
         lambda _payload, _magic: (frames, [0, 1], 1.0),
     )
     monkeypatch.setattr(
-        image_preprocessing,
+        media_preprocessing,
         "dynamic_res_preprocess",
         lambda *_args, **_kwargs: SimpleNamespace(height=4, width=6),
     )
@@ -289,7 +282,7 @@ def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):
         target_shapes.append(target_hw)
         return torch.ones(1, 1, 2), torch.tensor([target_hw], dtype=torch.int32)
 
-    monkeypatch.setattr(image_preprocessing, "preprocess_image", fake_preprocess_image)
+    monkeypatch.setattr(media_preprocessing, "preprocess_image", fake_preprocess_image)
     config = VideoProcessingConfig(
         image_config=ImageProcessingConfig(patch_dim=2, dynamic_resolution=True),
         num_frames=2,
@@ -308,12 +301,8 @@ def test_video_manifest_packs_frames_with_one_shared_resolution(monkeypatch):
 
 def test_video_manifest_rejects_wrong_frame_count(monkeypatch):
     image_module = pytest.importorskip("PIL.Image")
-    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-        image_preprocessing,
-    )
-
     monkeypatch.setattr(
-        image_preprocessing,
+        media_preprocessing,
         "_load_frame_sequence_manifest",
         lambda _payload, _magic: ([image_module.new("RGB", (2, 2))], [0], 1.0),
     )

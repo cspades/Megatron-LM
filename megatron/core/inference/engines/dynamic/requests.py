@@ -5,7 +5,7 @@ import logging
 import math
 import warnings
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -45,31 +45,26 @@ logger.setLevel(logging.INFO)
 _PROMPT_PREPARATION_ERROR_FIELD = "_request_prompt_preparation_error"
 
 
-def _weight_scoped_salt(weight_epoch: int, media_cache_key: Optional[str]) -> Optional[str]:
-    """Scope a request's block hashes to the weight generation that will serve it.
+def _weight_scoped_salt(
+    weight_epoch: int, block_salt_index: Optional[dict[int, str]]
+) -> Optional[dict[int, str]]:
+    """Prevent prefix-cache reuse across weight refits.
 
-    Under KVCacheManagementMode.PERSIST the prefix cache survives a refit:
-    reinitialize_inference_state_buffers() only resets metadata on the RECOMPUTE
-    path, so the KV and Mamba hash tables outlive suspend/resume and a request
-    admitted afterwards can match blocks whose KV the previous weights computed.
-    Staleness is then bounded only by eviction pressure, since the engine-side
-    allocator has no TTL.
-
-    Mixing the weight generation into the salt makes chains from different
-    generations disjoint, so stale blocks become unmatchable rather than being
-    freed -- nothing is mutated at refit time, leaving live requests, chunked
-    prefill and pending Mamba restores untouched.
-
-    Composed with the media key rather than replacing it: multimodal requests
-    still need equal token placeholders backed by different media to stay
-    unmatchable. Epoch 0 returns the media key unchanged, so an engine that never
-    resumes hashes exactly as before.
+    A nonzero weight epoch salts the first block, changing its entire hash chain.
+    Existing media salts are preserved; epoch zero leaves them unchanged.
     """
     if weight_epoch == 0:
-        return media_cache_key
-    if media_cache_key is None:
-        return f"w{weight_epoch}"
-    return f"w{weight_epoch}\x00{media_cache_key}"
+        return block_salt_index
+    if block_salt_index is None:
+        # Salt the weight epoch at the very first block.
+        # All blocks are effectively invalid after refit.
+        return {0: f"weight_epoch_{weight_epoch}"}
+    else:
+        weight_epoch_key = f"weight_epoch_{weight_epoch}"
+        if 0 in block_salt_index:
+            # Merge the weight epoch with the block salt index at position 0.
+            weight_epoch_key += f",{block_salt_index[0]}"
+        return {0: weight_epoch_key, **{k: v for k, v in block_salt_index.items() if k != 0}}
 
 
 @dataclass(kw_only=True)
@@ -447,7 +442,7 @@ class RequestIntakeMixin:
         video_fps: Optional[List[float]] = None,
         media_tokens_preexpanded: bool = False,
         offload_params: Optional[Dict] = None,
-        media_cache_key: Optional[str] = None,
+        media_cache_keychain: Optional[Tuple[str, ...]] = None,
     ) -> asyncio.Future[DynamicInferenceRequest]:
         """Add request to inference context.
 
@@ -484,7 +479,7 @@ class RequestIntakeMixin:
             media_tokens_preexpanded (bool): Whether prompt token IDs already contain
                 one model token per projected media embedding.
             offload_params (Optional[Dict]): Opaque metadata forwarded to the payload stager.
-            media_cache_key (Optional[str]): Media identity computed by the submitting
+            media_cache_keychain (Optional[Tuple[str, ...]]): Media identities computed by the submitting
                 inference client. Direct callers may omit it and let the engine derive
                 an identity from the resolved media tensors.
 
@@ -497,7 +492,7 @@ class RequestIntakeMixin:
             sampling_params = SamplingParams()
 
         input_modalities = ["text"]
-        cached_vision_entry = self._get_cached_vision_entry(media_cache_key)
+        cached_vision_entry = self._get_cached_vision_entry(media_cache_keychain)
         if cached_vision_entry is not None:
             input_modalities.append(cached_vision_entry.modality)
         elif num_frames is not None:
@@ -542,7 +537,7 @@ class RequestIntakeMixin:
             or num_img_embeddings_per_tile != 0
             or imgs_sizes is not None
             or num_frames is not None
-            or media_cache_key is not None
+            or media_cache_keychain is not None
         ):
             nvtx_range = "megatron.inference.multimodal.build_vlm_request"
             nvtx_range_push(nvtx_range)
@@ -562,7 +557,7 @@ class RequestIntakeMixin:
                     video_fps=video_fps,
                     media_tokens_preexpanded=media_tokens_preexpanded,
                     offload_params=offload_params,
-                    media_cache_key=media_cache_key,
+                    media_cache_keychain=media_cache_keychain,
                 )
             finally:
                 nvtx_range_pop(nvtx_range)

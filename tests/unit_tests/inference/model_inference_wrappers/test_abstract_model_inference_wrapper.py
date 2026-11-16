@@ -9,10 +9,17 @@ from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConf
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
+from megatron.core.inference.model_inference_wrappers.multimodal.multimodal_inference_wrapper import (
+    MultimodalInferenceWrapperMixin,
+)
+
+
+class _TestMultimodalWrapper(MultimodalInferenceWrapperMixin, GPTInferenceWrapper):
+    pass
 
 
 def _wrapper(prompt_config=None):
-    wrapper = object.__new__(GPTInferenceWrapper)
+    wrapper = object.__new__(_TestMultimodalWrapper)
     wrapper.multimodal_prompt_config = prompt_config
     return wrapper
 

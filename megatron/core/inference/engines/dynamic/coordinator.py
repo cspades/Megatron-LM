@@ -25,6 +25,7 @@ from megatron.core.inference.inference_request import (
     RequestPayloadStageResult,
     Status,
     merge_multimodal_data,
+    normalize_media_cache_keychain,
     resolve_multimodal_data_for_engine,
 )
 from megatron.core.inference.sampling_params import SamplingParams
@@ -237,6 +238,17 @@ class CoordinatorMixin:
             deterministic_mode = torch.are_deterministic_algorithms_enabled()
             dp_pipe, dp_process_pipe = spawn_context.Pipe()
             coordinator_ready_event = spawn_context.Event()
+            wrapper = self.controller.inference_wrapped_model
+            expandable_token_ids = (
+                {
+                    wrapper.resolve_media_token_id(self.controller.tokenizer, modality)
+                    for modality in ("image", "video")
+                    if getattr(wrapper, f"supports_{modality}", False)
+                }
+                if hasattr(wrapper, "resolve_media_token_id")
+                else set()
+            )
+
             self.inference_coordinator_process = spawn_context.Process(
                 target=DataParallelInferenceCoordinator.entrypoint,
                 kwargs={
@@ -268,6 +280,7 @@ class CoordinatorMixin:
                     "hostname": hostname,
                     "disaggregated": disagg_config is not None,
                     "initial_state": coordinator_initial_state,
+                    "expandable_token_ids": expandable_token_ids,
                 },
             )
             self.inference_coordinator_process.start()
@@ -788,14 +801,22 @@ class CoordinatorMixin:
                 nvtx_range_push(nvtx_range)
                 try:
                     prompt = msgpack.unpackb(message[1], raw=False)
-                    media_cache_key = (
-                        media_meta.get("media_cache_key") if isinstance(media_meta, dict) else None
-                    )
+                    try:
+                        media_cache_keychain = normalize_media_cache_keychain(
+                            media_meta.get("media_cache_keychain")
+                            if isinstance(media_meta, dict)
+                            else None
+                        )
+                    except ValueError as error:
+                        self._fail_submission(
+                            request_id, SamplingParams.deserialize(sampling_params), error
+                        )
+                        continue
                     media_modality = (
                         media_meta.get("modality") if isinstance(media_meta, dict) else None
                     )
                     cached_vision_entry = self._get_cached_vision_entry(
-                        media_cache_key, media_modality
+                        media_cache_keychain, media_modality
                     )
                     if cached_vision_entry is None:
                         media_payload = msgpack.unpackb(message[2], raw=False)
@@ -826,7 +847,7 @@ class CoordinatorMixin:
                 try:
                     if cached_vision_entry is not None:
                         vlm_kwargs = {
-                            "media_cache_key": media_cache_key,
+                            "media_cache_keychain": media_cache_keychain,
                             "media_tokens_preexpanded": bool(
                                 media_meta.get("media_tokens_preexpanded", False)
                             ),

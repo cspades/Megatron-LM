@@ -560,12 +560,12 @@ def test_handoff_salt_is_used_for_lookup_and_retained_after_import(handoff_loop)
         7,
         prompt,
         SamplingParams(num_tokens_to_generate=3),
-        {"resume_tokens": [99], "block_hash_salt": "weights-v2"},
+        {"resume_tokens": [99], "block_hash_salt": [[0, "weights-v2"]]},
         [100],
     )
     pending = engine._pending_kv_imports[0]
     assert pending.hashes == compute_block_hashes_batched(
-        torch.tensor(prompt), 4, cache_salt="weights-v2"
+        torch.tensor(prompt), 4, cache_salt={0: "weights-v2"}
     )
     assert pending.cached_prefix_block_count == 0
     # Other evicted requests may still be waiting when an import completes.
@@ -575,16 +575,16 @@ def test_handoff_salt_is_used_for_lookup_and_retained_after_import(handoff_loop)
     ):
         engine._finalize_kv_handoff_import(pending)
     request = engine.get_request(7)
-    assert request.block_hash_salt == "weights-v2"
+    assert request.block_hash_salt == {0: "weights-v2"}
     assert list(engine.waiting_request_ids) == [8]
     request.block_size_tokens = 4
     request.enable_prefix_caching = True
     request.generated_tokens.extend([98, 97, 96])
     record = DynamicInferenceRequestRecord.from_request(request)
     record.checkpoint()
-    assert record[-1].block_hash_salt == "weights-v2"
+    assert record[-1].block_hash_salt == {0: "weights-v2"}
     assert record[-1].precomputed_block_hashes == compute_block_hashes_batched(
-        torch.tensor([*prompt, 99, 98, 97, 96]), 4, cache_salt="weights-v2"
+        torch.tensor([*prompt, 99, 98, 97, 96]), 4, cache_salt={0: "weights-v2"}
     )
     _drain_loop(handoff_loop)
 
@@ -1478,7 +1478,7 @@ def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch
         SimpleNamespace(
             request_id=7,
             prompt_tokens=torch.arange(8),
-            block_hash_salt="weights-v2",
+            block_hash_salt={0: "weights-v2"},
             sampling_params=SamplingParams(
                 do_kv_handoff=True, return_log_probs=True, skip_prompt_log_probs=True
             ),
@@ -1514,7 +1514,7 @@ def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch
         "block_ids": [10, 11],
         "kv_meta": {
             "resume_tokens": [71],
-            "block_hash_salt": "weights-v2",
+            "block_hash_salt": [(0, "weights-v2")],
             "resume_log_probs": [-0.1],
             "pp_metas": [
                 {"tp_metas": {"global_rank": 0}, "block_ids": [10, 11]},
@@ -1522,6 +1522,9 @@ def test_handoff_metadata_batches_completed_requests_across_pipeline(monkeypatch
             ],
         },
     }
+    assert msgpack.unpackb(
+        msgpack.packb(requests[0].disaggregated_params, use_bin_type=True), raw=False
+    )["kv_meta"]["block_hash_salt"] == [[0, "weights-v2"]]
     assert "resume_log_probs" not in requests[1].disaggregated_params["kv_meta"]
     assert requests[1].disaggregated_params["kv_meta"]["pp_metas"][1]["block_ids"] == [12, 13, 14]
 

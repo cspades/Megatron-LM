@@ -126,6 +126,7 @@ class DataParallelInferenceCoordinator:
         hostname: str | None = None,
         disaggregated: bool = False,
         initial_state: CoordinatorState = CoordinatorState.RUNNING,
+        expandable_token_ids: set[int] | None = None,
     ):
         """
         Initializes the inference coordinator.
@@ -140,8 +141,8 @@ class DataParallelInferenceCoordinator:
                 expected to connect.
             tokenizer: The tokenizer to use for prompt tokenization and detokenization.
             inference_coordinator_port (Optional[int]): The TCP port number to bind the server to.
-            prefix_cache_ttl_seconds (float): How long a routed block is assumed to
-                still be held by the engine it was routed to.
+            prefix_cache_ttl_seconds (float): How long routed prefix blocks and media are
+                assumed to remain cached by their assigned engines.
             prefix_caching_routing_alpha (float): How hard to penalise load when
                 routing on prefix affinity: score = cache_score - alpha *
                 relative_load, measured against the fleet mean. Dimensionless and
@@ -154,6 +155,8 @@ class DataParallelInferenceCoordinator:
                 reusable projected media embeddings.
             max_requests (int): Max concurrent requests per rank, used to cap load
                 balancing and to gate media affinity on spare capacity.
+            expandable_token_ids (Optional[set[int]]): Compact media token IDs whose
+                consecutive expanded runs are collapsed for routing hashes.
             initial_state (CoordinatorState): State the control-signal machine starts in.
                 RUNNING by default; SUSPENDED when the engines are constructed without weights.
                 It must match the engines' start state: RESUME is honored only from SUSPENDED,
@@ -245,6 +248,7 @@ class DataParallelInferenceCoordinator:
         self.prefix_cache_ttl_seconds = prefix_cache_ttl_seconds
         self.media_cache_coordinator_policy = media_cache_coordinator_policy
         self.media_cache_routing_weight = media_cache_routing_weight
+        self.expandable_token_ids = set(expandable_token_ids or ())
         self.vision_embedding_cache_enabled = vision_embedding_cache_enabled
         if self.media_cache_routing_weight < 0:
             raise ValueError("media_cache_routing_weight must be non-negative.")
@@ -275,7 +279,7 @@ class DataParallelInferenceCoordinator:
         # removing an engine renumbers the ranks, which would leave queued entries
         # pointing at the wrong one.
         self._hash_expiry: deque = deque()
-        self._media_cache_affinity: OrderedDict[str, bytes] = OrderedDict()
+        self._media_cache_affinity: OrderedDict[tuple[str, ...], dict[bytes, float]] = OrderedDict()
         self._media_cache_affinity_max_entries = _DEFAULT_MEDIA_CACHE_AFFINITY_MAX_ENTRIES
 
         # Clients that have completed the CONNECT handshake.
@@ -301,12 +305,31 @@ class DataParallelInferenceCoordinator:
         """
         return select_engine(self._identities_list, self._pending_counts)
 
-    def _update_media_affinity(self, media_cache_key: str, identity: bytes) -> None:
-        """Record the rank most recently assigned a generated media key."""
-        self._media_cache_affinity.pop(media_cache_key, None)
-        self._media_cache_affinity[media_cache_key] = identity
+    def _update_media_affinity(
+        self, media_cache_keychain: tuple[str, ...], identity: bytes
+    ) -> None:
+        """Record every rank assigned the complete media keychain."""
+        now = time.monotonic()
+        assigned_identities = self._media_cache_affinity.pop(media_cache_keychain, {})
+        assigned_identities[identity] = now
+        self._media_cache_affinity[media_cache_keychain] = assigned_identities
         if len(self._media_cache_affinity) > self._media_cache_affinity_max_entries:
             self._media_cache_affinity.popitem(last=False)
+
+        self._expire_media_affinity(now)
+
+    def _expire_media_affinity(self, now):
+        """Prune media-engine assignments that exceed the cache TTL."""
+        for media_cache_keychain, assigned_identities in list(self._media_cache_affinity.items()):
+            assigned_identities = {
+                assigned_identity: timestamp
+                for assigned_identity, timestamp in assigned_identities.items()
+                if now - timestamp <= self.prefix_cache_ttl_seconds
+            }
+            if assigned_identities:
+                self._media_cache_affinity[media_cache_keychain] = assigned_identities
+            else:
+                del self._media_cache_affinity[media_cache_keychain]
 
     def _register_rank_identity(self, identity):
         """Register a new rank identity in the scoring data structures.
@@ -357,11 +380,16 @@ class DataParallelInferenceCoordinator:
 
         self.identities_of_data_parallel_ranks.remove(identity)
         self.removed_engine_identities.add(identity)
-        self._media_cache_affinity = OrderedDict(
-            (media_key, assigned_identity)
-            for media_key, assigned_identity in self._media_cache_affinity.items()
-            if assigned_identity != identity
-        )
+        remaining_media_affinity = OrderedDict()
+        for media_keychain, assigned_identities in self._media_cache_affinity.items():
+            remaining_identities = {
+                assigned_identity: timestamp
+                for assigned_identity, timestamp in assigned_identities.items()
+                if assigned_identity != identity
+            }
+            if remaining_identities:
+                remaining_media_affinity[media_keychain] = remaining_identities
+        self._media_cache_affinity = remaining_media_affinity
         # Losing the control connection does not prove source allocations are gone.
         # Keep handoff ownership so cleanup can retry if the engine reconnects.
         idx = self.identity_to_rank_index.pop(identity, None)
@@ -492,24 +520,21 @@ class DataParallelInferenceCoordinator:
         for data_parallel_rank_id in list(self.identities_of_data_parallel_ranks):
             self._send_to_engine(data_parallel_rank_id, [serialized])
 
-    def compute_request_hashes(self, prompt, cache_salt: str | None = None):
+    def compute_request_hashes(self, prompt):
         """Compute compact-prompt affinity hashes on CPU.
-
-        For text requests these equal the engine's KV block hashes. For
-        multimodal requests they are routing proxies: the coordinator does not
-        preprocess media or expand placeholders, so the engine independently
-        computes authoritative KV hashes from its post-expansion tokens. With a
-        common media salt, compact-prefix matches remain a useful affinity
-        signal because equal media have equal expansion behavior.
 
         Callers decide whether hashes are wanted at all: computing them requires
         the decoded prompt, and decoding it is the cost the caller is usually
         trying to avoid. See handle_submit_request.
 
+        Multimodal hashes are not salted into request hashes, as they need to
+        align with the position of multimodal embeddings associated with a media
+        item to ensure prefix block hashes are computed accurately for caching.
+        A position-to-hash mapping will be passed to compute_block_hashes_batched
+        as block-wise cache salt in the inference engine.
+
         Args:
             prompt: Either a string (to be tokenized) or a list of token IDs.
-            cache_salt: Optional media identity mixed into the prompt hash
-                chain for multimodal affinity.
 
         Returns:
             List of integer routing hashes, one per complete block in the prompt.
@@ -518,12 +543,20 @@ class DataParallelInferenceCoordinator:
             tokens = self.tokenizer.tokenize(prompt)
         else:
             tokens = list(prompt)
-        token_tensor = torch.tensor(tokens, dtype=torch.int64)
-        return compute_block_hashes_batched(
-            token_tensor, self.block_size_tokens, cache_salt=cache_salt
-        )
+        # Remove engine-expandable media placeholder tokens, which appear in subsequent
+        # turns differently than the initial turn when prefix-stitching and ends up
+        # turn-lagging the affinity score.
+        tokens_reduced = [
+            token
+            for i, token in enumerate(tokens)
+            if i == 0 or token not in self.expandable_token_ids or token != tokens[i - 1]
+        ]
+        token_tensor = torch.tensor(tokens_reduced, dtype=torch.int64)
+        return compute_block_hashes_batched(token_tensor, self.block_size_tokens)
 
-    def get_best_data_parallel_rank(self, request_hashes, media_cache_key: str | None = None):
+    def get_best_data_parallel_rank(
+        self, request_hashes, media_cache_keychain: tuple[str, ...] | None = None
+    ):
         """Select the best DP rank based on media affinity, prefix affinity, and load.
 
         Uses ``score = cache_score - alpha * relative_load``, where
@@ -533,7 +566,7 @@ class DataParallelInferenceCoordinator:
 
         Args:
             request_hashes: List of block hashes for the request.
-            media_cache_key: Internally generated content key for request media.
+            media_cache_keychain: Internally generated content keys for request media.
 
         Returns:
             bytes: The ZMQ identity of the selected data parallel rank.
@@ -542,7 +575,7 @@ class DataParallelInferenceCoordinator:
             self._identities_list,
             self._pending_counts,
             affinity_scores=self.get_routing_affinity(
-                self._identities_list, self._pending_counts, request_hashes, media_cache_key
+                self._identities_list, self._pending_counts, request_hashes, media_cache_keychain
             ),
             routing_alpha=self.prefix_caching_routing_alpha,
         )
@@ -552,7 +585,7 @@ class DataParallelInferenceCoordinator:
         identities: list[bytes],
         counts: np.ndarray,
         request_hashes: list[int],
-        media_cache_key: str | None = None,
+        media_cache_keychain: tuple[str, ...] | None = None,
     ) -> np.ndarray | None:
         """Read normalized cache affinity for an ordered eligible engine pool.
 
@@ -561,7 +594,11 @@ class DataParallelInferenceCoordinator:
         Cache state stays here; callers own eligibility, load and selection.
         """
         # Use load-balancing if text or multimodal coordination affinity is deactivated.
-        has_media = isinstance(media_cache_key, str) and bool(media_cache_key)
+        has_media = (
+            isinstance(media_cache_keychain, tuple)
+            and bool(media_cache_keychain)
+            and all(isinstance(key, str) and key for key in media_cache_keychain)
+        )
         use_prefix_affinity = (
             self.enable_prefix_caching
             and bool(request_hashes)
@@ -589,12 +626,14 @@ class DataParallelInferenceCoordinator:
         # Compute multimodal affinity.
         media_hit = np.zeros(n_ranks, dtype=np.float64)
         if use_media_affinity:
-            media_identity = self._media_cache_affinity.get(media_cache_key)
-            media_rank_idx = (
-                identities.index(media_identity) if media_identity in identities else None
-            )
-            if media_rank_idx is not None and counts[media_rank_idx] < self.max_requests:
-                media_hit[media_rank_idx] = 1.0
+            # Lookup engine ranks that have affinity with the keychain.
+            media_identities = self._media_cache_affinity.get(media_cache_keychain, {})
+            for media_identity in media_identities:
+                if media_identity in identities:
+                    media_rank_idx = identities.index(media_identity)
+                    if counts[media_rank_idx] < self.max_requests:
+                        # Multimodal keychain engine rank affinity hit.
+                        media_hit[media_rank_idx] = 1.0
 
         # If there are no hits anywhere, just fall-back to load balancing.
         if not prefix_blocks.any() and not media_hit.any():
@@ -795,6 +834,7 @@ class DataParallelInferenceCoordinator:
         hostname: str | None = None,
         disaggregated: bool = False,
         initial_state: CoordinatorState = CoordinatorState.RUNNING,
+        expandable_token_ids: set[int] | None = None,
     ):
         """
         Class method to instantiate and run the coordinator, for use in a separate process.
@@ -823,6 +863,8 @@ class DataParallelInferenceCoordinator:
             max_requests (int): Max concurrent requests per rank.
             initial_state (CoordinatorState): State the control-signal machine starts in.
                 RUNNING by default; SUSPENDED when the engines are constructed without weights.
+            expandable_token_ids (Optional[set[int]]): Compact media token IDs whose
+                consecutive expanded runs are collapsed for routing hashes.
         """
         coordinator = cls(
             pipe_connection,
@@ -843,6 +885,7 @@ class DataParallelInferenceCoordinator:
             hostname=hostname,
             disaggregated=disaggregated,
             initial_state=initial_state,
+            expandable_token_ids=expandable_token_ids,
         )
         ready_event.set()
         try:

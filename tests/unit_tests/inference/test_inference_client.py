@@ -343,19 +343,11 @@ async def test_configured_client_hashes_a_text_prompt():
     )
 
 
-async def test_multimodal_hashes_are_salted_with_the_media_key():
-    """Same tokens, different media, disjoint hashes.
-
-    The client is the only place holding both the tokens and the media key, so
-    it is the only place that can salt them without deriving the key twice --
-    deriving it digests the media, hundreds of MB for video.
-    """
+async def test_multimodal_hashes_keep_text_affinity_independent():
+    """Coordinator text-prefix hashes do not include the orthogonal media identity."""
     import torch
 
-    from megatron.core.inference.inference_request import (
-        compute_block_hashes_batched,
-        compute_media_cache_key,
-    )
+    from megatron.core.inference.inference_request import compute_block_hashes_batched
 
     client, fake_socket = _configured_client()
     tokens = list(range(8))
@@ -366,11 +358,9 @@ async def test_multimodal_hashes_are_salted_with_the_media_key():
     client.add_request(tokens, SamplingParams(), multi_modal_data={"image": b"jpeg"}).cancel()
     media_hashes = _hash_frame(fake_socket)
 
-    assert set(text_hashes).isdisjoint(media_hashes)
+    assert media_hashes == text_hashes
     assert media_hashes == compute_block_hashes_batched(
-        torch.tensor(tokens, dtype=torch.int64),
-        block_size=4,
-        cache_salt=compute_media_cache_key("image", [b"jpeg"]),
+        torch.tensor(tokens, dtype=torch.int64), block_size=4
     )
 
 
@@ -394,7 +384,7 @@ async def test_media_bytes_travel_in_their_own_frame():
 
     media_meta = msgpack.unpackb(meta_frame, raw=False)[3]
     assert media_meta == {
-        "media_cache_key": compute_media_cache_key("image", [image]),
+        "media_cache_keychain": [compute_media_cache_key("image", image)],
         "modality": "image",
     }
     # The bytes are in the body frame, and nowhere in the metadata frame.

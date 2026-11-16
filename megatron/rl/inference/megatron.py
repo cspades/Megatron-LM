@@ -151,8 +151,10 @@ class MegatronLocal(MegatronChatInterface, InferenceServer):
                 server_port=kwargs.get('port', 8294),
                 parsers=cfg.rl.rl_inference_parsers,
                 verbose=kwargs.get('verbose', False),
-                multimodal_prompt_config=(
-                    inference_engine.controller.inference_wrapped_model.multimodal_prompt_config
+                multimodal_prompt_config=getattr(
+                    inference_engine.controller.inference_wrapped_model,
+                    "multimodal_prompt_config",
+                    None,
                 ),
             )
         else:

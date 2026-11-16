@@ -13,7 +13,7 @@ from megatron.core.inference.inference_request import (
     PREFIX_MEDIA_COUNT_FIELD,
     PREFIX_TEMPLATE_TOKEN_IDS_FIELD,
     DynamicVLMInferenceRequest,
-    compute_media_cache_key,
+    compute_media_cache_keychain,
 )
 from megatron.core.inference.sampling_params import SamplingParams
 from megatron.core.utils import internal_api, nvtx_range_pop, nvtx_range_push
@@ -87,7 +87,14 @@ def _prepend_expanded_multimodal_prefix(
 
 
 def _slice_suffix_media_metadata(
-    prefix_media_count, *, num_tiles, imgs_sizes, num_frames, video_frame_indices, video_fps
+    prefix_media_count,
+    *,
+    media_item_embedding_counts,
+    num_tiles,
+    imgs_sizes,
+    num_frames,
+    video_frame_indices,
+    video_fps,
 ):
     """Select metadata for media placeholders occurring in the compact suffix."""
     if not isinstance(prefix_media_count, int) or prefix_media_count < 0:
@@ -118,6 +125,7 @@ def _slice_suffix_media_metadata(
 
     return {
         "suffix_media_count": total_media_count - prefix_media_count,
+        "media_item_embedding_counts": media_item_embedding_counts[prefix_media_count:],
         "num_tiles": (num_tiles[prefix_media_count:] if num_tiles is not None else None),
         "imgs_sizes": (imgs_sizes[prefix_media_offset:] if imgs_sizes is not None else None),
         "num_frames": (num_frames[prefix_media_count:] if num_frames is not None else None),
@@ -298,9 +306,9 @@ class MultimodalRequestMixin:
         image, so the images of several requests are concatenated the same way and the output
         is split back by each request's embedding count. One call covers at most
         ``context.max_tokens`` embeddings. Cache hits are filled from the vision cache,
-        requests sharing a ``media_cache_key`` are encoded once, a group whose shared encode
-        fails falls back to per-request encodes, and a request whose encode fails is failed
-        on its own and removed from the waiting queue.
+        requests sharing the same media hashes are encoded once, a group whose shared encode fails
+        falls back to per-request encodes, and a request whose encode fails is failed on its own and
+        removed from the waiting queue.
         """
         if not self._has_deferred_image_encodes:
             return
@@ -329,18 +337,19 @@ class MultimodalRequestMixin:
         encoded: Dict[int, Tensor] = {}
         failed: Dict[int, Exception] = {}
         pending: List[Tuple[DynamicVLMInferenceRequest, int]] = []
-        first_request_by_key: Dict[str, int] = {}
+        first_request_by_key: Dict[Tuple[str, ...], int] = {}
         duplicates: List[Tuple[DynamicVLMInferenceRequest, int]] = []
         # Requests whose embeddings alias a tensor the cache or another request already
         # holds; they are registered without inserting into the cache again.
         aliased_ids = set()
         for request in deferred:
-            cached = self._get_cached_vision_embedding(request.media_cache_key)
+            media_cache_identity = request.media_cache_identity
+            cached = self._get_cached_vision_embedding(media_cache_identity)
             if cached is not None:
                 encoded[request.request_id] = cached
                 aliased_ids.add(request.request_id)
                 continue
-            key = request.media_cache_key
+            key = media_cache_identity or ()
             if key:
                 if key in first_request_by_key:
                     duplicates.append((request, first_request_by_key[key]))
@@ -459,7 +468,9 @@ class MultimodalRequestMixin:
         # entries by their storage and keeps them past the group.
         cache_on = self.vision_embedding_cache_max_bytes > 0
         return {
-            request.request_id: (piece.clone() if cache_on and request.media_cache_key else piece)
+            request.request_id: (
+                piece.clone() if cache_on and request.media_block_salt_keychain else piece
+            )
             for (request, _), piece in zip(group, torch.split(embeddings, counts, dim=split_dim))
         }
 
@@ -501,7 +512,7 @@ class MultimodalRequestMixin:
         request.deferred_image_embedding_count = None
         if cache:
             self._cache_vision_embedding(
-                request.media_cache_key,
+                request.media_cache_identity,
                 embeddings,
                 modality=modality,
                 imgs=imgs,
@@ -517,9 +528,10 @@ class MultimodalRequestMixin:
         )
 
     def _get_cached_vision_entry(
-        self, cache_key: Optional[str], modality: Optional[str] = None
+        self, media_cache_keychain: Optional[Tuple[str, ...]], modality: Optional[str] = None
     ) -> Optional[_VisionCacheEntry]:
         """Return and promote a complete reusable vision-cache entry."""
+        cache_key = media_cache_keychain or ()
         if (
             not cache_key
             or self.vision_embedding_cache_max_bytes == 0
@@ -532,13 +544,15 @@ class MultimodalRequestMixin:
         self._vision_embedding_cache.move_to_end(cache_key)
         return entry
 
-    def _get_cached_vision_embedding(self, cache_key: Optional[str]) -> Optional[Tensor]:
-        entry = self._get_cached_vision_entry(cache_key)
+    def _get_cached_vision_embedding(
+        self, media_cache_keychain: Optional[Tuple[str, ...]]
+    ) -> Optional[Tensor]:
+        entry = self._get_cached_vision_entry(media_cache_keychain)
         return entry.embedding if entry is not None else None
 
     def _cache_vision_embedding(
         self,
-        cache_key: Optional[str],
+        media_cache_keychain: Optional[Tuple[str, ...]],
         embedding: Tensor,
         *,
         modality: str,
@@ -550,6 +564,7 @@ class MultimodalRequestMixin:
         video_frame_indices: Optional[List[List[int]]] = None,
         video_fps: Optional[List[float]] = None,
     ) -> None:
+        cache_key = media_cache_keychain or ()
         if not cache_key or self.vision_embedding_cache_max_bytes == 0:
             return
         entry = _VisionCacheEntry(
@@ -596,15 +611,18 @@ class MultimodalRequestMixin:
         video_fps: Optional[List[float]] = None,
         media_tokens_preexpanded: bool = False,
         offload_params: Optional[Dict] = None,
-        media_cache_key: Optional[str] = None,
+        media_cache_keychain: Optional[Tuple[str, ...]] = None,
     ) -> DynamicVLMInferenceRequest:
         """Prepare media tokens, run the vision encoder, register per-request
         media data on the context, and return a DynamicVLMInferenceRequest.
         """
+        # Extract this turn's prefix stitching metadata. It should be regenerated every turn
+        # to reflect the turn's multimodal prefix boundary.
         prefix_stitching_metadata, offload_params = _take_expanded_prefix_stitching_metadata(
             offload_params
         )
-        cached_vision_entry = self._get_cached_vision_entry(media_cache_key)
+
+        cached_vision_entry = self._get_cached_vision_entry(media_cache_keychain)
         if cached_vision_entry is not None:
             modality = cached_vision_entry.modality
             imgs = cached_vision_entry.imgs
@@ -657,7 +675,7 @@ class MultimodalRequestMixin:
         needs_media_identity = self.context.enable_prefix_caching or (
             self.vision_embedding_cache_max_bytes > 0
         )
-        if media_cache_key is None and imgs is not None and needs_media_identity:
+        if media_cache_keychain is None and imgs is not None and needs_media_identity:
             # Compute multimodal media cache key, which is used by generators to
             # skip re-computing multimodal embeddings if the cache is hit.
             # Strongly recommend generating this hash upstream, such as via
@@ -674,7 +692,7 @@ class MultimodalRequestMixin:
                     media_inputs[name] = value
             if num_img_embeddings_per_tile:
                 media_inputs["num_img_embeddings_per_tile"] = num_img_embeddings_per_tile
-            media_cache_key = compute_media_cache_key(modality, media_inputs)
+            media_cache_keychain = compute_media_cache_keychain(modality, [media_inputs])
 
         device = torch.cuda.current_device()
         defer_image_encode = (
@@ -709,17 +727,14 @@ class MultimodalRequestMixin:
 
         if has_images:
             inference_wrapper = self.controller.inference_wrapped_model
-            suffix_media_metadata = None
-            if prefix_stitching_metadata is not None:
-                # Retrieve suffix multimodal data and metadata.
-                suffix_media_metadata = _slice_suffix_media_metadata(
-                    prefix_stitching_metadata[PREFIX_MEDIA_COUNT_FIELD],
-                    num_tiles=num_tiles,
-                    imgs_sizes=imgs_sizes,
-                    num_frames=num_frames,
-                    video_frame_indices=video_frame_indices,
-                    video_fps=video_fps,
-                )
+            media_token_id = inference_wrapper.resolve_media_token_id(
+                self.controller.tokenizer, modality
+            )
+
+            # Compute per-media embedding counts.
+            media_item_embedding_counts = inference_wrapper.get_embedding_tokens_per_media_item(
+                num_tiles=num_tiles, imgs_sizes=imgs_sizes, num_frames=num_frames
+            )
 
             # Compute input mask that provides multimodal embedding injection
             # guidelines for the inference wrapper decoder inputs.
@@ -727,10 +742,8 @@ class MultimodalRequestMixin:
                 mask_tensor = inference_wrapper.build_preexpanded_media_token_mask(tokens, modality)
                 expected_embedding_count = int((mask_tensor >= 0).sum().item())
             else:
-                media_token_id = inference_wrapper.resolve_media_token_id(
-                    self.controller.tokenizer, modality
-                )
                 prefix_tokens = None
+                suffix_media_metadata = None
                 if prefix_stitching_metadata is not None:
                     # Split the exact, already-expanded prefix from the compact suffix.
                     prefix_length = prefix_stitching_metadata[PREFIX_EXPANDED_TOKEN_COUNT_FIELD]
@@ -740,19 +753,34 @@ class MultimodalRequestMixin:
                             f"length {len(tokens)}."
                         )
                     prefix_tokens, tokens = tokens[:prefix_length], tokens[prefix_length:]
+                    # Retrieve suffix multimodal data and metadata.
+                    suffix_media_metadata = _slice_suffix_media_metadata(
+                        prefix_stitching_metadata[PREFIX_MEDIA_COUNT_FIELD],
+                        media_item_embedding_counts=media_item_embedding_counts,
+                        num_tiles=num_tiles,
+                        imgs_sizes=imgs_sizes,
+                        num_frames=num_frames,
+                        video_frame_indices=video_frame_indices,
+                        video_fps=video_fps,
+                    )
                 expansion_num_tiles = num_tiles
                 expansion_imgs_sizes = imgs_sizes
                 expansion_num_frames = num_frames
                 expansion_video_frame_indices = video_frame_indices
                 expansion_video_fps = video_fps
+                expansion_media_item_embedding_counts = media_item_embedding_counts
                 suffix_media_count = None
                 if suffix_media_metadata is not None:
                     # Suffix / compact tokens require multi-modal expansion.
+                    # Prefix-stitched tokens do not.
                     expansion_num_tiles = suffix_media_metadata["num_tiles"]
                     expansion_imgs_sizes = suffix_media_metadata["imgs_sizes"]
                     expansion_num_frames = suffix_media_metadata["num_frames"]
                     expansion_video_frame_indices = suffix_media_metadata["video_frame_indices"]
                     expansion_video_fps = suffix_media_metadata["video_fps"]
+                    expansion_media_item_embedding_counts = suffix_media_metadata[
+                        "media_item_embedding_counts"
+                    ]
                     suffix_media_count = suffix_media_metadata["suffix_media_count"]
 
                 if prefix_tokens is not None:
@@ -764,9 +792,11 @@ class MultimodalRequestMixin:
                         )
 
                 if suffix_media_count == 0:
-                    # No multimodal data.
+                    # No multimodal data in suffix when prefix stitching.
                     mask_tensor = torch.full_like(tokens, -1, dtype=torch.int64)
                 else:
+                    # Expand the suffix (suffix > 0) or entire (suffix = None)
+                    # sequence of tokens for multimodal embeddings.
                     token_list: List[List[int]] = [tokens.tolist()]
                     expansion_kwargs = {
                         "num_tiles": expansion_num_tiles,
@@ -785,7 +815,10 @@ class MultimodalRequestMixin:
                             expansion_kwargs["video_fps"] = expansion_video_fps
                     # Expand and prompt-format multimodal placeholder tokens.
                     expanded_tokens_list, mask_list = inference_wrapper.expand_image_tokens(
-                        token_list, image_token_id=media_token_id, **expansion_kwargs
+                        token_list,
+                        media_item_embedding_counts=expansion_media_item_embedding_counts,
+                        image_token_id=media_token_id,
+                        **expansion_kwargs,
                     )
                     # Construct expanded token sequence with model-specific media tokens.
                     expanded_tokens = [
@@ -808,8 +841,49 @@ class MultimodalRequestMixin:
                     expected_embedding_count = int((mask_tensor >= 0).sum().item())
                     media_tokens_preexpanded = True
 
+            # Compute the block salt indices for multimodal prefix block hashing.
+            media_block_salt_keychain = {}
+            if media_cache_keychain:
+                if len(media_cache_keychain) == len(media_item_embedding_counts):
+                    # Each hash in the keychain is associated with a full image or video.
+                    # Collect the embedding counts for a complete media item.
+                    embedding_counts_by_hash = [
+                        sum(counts) for counts in media_item_embedding_counts
+                    ]
+                elif len(media_cache_keychain) == 1:
+                    # The case where the user passes pre-processed, pre-packed Tensors
+                    # optionally with media placeholders pre-expanded, so the inference
+                    # client just computes a cumulative hash for the entire dictionary.
+                    # NOTE(@cspades): We do not support block-salted multimodal hashes
+                    # for engine-direct inference requests with ready-to-go Tensors.
+                    embedding_counts_by_hash = [
+                        sum(sum(counts) for counts in media_item_embedding_counts)
+                    ]
+                else:
+                    raise ValueError(
+                        f"Cannot align {len(media_cache_keychain)} media hashes with "
+                        f"{len(media_item_embedding_counts)} media items."
+                    )
+                media_positions = torch.nonzero(mask_tensor >= 0).flatten().tolist()
+                if sum(embedding_counts_by_hash) != len(media_positions):
+                    raise ValueError(
+                        f"Media embedding counts ({sum(embedding_counts_by_hash)}) do not "
+                        f"match the expanded media positions ({len(media_positions)})."
+                    )
+                embedding_offset = 0
+                for media_hash, embedding_count in zip(
+                    media_cache_keychain, embedding_counts_by_hash
+                ):
+                    if embedding_count == 0:
+                        # Skip empty media embeddings which do not affect the token sequence.
+                        continue
+                    # Construct a mapping from position to multimodal item hash.
+                    media_block_salt_keychain[media_positions[embedding_offset]] = media_hash
+                    # Increment to next media item's indices.
+                    embedding_offset += embedding_count
+
             # Retrieve or compute the vision embedding.
-            image_embeddings = self._get_cached_vision_embedding(media_cache_key)
+            image_embeddings = self._get_cached_vision_embedding(media_cache_keychain)
             if image_embeddings is None and defer_image_encode:
                 # The encode runs together with the other waiting image requests right
                 # before they are scheduled for prefill (_encode_waiting_images), and its
@@ -846,7 +920,7 @@ class MultimodalRequestMixin:
                         f"{actual_embedding_count} embedding(s)."
                     )
                 self._cache_vision_embedding(
-                    media_cache_key,
+                    media_cache_keychain,
                     image_embeddings,
                     modality=modality,
                     imgs=imgs,
@@ -869,7 +943,7 @@ class MultimodalRequestMixin:
         # placeholder token sequences.
         request_has_images = has_images
         enable_prefix_caching = self.context.enable_prefix_caching and (
-            not request_has_images or bool(media_cache_key)
+            not request_has_images or bool(media_cache_keychain)
         )
         media_tensors = {
             name: tensor
@@ -892,9 +966,12 @@ class MultimodalRequestMixin:
             enable_prefix_caching=enable_prefix_caching,
             # Recompute the block hashes for multimodal embeddings,
             # which are injected dynamically into the sequence.
+            # The block_hash_salt will also align the media hashes
+            # associated with embeddings to the prefix block in
+            # which the associated embeddings start.
             precomputed_block_hashes=[] if request_has_images else (precomputed_block_hashes or []),
             block_hash_salt=_weight_scoped_salt(
-                self._weight_epoch, media_cache_key if request_has_images else None
+                self._weight_epoch, media_block_salt_keychain if request_has_images else None
             ),
             num_img_embeddings_per_tile=num_img_embeddings_per_tile,
             imgs=imgs,
@@ -904,7 +981,7 @@ class MultimodalRequestMixin:
             video_frame_indices=video_frame_indices,
             video_fps=video_fps,
             media_tokens_preexpanded=media_tokens_preexpanded,
-            media_cache_key=media_cache_key,
+            media_block_salt_keychain=media_block_salt_keychain,
             decoder_seq_length=0,
             image_embeddings=image_embeddings,
             image_token_mask=mask_tensor,

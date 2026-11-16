@@ -25,12 +25,12 @@ from megatron.core.inference.inference_request import (
     resolve_multimodal_data_for_engine,
     serialize_multimodal_data,
 )
+from megatron.core.inference.media_preprocessing import (
+    dynamic_media_embedding_count_groups,
+    dynamic_media_embedding_counts,
+)
 from megatron.core.inference.model_inference_wrappers.multimodal.nemotron_omni_inference_wrapper import (
     NemotronOmniInferenceWrapper,
-)
-from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
-    dynamic_media_embedding_counts,
-    dynamic_media_replacement_counts,
 )
 from megatron.core.inference.model_inference_wrappers.multimodal.vlm_inference_wrapper import (
     VLMInferenceWrapper,
@@ -118,6 +118,7 @@ def _build_toy_wrapper(wrapper_cls):
     wrapper.model = SimpleNamespace(module=model) if wrapper_cls is VLMInferenceWrapper else model
     wrapper.inference_context = None
     wrapper.pp_group = None
+    wrapper._cache_model_attributes()
 
     def toy_vision_forward(_images, num_image_tiles=None, imgs_sizes=None, num_frames=None):
         assert num_image_tiles is None
@@ -126,12 +127,12 @@ def _build_toy_wrapper(wrapper_cls):
             patch_dim=model.patch_dim,
             pixel_shuffle=wrapper_cls is NemotronOmniInferenceWrapper,
         )
-        replacement_counts = dynamic_media_replacement_counts(
+        embedding_count_groups = dynamic_media_embedding_count_groups(
             frame_counts,
             num_frames=num_frames,
             temporal_patch_size=model.vision_model.temporal_patch_dim,
         )
-        return torch.ones(sum(replacement_counts), 1, 4)
+        return torch.ones(sum(map(sum, embedding_count_groups)), 1, 4)
 
     wrapper._forward_vision_encoder = mock.Mock(side_effect=toy_vision_forward)
     return wrapper
@@ -216,14 +217,12 @@ class _ToyInferenceService:
         request_id = self._request_id
         try:
             self.last_wire_data = serialize_multimodal_data(multi_modal_data)
-            media_cache_key = self.last_wire_data["media_cache_key"]
-            request_hashes = self.coordinator.compute_request_hashes(
-                prompt, cache_salt=media_cache_key
-            )
+            media_cache_keychain = self.last_wire_data["media_cache_keychain"]
+            request_hashes = self.coordinator.compute_request_hashes(prompt)
             selected_rank = self.coordinator.get_best_data_parallel_rank(
-                request_hashes, media_cache_key=media_cache_key
+                request_hashes, media_cache_keychain=media_cache_keychain
             )
-            self.coordinator._update_media_affinity(media_cache_key, selected_rank)
+            self.coordinator._update_media_affinity(media_cache_keychain, selected_rank)
             rank_index = self.coordinator.identity_to_rank_index[selected_rank]
             self.coordinator._pending_counts[rank_index] += 1
             self.selected_ranks.append(selected_rank)
@@ -270,19 +269,17 @@ class _ToyInferenceService:
 
 @pytest.fixture
 def toy_media_preprocessing(monkeypatch):
-    from megatron.core.inference.text_generation_server.dynamic_text_gen_server import (
-        image_preprocessing,
-    )
+    from megatron.core.inference import media_preprocessing
 
     monkeypatch.setattr(
-        image_preprocessing,
+        media_preprocessing,
         "preprocess_image_bytes_list",
         lambda media, _config, device=None: (
             _toy_preprocessed_media("image") if media == [_MEDIA_BYTES] else None
         ),
     )
     monkeypatch.setattr(
-        image_preprocessing,
+        media_preprocessing,
         "preprocess_video_bytes_list",
         lambda media, _config, device=None: (
             _toy_preprocessed_media("video") if media == [_MEDIA_BYTES] else None

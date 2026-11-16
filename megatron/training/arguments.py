@@ -2088,9 +2088,10 @@ def _add_inference_args(parser):
                        type=float, default=300.0,
                        dest='inference_dynamic_batching_prefix_cache_ttl_seconds',
                        help='How long the coordinator assumes an engine still holds a '
-                       'block it routed there. The coordinator never observes evictions, '
-                       'so entries untouched for this long are dropped rather than kept '
-                       'forever. Default: 300.0.')
+                       'routed prefix block or media item. The coordinator never observes '
+                       'evictions, so stale prefix entries are pruned on prefix updates and '
+                       'stale media assignments on media updates. '
+                       'Default: 300.0.')
     group.add_argument('--inference-dynamic-batching-media-cache-coordinator-policy',
                        type=str, default='affinity',
                        choices=['affinity', 'load_balanced'],

@@ -57,6 +57,38 @@ if TYPE_CHECKING:
 _SSM_STATE_KINDS = ("conv", "recurrent")
 
 
+def _pack_block_hash_salt(block_hash_salt: dict[int, str]) -> list[tuple[int, str]]:
+    """Encode an integer-keyed salt map without MessagePack map keys."""
+    return sorted(block_hash_salt.items())
+
+
+def _unpack_block_hash_salt(packed_salt) -> dict[int, str] | None:
+    """Decode and validate a position-to-salt sequence from handoff metadata."""
+    if packed_salt is None:
+        return None
+    if isinstance(packed_salt, dict):
+        entries = packed_salt.items()
+    elif isinstance(packed_salt, (list, tuple)):
+        entries = packed_salt
+    else:
+        raise TypeError("block_hash_salt must be a mapping or sequence of (position, salt) pairs.")
+    block_hash_salt = {}
+    for entry in entries:
+        if (
+            not isinstance(entry, (list, tuple))
+            or len(entry) != 2
+            or type(entry[0]) is not int
+            or entry[0] < 0
+            or not isinstance(entry[1], str)
+        ):
+            raise TypeError("block_hash_salt entries must be (non-negative int, str) pairs.")
+        position, salt = entry
+        if position in block_hash_salt:
+            raise ValueError(f"Duplicate block_hash_salt position: {position}.")
+        block_hash_salt[position] = salt
+    return block_hash_salt
+
+
 @dataclass(frozen=True)
 class _PreparedHandoffMetadata:
     """Per-request metadata assembled once for a completed prefill batch."""
@@ -744,7 +776,7 @@ class InferenceStateHandoffMixin:
             kv_meta = dict(kv_meta)
         kv_meta["resume_tokens"] = prepared.resume_tokens
         if request.block_hash_salt is not None:
-            kv_meta["block_hash_salt"] = request.block_hash_salt
+            kv_meta["block_hash_salt"] = _pack_block_hash_salt(request.block_hash_salt)
         if prepared.resume_log_probs:
             kv_meta["resume_log_probs"] = prepared.resume_log_probs
         if ssm_meta is not None:
@@ -850,6 +882,11 @@ class InferenceStateHandoffMixin:
         if self._kv_transfer_agent is None:
             raise RuntimeError("KV handoff received without a transfer backend")
 
+        block_hash_salt = _unpack_block_hash_salt(kv_meta.get("block_hash_salt"))
+        if block_hash_salt is not None:
+            kv_meta = dict(kv_meta)
+            kv_meta["block_hash_salt"] = block_hash_salt
+
         resume_tokens = (
             [int(token) for token in kv_meta.get("resume_tokens", [])]
             if isinstance(kv_meta, dict)
@@ -879,7 +916,7 @@ class InferenceStateHandoffMixin:
 
         prompt_tensor = torch.tensor(prompt, dtype=torch.int64)
         hashes = compute_block_hashes_batched(
-            prompt_tensor, self.context.block_size_tokens, cache_salt=kv_meta.get("block_hash_salt")
+            prompt_tensor, self.context.block_size_tokens, cache_salt=block_hash_salt
         )
         num_blocks = transfer_block_count(kv_meta, src_block_ids)
         expected_blocks = (

@@ -10,18 +10,21 @@ from megatron.core.inference.communication_utils import (
 )
 from megatron.core.inference.config import MediaPromptSpec, MultimodalPromptConfig
 from megatron.core.inference.contexts import StaticInferenceContext
+from megatron.core.inference.media_preprocessing import (
+    dynamic_media_embedding_count_groups,
+    dynamic_media_embedding_counts,
+)
 from megatron.core.inference.model_inference_wrappers.gpt.gpt_inference_wrapper import (
     GPTInferenceWrapper,
 )
-from megatron.core.inference.model_inference_wrappers.multimodal.utils import (
-    dynamic_media_embedding_counts,
-    dynamic_media_replacement_counts,
+from megatron.core.inference.model_inference_wrappers.multimodal.multimodal_inference_wrapper import (
+    MultimodalInferenceWrapperMixin,
 )
 from megatron.core.utils import get_attr_wrapped_model
 
 
 # pylint: disable=line-too-long
-class VLMInferenceWrapper(GPTInferenceWrapper):
+class VLMInferenceWrapper(MultimodalInferenceWrapperMixin, GPTInferenceWrapper):
     """Inference wrapper for VLMs"""
 
     supports_text = True
@@ -36,11 +39,32 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         image_spec=_media_prompt_spec, video_spec=_media_prompt_spec
     )
 
+    def __init__(self, model, inference_context=None):
+        super().__init__(model, inference_context)
+        self._cache_model_attributes()
+
+    def _cache_model_attributes(self):
+        self._model_module = get_attr_wrapped_model(
+            self.model, "image_token_index", return_model_obj=True
+        )
+        model_attributes = vars(self._model_module)
+        for source, target in (
+            ("patch_dim", "_patch_dim"),
+            ("_pixel_shuffle", "_pixel_shuffle"),
+            ("_conv_merging", "_conv_merging"),
+            ("_drop_vision_class_token", "_drop_vision_class_token"),
+            ("dynamic_resolution", "_dynamic_resolution"),
+            ("img_seq_len", "_img_embeddings_per_tile"),
+        ):
+            if source in model_attributes:
+                setattr(self, target, model_attributes[source])
+        self._class_token_len = model_attributes.get("_class_token_len", 0)
+        self._temporal_patch_size = model_attributes.get("temporal_patch_dim", 1)
+
     def get_preexpanded_media_token_id(self, modality: str) -> int:
         """Return LLaVA's internal sentinel without exposing it as a vocabulary ID."""
         del modality
-        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
-        return int(module.image_token_index)
+        return int(self._model_module.image_token_index)
 
     def prep_model_for_inference(self, prompts_tokens: Optional[torch.Tensor] = None):
         """A utility function for preparing model for inference
@@ -149,7 +173,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
     # ---- Dynamic inference methods ----
 
-    def _image_rows(self, module, imgs_sizes, per_image_embeddings, num_frames):
+    def _image_rows(self, imgs_sizes, media_item_embedding_counts, num_frames):
         """Return (num_rows, row_len, break_id, end_id) per image for row-separated layouts.
 
         Returns None unless the image preprocessing config sets a row break or image end token,
@@ -166,13 +190,13 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             return None
         if num_frames is not None:
             raise NotImplementedError("Image row separators are not supported for video inputs.")
-        if module._pixel_shuffle:
+        if self._pixel_shuffle:
             raise NotImplementedError("Image row separators are not supported with pixel shuffle.")
-        merge = 2 if module._conv_merging else 1
+        merge = 2 if self._conv_merging else 1
         image_rows = []
-        for (height, width), count in zip(imgs_sizes.tolist(), per_image_embeddings):
-            num_rows = height // module.patch_dim // merge
-            row_len = width // module.patch_dim // merge
+        for (height, width), count in zip(imgs_sizes.tolist(), media_item_embedding_counts):
+            num_rows = height // self._patch_dim // merge
+            row_len = width // self._patch_dim // merge
             if num_rows * row_len != count:
                 raise ValueError(
                     f"Image of {num_rows}x{row_len} merged patches does not match its {count} "
@@ -181,8 +205,42 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             image_rows.append((num_rows, row_len, break_id, end_id))
         return image_rows
 
+    def get_embedding_tokens_per_media_item(
+        self, num_tiles=None, imgs_sizes=None, num_frames=None
+    ) -> list[list[int]]:
+        """Return the embedding count for each image or video."""
+        if imgs_sizes is None:
+            return [[int(tiles) * self._img_embeddings_per_tile] for tiles in num_tiles]
+
+        frame_embedding_counts = dynamic_media_embedding_counts(
+            imgs_sizes,
+            self._patch_dim,
+            pixel_shuffle=self._pixel_shuffle,
+            spatial_merge_size=2 if self._conv_merging else 1,
+        )
+        if not self._drop_vision_class_token:
+            class_token_len = int(self._class_token_len)
+            if self._pixel_shuffle and class_token_len > 0:
+                raise ValueError(
+                    "Dynamic-resolution pixel shuffle requires dropping " "vision class tokens."
+                )
+            frame_embedding_counts = [count + class_token_len for count in frame_embedding_counts]
+        media_embedding_count_groups = dynamic_media_embedding_count_groups(
+            frame_embedding_counts,
+            num_frames=num_frames,
+            temporal_patch_size=self._temporal_patch_size,
+        )
+        return [[sum(counts)] for counts in media_embedding_count_groups]
+
     def expand_image_tokens(
-        self, tokens, num_tiles=None, imgs_sizes=None, num_frames=None, *, image_token_id=None
+        self,
+        tokens,
+        media_item_embedding_counts,
+        num_tiles=None,
+        imgs_sizes=None,
+        num_frames=None,
+        *,
+        image_token_id=None,
     ):
         """Expand image tokens to multiple pad tokens.
 
@@ -202,7 +260,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             mask (List[List[int or None]]): Mask indicating image embedding indices for each
                 position, None for non-image positions.
         """
-        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        module = self._model_module
         image_token_index = (
             module.image_token_index if image_token_id is None else int(image_token_id)
         )
@@ -214,7 +272,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         # Reject dynamic-resolution requests when the model does not expose
         # the required attributes; falling through to the static path would
         # silently miscount tokens.
-        if imgs_sizes is not None and not getattr(module, 'dynamic_resolution', False):
+        if imgs_sizes is not None and not self._dynamic_resolution:
             raise NotImplementedError(
                 "Dynamic-resolution image expansion requires LLaVAModel "
                 "with dynamic_resolution enabled and patch_dim/_class_token_len "
@@ -222,40 +280,19 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             )
 
         # Compute per-image embedding counts
-        if imgs_sizes is not None and getattr(module, 'dynamic_resolution', False):
-            frame_embedding_counts = dynamic_media_embedding_counts(
-                imgs_sizes,
-                module.patch_dim,
-                pixel_shuffle=module._pixel_shuffle,
-                spatial_merge_size=2 if module._conv_merging else 1,
-            )
-            if not module._drop_vision_class_token:
-                class_token_len = int(getattr(module, "_class_token_len", 0))
-                if module._pixel_shuffle and class_token_len > 0:
-                    raise ValueError(
-                        "Dynamic-resolution pixel shuffle requires dropping " "vision class tokens."
-                    )
-                frame_embedding_counts = [
-                    count + class_token_len for count in frame_embedding_counts
-                ]
+        if imgs_sizes is not None and self._dynamic_resolution:
             placeholder_count = sum(
                 token == image_token_index for sample_tokens in tokens for token in sample_tokens
             )
-            per_image_embeddings = dynamic_media_replacement_counts(
-                frame_embedding_counts,
-                num_frames=num_frames,
-                temporal_patch_size=int(getattr(module, "temporal_patch_dim", 1)),
-            )
             media_kind = "video" if num_frames is not None else "image"
-            if placeholder_count != len(per_image_embeddings):
+            if placeholder_count != len(media_item_embedding_counts):
                 raise ValueError(
                     f"Expected one compact placeholder per {media_kind}: "
-                    f"expected {len(per_image_embeddings)}, got {placeholder_count}."
+                    f"expected {len(media_item_embedding_counts)}, got {placeholder_count}."
                 )
         else:
             # Static resolution: fixed embeddings per tile
-            img_embeddings_per_tile = module.img_seq_len
-            per_image_embeddings = None  # computed per-image below
+            img_embeddings_per_tile = self._img_embeddings_per_tile
 
         # Count images per sample
         num_images_per_sample = []
@@ -267,19 +304,25 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         expanded_tokens_list = []
         mask_list = []
 
-        if per_image_embeddings is not None:
+        if imgs_sizes is not None and self._dynamic_resolution:
             # Dynamic resolution path
-            image_rows = self._image_rows(module, imgs_sizes, per_image_embeddings, num_frames)
+            image_rows = self._image_rows(
+                imgs_sizes, [counts[0] for counts in media_item_embedding_counts], num_frames
+            )
             image_global_idx = 0
             for batch_idx in range(batch_size):
                 sample_tokens = tokens[batch_idx]
                 expanded_sample = []
                 mask_sample = []
-                image_embedding_offset = sum(per_image_embeddings[:image_global_idx])
+                image_embedding_offset = sum(
+                    counts[0] for counts in media_item_embedding_counts[:image_global_idx]
+                )
 
                 for token in sample_tokens:
-                    if token == image_token_index and image_global_idx < len(per_image_embeddings):
-                        tokens_for_image = per_image_embeddings[image_global_idx]
+                    if token == image_token_index and image_global_idx < len(
+                        media_item_embedding_counts
+                    ):
+                        tokens_for_image = media_item_embedding_counts[image_global_idx][0]
                         if image_rows is None:
                             expanded_sample.extend([pad_value] * tokens_for_image)
                             start_idx = image_embedding_offset
@@ -370,14 +413,14 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         """
         from megatron.core.packed_seq_params import PackedSeqParams
 
-        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        module = self._model_module
         target_dtype = module.vision_model.config.params_dtype
         if images.dtype != target_dtype:
             images = images.to(dtype=target_dtype)
 
         # Reject dynamic-resolution requests when the model does not expose
         # the required attributes (see expand_image_tokens for context).
-        if imgs_sizes is not None and not getattr(module, 'dynamic_resolution', False):
+        if imgs_sizes is not None and not self._dynamic_resolution:
             raise NotImplementedError(
                 "Dynamic-resolution vision-encoder forward requires LLaVAModel "
                 "with dynamic_resolution enabled and patch_dim available. "
@@ -386,9 +429,8 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
 
         # Build vision_packed_seq_params for dynamic resolution
         vision_packed_seq_params = None
-        if imgs_sizes is not None and getattr(module, 'dynamic_resolution', False):
-            patch_dim = module.patch_dim
-            seq_lens = torch.prod(imgs_sizes // patch_dim, dim=-1)
+        if imgs_sizes is not None and self._dynamic_resolution:
+            seq_lens = torch.prod(imgs_sizes // self._patch_dim, dim=-1)
             cu_seqlens = torch.cat(
                 [
                     torch.zeros(1, dtype=torch.int32, device=imgs_sizes.device),
@@ -452,7 +494,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
         attention_mask = inference_input.get("attention_mask", None)
         image_embeddings = inference_input.get("image_embeddings", None)
 
-        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        module = self._model_module
 
         if is_pipeline_first_stage(self.pp_group) or self._recv_only_vision_embeds:
             # Media positions may contain either compact-path padding or the
@@ -612,7 +654,7 @@ class VLMInferenceWrapper(GPTInferenceWrapper):
             return super().run_one_forward_step(inference_input)
 
         # Static VLM path
-        module = get_attr_wrapped_model(self.model, "image_token_index", return_model_obj=True)
+        module = self._model_module
         num_image_tokens = (tokens == module.image_token_index).sum().item()
         num_img_embeddings = inference_input["num_img_embeddings"]
         decoder_seq_length = inference_input["decoder_seq_length"]

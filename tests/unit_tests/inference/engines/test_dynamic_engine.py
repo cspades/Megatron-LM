@@ -165,6 +165,8 @@ def _build_mock_vlm_engine(image_embeddings):
     engine._cache_vision_embedding = mock.Mock()
     engine._has_deferred_image_encodes = False
     engine.waiting_request_ids = deque()
+    embedding_count = image_embeddings.numel() // image_embeddings.shape[-1]
+    wrapper.get_embedding_tokens_per_media_item.return_value = [[embedding_count]]
     return engine, wrapper
 
 
@@ -189,7 +191,7 @@ def _call_build_vlm_request(
     tokens,
     *,
     media_tokens_preexpanded,
-    media_cache_key=None,
+    media_cache_keychain=None,
     offload_params=None,
     imgs_sizes=None,
     sampling_params=None,
@@ -209,7 +211,7 @@ def _call_build_vlm_request(
             num_img_embeddings_per_tile=0,
             imgs_sizes=imgs_sizes,
             media_tokens_preexpanded=media_tokens_preexpanded,
-            media_cache_key=media_cache_key,
+            media_cache_keychain=media_cache_keychain,
             offload_params=offload_params,
         )
 
@@ -511,6 +513,7 @@ def test_build_vlm_request_offsets_suffix_embeddings_after_multiple_prefix_media
 def test_slice_suffix_video_metadata_uses_frame_offset_for_image_sizes():
     result = dynamic_engine_multimodal._slice_suffix_media_metadata(
         2,
+        media_item_embedding_counts=[[2], [1], [3]],
         num_tiles=None,
         imgs_sizes=torch.tensor([[1, 1], [2, 2], [3, 3], [4, 4], [5, 5], [6, 6]]),
         num_frames=torch.tensor([2, 1, 3]),
@@ -519,6 +522,7 @@ def test_slice_suffix_video_metadata_uses_frame_offset_for_image_sizes():
     )
 
     assert result["suffix_media_count"] == 1
+    assert result["media_item_embedding_counts"] == [[3]]
     assert torch.equal(result["imgs_sizes"], torch.tensor([[4, 4], [5, 5], [6, 6]]))
     assert torch.equal(result["num_frames"], torch.tensor([3]))
     assert result["video_frame_indices"] == [[10, 11, 12]]
@@ -528,6 +532,7 @@ def test_slice_suffix_video_metadata_uses_frame_offset_for_image_sizes():
 def test_slice_suffix_static_tiling_metadata_uses_logical_media_count():
     result = dynamic_engine_multimodal._slice_suffix_media_metadata(
         1,
+        media_item_embedding_counts=[[8], [12]],
         num_tiles=torch.tensor([2, 3]),
         imgs_sizes=None,
         num_frames=None,
@@ -536,6 +541,7 @@ def test_slice_suffix_static_tiling_metadata_uses_logical_media_count():
     )
 
     assert result["suffix_media_count"] == 1
+    assert result["media_item_embedding_counts"] == [[12]]
     assert torch.equal(result["num_tiles"], torch.tensor([3]))
 
 
@@ -543,6 +549,7 @@ def test_slice_suffix_metadata_rejects_prefix_media_overcount():
     with pytest.raises(ValueError, match="prefix media count exceeds"):
         dynamic_engine_multimodal._slice_suffix_media_metadata(
             2,
+            media_item_embedding_counts=[[4]],
             num_tiles=None,
             imgs_sizes=torch.tensor([[2, 2]]),
             num_frames=None,
@@ -607,13 +614,16 @@ def test_build_vlm_request_enables_media_salted_prefix_caching():
         engine, torch.tensor([10, 42, 20], dtype=torch.int64), media_tokens_preexpanded=False
     )
 
-    media_cache_key = compute_media_cache_key(
-        "image", {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])}
+    media_cache_keychain = (
+        compute_media_cache_key(
+            "image", {"imgs": torch.ones(1, 2, 4), "imgs_sizes": torch.tensor([[2, 2]])}
+        ),
     )
+    media_salt = {1: media_cache_keychain[0]}
     assert request.enable_prefix_caching
-    assert request.block_hash_salt == media_cache_key
+    assert request.block_hash_salt == media_salt
     assert request.precomputed_block_hashes == compute_block_hashes_batched(
-        request.prompt_tokens, block_size=2, cache_salt=media_cache_key
+        request.prompt_tokens, block_size=2, cache_salt=media_salt
     )
 
 
@@ -624,20 +634,20 @@ def test_build_vlm_request_reuses_client_media_cache_key():
     wrapper.expand_image_tokens.return_value = ([[10, -1, -1, 20]], [[None, 0, 1, None]])
 
     with mock.patch(
-        "megatron.core.inference.engines.dynamic.multimodal.compute_media_cache_key"
+        "megatron.core.inference.engines.dynamic.multimodal.compute_media_cache_keychain"
     ) as compute_key:
         request = _call_build_vlm_request(
             engine,
             torch.tensor([10, 42, 20], dtype=torch.int64),
             media_tokens_preexpanded=False,
-            media_cache_key="client-media-key",
+            media_cache_keychain=("client-media-key",),
         )
 
     compute_key.assert_not_called()
-    engine._get_cached_vision_embedding.assert_called_once_with("client-media-key")
-    assert request.block_hash_salt == "client-media-key"
+    engine._get_cached_vision_embedding.assert_called_once_with(("client-media-key",))
+    assert request.block_hash_salt == {1: "client-media-key"}
     assert request.precomputed_block_hashes == compute_block_hashes_batched(
-        request.prompt_tokens, block_size=2, cache_salt="client-media-key"
+        request.prompt_tokens, block_size=2, cache_salt={1: "client-media-key"}
     )
 
 
@@ -668,7 +678,7 @@ def test_build_vlm_request_reuses_cached_preprocessed_media_without_raw_input():
             num_tiles=None,
             num_img_embeddings_per_tile=0,
             imgs_sizes=None,
-            media_cache_key="client-media-key",
+            media_cache_keychain=("client-media-key",),
         )
 
     wrapper._forward_vision_encoder.assert_not_called()
@@ -844,7 +854,7 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     params = SamplingParams(num_tokens_to_generate=1, termination_id=-1)
     submit = Headers.SUBMIT_REQUEST.value
     media_meta = {
-        "media_cache_key": "shared-image",
+        "media_cache_keychain": ["shared-image"],
         "modality": "image",
         "media_tokens_preexpanded": True,
     }
@@ -871,7 +881,7 @@ def test_schedule_requests_skips_cached_media_payload_and_preprocessing():
     assert args[:2] == (17, [10, 99])
     assert kwargs == {
         "offload_params": None,
-        "media_cache_key": "shared-image",
+        "media_cache_keychain": ["shared-image"],
         "media_tokens_preexpanded": True,
     }
 
@@ -886,7 +896,7 @@ def _arange_encoder(imgs, num_image_tiles=None, imgs_sizes=None):
     return torch.arange(total, dtype=torch.float32).view(total, 1, 1)
 
 
-def _waiting_image_request(request_id, imgs_sizes, *, media_cache_key=None):
+def _waiting_image_request(request_id, imgs_sizes, *, media_cache_keychain=None):
     sizes = torch.tensor(imgs_sizes)
     count = sum(_patch_count(sizes))
     request = mock.Mock(spec=DynamicVLMInferenceRequest)
@@ -896,7 +906,9 @@ def _waiting_image_request(request_id, imgs_sizes, *, media_cache_key=None):
     request.imgs_sizes = sizes
     request.image_token_mask = torch.tensor([-1] + list(range(count)) + [-1])
     request.deferred_image_embedding_count = count
-    request.media_cache_key = media_cache_key
+    request.media_block_salt_keychain = (
+        dict(enumerate(media_cache_keychain)) if media_cache_keychain else None
+    )
     request.num_img_embeddings_per_tile = 0
     request.video_frame_indices = None
     request.video_fps = None
@@ -946,7 +958,7 @@ def test_build_vlm_request_defers_encode_with_the_expected_embedding_count():
 
 
 def test_encode_waiting_images_does_not_recache_a_cache_hit():
-    hit = _waiting_image_request(1, [[4, 4]], media_cache_key="hit")
+    hit = _waiting_image_request(1, [[4, 4]], media_cache_keychain=("hit",))
     fresh = _waiting_image_request(2, [[4, 4]])
     other = _waiting_image_request(3, [[2, 4]])
     engine, _ = _build_waiting_engine([hit, fresh, other])
@@ -1090,7 +1102,7 @@ def test_encode_waiting_images_shares_one_encoder_call():
 
 
 def test_encode_waiting_images_copies_shared_slices_that_go_into_the_cache():
-    keyed_request = _waiting_image_request(1, [[4, 4]], media_cache_key="a")
+    keyed_request = _waiting_image_request(1, [[4, 4]], media_cache_keychain=("a",))
     unkeyed_request = _waiting_image_request(2, [[4, 4]])
     engine, wrapper = _build_waiting_engine([keyed_request, unkeyed_request])
     engine.vision_embedding_cache_max_bytes = 1 << 20
@@ -1111,7 +1123,7 @@ def test_encode_waiting_images_copies_shared_slices_that_go_into_the_cache():
 def test_encode_waiting_images_skips_requests_already_encoded_or_cached():
     encoded_request = _waiting_image_request(1, [[4, 4]])
     encoded_request.image_embeddings = torch.zeros(4, 1, 1)
-    cached_request = _waiting_image_request(2, [[4, 4]], media_cache_key="hit")
+    cached_request = _waiting_image_request(2, [[4, 4]], media_cache_keychain=("hit",))
     fresh_request = _waiting_image_request(3, [[4, 4]])
     engine, wrapper = _build_waiting_engine([encoded_request, cached_request, fresh_request])
     engine._get_cached_vision_embedding.side_effect = lambda key: (
@@ -1130,9 +1142,9 @@ def test_encode_waiting_images_skips_requests_already_encoded_or_cached():
 
 def test_encode_waiting_images_encodes_shared_media_key_once():
     requests = [
-        _waiting_image_request(1, [[4, 4]], media_cache_key="same"),
-        _waiting_image_request(2, [[4, 4]], media_cache_key="same"),
-        _waiting_image_request(3, [[2, 4]], media_cache_key="other"),
+        _waiting_image_request(1, [[4, 4]], media_cache_keychain=("same",)),
+        _waiting_image_request(2, [[4, 4]], media_cache_keychain=("same",)),
+        _waiting_image_request(3, [[2, 4]], media_cache_keychain=("other",)),
     ]
     engine, wrapper = _build_waiting_engine(requests)
 
@@ -1262,8 +1274,8 @@ def test_encode_waiting_images_falls_back_per_request_on_mixed_layouts(caplog):
 
 
 def test_encode_waiting_images_fails_duplicates_of_a_failed_primary():
-    primary = _waiting_image_request(1, [[4, 4]], media_cache_key="same")
-    duplicate = _waiting_image_request(2, [[4, 4]], media_cache_key="same")
+    primary = _waiting_image_request(1, [[4, 4]], media_cache_keychain=("same",))
+    duplicate = _waiting_image_request(2, [[4, 4]], media_cache_keychain=("same",))
     engine, wrapper = _build_waiting_engine([primary, duplicate])
     wrapper._forward_vision_encoder.side_effect = RuntimeError("encoder exploded")
 
@@ -1275,8 +1287,8 @@ def test_encode_waiting_images_fails_duplicates_of_a_failed_primary():
 
 
 def test_encode_waiting_images_duplicates_share_the_primary_without_recaching():
-    primary = _waiting_image_request(1, [[4, 4]], media_cache_key="same")
-    duplicate = _waiting_image_request(2, [[4, 4]], media_cache_key="same")
+    primary = _waiting_image_request(1, [[4, 4]], media_cache_keychain=("same",))
+    duplicate = _waiting_image_request(2, [[4, 4]], media_cache_keychain=("same",))
     engine, _ = _build_waiting_engine([primary, duplicate])
 
     _encode_waiting(engine)
@@ -2397,8 +2409,8 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
                 sampling_params=SamplingParams(),
                 block_size_tokens=block_size,
                 enable_prefix_caching=True,
-                block_hash_salt=dynamic_engine_requests._weight_scoped_salt(0, "img-a"),
-                media_cache_key="img-a",
+                block_hash_salt=dynamic_engine_requests._weight_scoped_salt(0, {0: "img-a"}),
+                media_block_salt_keychain={0: "img-a"},
                 num_img_embeddings_per_tile=0,
                 imgs=None,
                 num_tiles=None,
@@ -2426,7 +2438,7 @@ def test_resume_resalts_requests_admitted_before_the_weight_epoch_bump():
     # A post-resume arrival hashes identically, so the two can still share KV.
     assert engine.get_request(6).precomputed_block_hashes == hashes(new_salt)
 
-    vlm_salt = dynamic_engine_requests._weight_scoped_salt(1, "img-a")
+    vlm_salt = dynamic_engine_requests._weight_scoped_salt(1, {0: "img-a"})
     assert engine.get_request(5).block_hash_salt == vlm_salt
     assert engine.get_request(5).precomputed_block_hashes == hashes(vlm_salt)
 
@@ -3004,8 +3016,8 @@ def test_refresh_vlm_request_recomputes_embeddings_from_preserved_mask():
         request_id=32,
         prompt_tokens=torch.tensor([99, 99, 5, 7]),
         sampling_params=SamplingParams(num_tokens_to_generate=1, termination_id=-1),
-        block_hash_salt="w7\0media",
-        media_cache_key="media",
+        block_hash_salt={0: "w7\0media"},
+        media_block_salt_keychain={0: "media"},
         num_img_embeddings_per_tile=0,
         imgs=torch.ones(1),
         num_tiles=None,
@@ -3040,7 +3052,7 @@ def test_refresh_vlm_request_recomputes_embeddings_from_preserved_mask():
     assert request.image_embeddings is wrapper._forward_vision_encoder.return_value
     assert request.image_token_mask.tolist() == [0, 1, -1, -1]
     engine._cache_vision_embedding.assert_called_once()
-    assert engine._cache_vision_embedding.call_args.args[0] == "media"
+    assert engine._cache_vision_embedding.call_args.args[0] == ("media",)
     engine.context.add_vlm_request_data.assert_called_once_with(
         request.request_id,
         image_embeddings=request.image_embeddings,
@@ -3118,8 +3130,8 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
         request_id=33,
         prompt_tokens=torch.tensor([99, 99, 5], device=device),
         sampling_params=SamplingParams(num_tokens_to_generate=4, termination_id=-1),
-        block_hash_salt="media",
-        media_cache_key="media",
+        block_hash_salt={0: "media"},
+        media_block_salt_keychain={0: "media"},
         num_img_embeddings_per_tile=0,
         imgs=imgs,
         num_tiles=torch.tensor([1]),
@@ -3160,7 +3172,7 @@ def test_checkpointed_vlm_request_refreshes_cpu_media_on_gpu():
     assert checkpointed_request.prompt_tokens.device == device
     assert checkpointed_request.imgs is imgs
     assert checkpointed_request.imgs_sizes is imgs_sizes
-    assert checkpointed_request.media_cache_key == "media"
+    assert checkpointed_request.media_block_salt_keychain == {0: "media"}
     assert checkpointed_request.imgs.device.type == "cpu"
     assert checkpointed_request.imgs_sizes.device.type == "cpu"
     assert checkpointed_request.image_embeddings is refreshed_embeddings
